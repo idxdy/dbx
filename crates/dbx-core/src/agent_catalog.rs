@@ -324,6 +324,7 @@ const AGENT_CATALOG: &[AgentCatalogEntry] = &[
         store_visible: true,
         profiles: &[],
     },
+    AgentCatalogEntry { db_type: DatabaseType::Ldap, key: "ldap", label: "LDAP", store_visible: true, profiles: &[] },
     AgentCatalogEntry {
         db_type: DatabaseType::MongoDb,
         key: "mongodb",

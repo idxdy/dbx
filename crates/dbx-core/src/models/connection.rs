@@ -156,6 +156,16 @@ pub struct ConnectionConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ldap_security_protocol: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ldap_principal: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ldap_keytab_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ldap_krb5_conf: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ldap_base_dn: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gbase_server: String,
     /// Informix server name (INFORMIXSERVER). When empty, the agent
     /// derives it from the hostname.
@@ -586,6 +596,8 @@ pub enum DatabaseType {
     Etcd,
     #[serde(rename = "zookeeper")]
     ZooKeeper,
+    #[serde(rename = "ldap")]
+    Ldap,
     Nacos,
     Consul,
     #[serde(rename = "iris")]
@@ -696,6 +708,16 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
+    pub ldap_security_protocol: String,
+    #[serde(default)]
+    pub ldap_principal: String,
+    #[serde(default)]
+    pub ldap_keytab_path: String,
+    #[serde(default)]
+    pub ldap_krb5_conf: String,
+    #[serde(default)]
+    pub ldap_base_dn: String,
+    #[serde(default)]
     pub gbase_server: String,
     #[serde(default)]
     pub informix_server: String,
@@ -766,6 +788,11 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_scan_page_size: data.redis_scan_page_size,
             redis_database_aliases: data.redis_database_aliases,
             etcd_endpoints: data.etcd_endpoints,
+            ldap_security_protocol: data.ldap_security_protocol,
+            ldap_principal: data.ldap_principal,
+            ldap_keytab_path: data.ldap_keytab_path,
+            ldap_krb5_conf: data.ldap_krb5_conf,
+            ldap_base_dn: data.ldap_base_dn,
             gbase_server: data.gbase_server,
             informix_server: data.informix_server,
             external_config: data.external_config,
@@ -1195,6 +1222,9 @@ impl ConnectionConfig {
             DatabaseType::ZooKeeper => {
                 format!("zookeeper://{host}:{port}")
             }
+            DatabaseType::Ldap => {
+                format!("ldap://{host}:{port}")
+            }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
             DatabaseType::InfluxDb | DatabaseType::VictoriaMetrics => {
                 let scheme = if self.ssl { "https" } else { "http" };
@@ -1461,6 +1491,13 @@ impl ConnectionConfig {
                     format!("zookeeper://{host}:{port}")
                 } else {
                     format!("zookeeper://{}:{}@{host}:{port}", username, password)
+                }
+            }
+            DatabaseType::Ldap => {
+                if username.is_empty() {
+                    format!("ldap://{host}:{port}")
+                } else {
+                    format!("ldap://{}:{}@{host}:{port}", username, password)
                 }
             }
             DatabaseType::Iris => {
@@ -2567,6 +2604,11 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,

@@ -33,6 +33,7 @@ pub fn is_single_connection_pool(db_type: &DatabaseType) -> bool {
             | DatabaseType::Iris
             | DatabaseType::OceanbaseOracle
             | DatabaseType::Access
+            | DatabaseType::Ldap
             | DatabaseType::Jdbc
             | DatabaseType::VictoriaMetrics
     )
