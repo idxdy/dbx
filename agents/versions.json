@@ -43,6 +43,7 @@
   "etcd": "0.1.35",
   "zookeeper": "0.1.25",
   "kafka": "0.1.12",
+  "ldap": "0.1.0",
   "rocketmq": "0.1.7",
   "rabbitmq": "0.1.7",
   "sqlserver-legacy": "0.1.18"
