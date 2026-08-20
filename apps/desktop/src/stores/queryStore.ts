@@ -705,6 +705,9 @@ export const useQueryStore = defineStore("query", () => {
   const activeTabId = ref<string | null>(null);
   const isOpenTabsLoaded = ref(false);
   const activeTabHistory = ref<string[]>([]);
+  // Most-recently-activated tab ids, oldest first. Read-only view for the
+  // Ctrl+Tab switcher, which renders them in reverse.
+  const recentTabIds = computed(() => activeTabHistory.value);
   const showCloseConfirm = ref(false);
   const pendingCloseTabId = ref<string | null>(null);
   const pendingBatchCloseTabIds = ref<string[] | null>(null);
@@ -2244,7 +2247,7 @@ export const useQueryStore = defineStore("query", () => {
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string, initialTab?: TableInfoTab, initialTarget?: TableStructureEditorTarget, catalog?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
-      const existing = tabs.value.find((tab) => tab.mode === "structure" && tab.connectionId === connectionId && tab.database === database && (tab.catalog || "") === (catalog || "") && (tab.structureTableName || "") === resolvedTableName);
+      const existing = tabs.value.find((tab) => tab.mode === "structure" && tab.connectionId === connectionId && tab.database === database && (tab.catalog || "") === (catalog || "") && (tab.schema || "") === (schema || "") && (tab.structureTableName || "") === resolvedTableName);
       if (existing) {
         applyTableStructureInitialTab(existing, initialTab, initialTarget);
         switchTab(existing.id);
@@ -3582,11 +3585,7 @@ export const useQueryStore = defineStore("query", () => {
     // unqualified object reference. Resolve metadata through the login's
     // default schema (with the driver's dbo fallback) so metadata and writes
     // target the same object as the original SELECT.
-    let schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema);
-    if (!schema) {
-      if (dbType === "postgres" || dbType === "kwdb") schema = "public";
-      else schema = "";
-    }
+    const schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema) || "";
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
@@ -3594,7 +3593,11 @@ export const useQueryStore = defineStore("query", () => {
     // search_path. Do not reinterpret the selected database as a schema; the
     // agent resolves the visible relation's actual namespace with the columns.
     const useCurrentVastbaseSchema = dbType === "vastbase" && !source.schema && !tab.schema;
-    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema) || useCurrentVastbaseSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
+    // PostgreSQL-compatible unqualified names also resolve through the
+    // connection's search_path. Keep the metadata request unqualified when no
+    // schema was selected instead of assuming public (or the database name).
+    const useCurrentPostgresSchema = (dbType === "postgres" || dbType === "kwdb") && !source.schema && !tab.schema;
+    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema) || useCurrentVastbaseSchema || useCurrentPostgresSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeUppercaseFoldedMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
     const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
     const metadataCatalog = normalizeUppercaseFoldedMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
@@ -4112,7 +4115,6 @@ export const useQueryStore = defineStore("query", () => {
     traceId: string;
     elapsed: () => string;
     timeoutSecs: number;
-    maxRows?: number;
   }) {
     const resultRowCount = options.result.rows.length;
     if (resultRowCount <= 0) {
@@ -4155,11 +4157,12 @@ export const useQueryStore = defineStore("query", () => {
           setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, undefined);
           return;
         }
-        const cappedTotal = capQueryResultTotal(total, options.maxRows);
-        setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, cappedTotal);
+        // COUNT describes all matching rows; the configured result limit only
+        // constrains how many of them pagination may load and retain.
+        setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, total);
         queryExecutionLog("info", "count:done", {
           traceId: options.traceId,
-          total: cappedTotal,
+          total,
           elapsed: options.elapsed(),
         });
       } catch (error) {
@@ -5148,7 +5151,6 @@ export const useQueryStore = defineStore("query", () => {
             traceId,
             elapsed,
             timeoutSecs: queryTimeoutSecs,
-            maxRows: queryResultMaxRows,
           });
         }
         queryExecutionLog("info", "result:assigned", {
@@ -6263,6 +6265,7 @@ export const useQueryStore = defineStore("query", () => {
     tabs,
     activeTabId,
     isOpenTabsLoaded,
+    recentTabIds,
     initOpenTabs,
     showCloseConfirm,
     pendingCloseTabId,

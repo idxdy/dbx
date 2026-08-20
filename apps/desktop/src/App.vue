@@ -62,7 +62,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
 import { externalSqlFileOpenErrorMessage, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
-import type { ConnectionConfig, DatabaseType, ObjectSourceKind, QueryTab } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, ObjectSourceKind, QueryTab, TreeNode } from "@/types/database";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import {
   isBrowserReloadShortcut,
@@ -87,9 +87,13 @@ import {
   isZoomInShortcut,
   isZoomOutShortcut,
   switchToTabIndexFromShortcut,
+  tabSwitcherDirectionFromShortcut,
 } from "@/lib/editor/keyboardShortcuts";
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { createTabNavigationHistory, moveInTabNavigationHistory, recordTabVisit } from "@/lib/tabs/tabNavigationHistory";
+import { initialTabSwitcherSelection, moveTabSwitcherSelection, tabSwitcherOrder } from "@/lib/tabs/tabSwitcher";
+import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeyboard";
+import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
 import { buildAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
@@ -109,6 +113,7 @@ import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { savedSqlDefaultTargetForWrite } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { countActiveUpdateBlockingTasks } from "@/lib/app/appUpdateTaskGuard";
 import { initSavedSqlEditorPositions } from "@/lib/app/savedSqlEditorPosition";
+import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { isSchemaAware, isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
@@ -120,7 +125,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { HistoryEntry } from "@/lib/backend/tauri";
-import type { AiAction } from "@/lib/ai/ai";
+import { resolveDefaultAiSchema, type AiAction } from "@/lib/ai/ai";
 import ExternalSqlFileChangeDialog from "@/components/editor/ExternalSqlFileChangeDialog.vue";
 
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
@@ -133,12 +138,15 @@ const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/Upda
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
 const QuickOpenDialog = defineAsyncComponent(() => import("@/components/quick-open/QuickOpenDialog.vue"));
+const TabSwitcherDialog = defineAsyncComponent(() => import("@/components/tabs/TabSwitcherDialog.vue"));
 const QueryEditorDdlViewDialog = defineAsyncComponent(() => import("@/components/objects/DdlViewDialog.vue"));
 const QueryEditorObjectSourceDialog = defineAsyncComponent(() => import("@/components/objects/ObjectSourceDialog.vue"));
 
 type AiAssistantHandle = {
   triggerAction: (action: AiAction, instruction?: string) => void;
   setPrompt: (text: string) => void;
+  addTableMention: (target: { schema?: string; table: string }) => void;
+  clearContextReferences: () => void;
 };
 
 const { t } = useI18n();
@@ -223,6 +231,8 @@ const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome"
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
 const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsStore.settingsPageActive);
 const showQuickOpen = ref(false);
+const showTabSwitcher = ref(false);
+const tabSwitcherIndex = ref(0);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
@@ -866,6 +876,58 @@ function fixWithAi(errorMessage: string) {
 function sendSelectionToAi(sql: string) {
   openRightSidebarPanel("ai");
   invokeWhenAiReady((handle) => handle.setPrompt(sql));
+}
+
+let addToAiRequestId = 0;
+
+async function addToAi(node: TreeNode) {
+  if ((node.type !== "connection" && node.type !== "database" && node.type !== "table") || !node.connectionId) return;
+  const connection = connectionStore.getConfig(node.connectionId);
+  if (!connection) return;
+  const requestId = ++addToAiRequestId;
+
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    if (requestId !== addToAiRequestId) return;
+    connectionStore.activeConnectionId = node.connectionId;
+
+    let target: { database: string; schema?: string; catalog?: string } | null = null;
+    if (node.type === "connection") {
+      const options = await getDatabaseOptions(node.connectionId);
+      if (requestId !== addToAiRequestId) return;
+      target =
+        connection.db_type === "dameng"
+          ? {
+              database: resolveDefaultDatabase(connection, []),
+              schema: resolveDefaultAiSchema(connection, options),
+            }
+          : {
+              database: resolveDefaultDatabase(connection, options),
+              schema: connection.default_schema,
+            };
+    } else if (hasTreeNodeDatabaseContext(node)) {
+      target = { database: node.database, schema: node.schema, catalog: node.catalog };
+    }
+    if (!target) return;
+
+    const currentTab = activeTab.value;
+    const contextChanged = currentTab?.connectionId !== node.connectionId || currentTab?.database !== target.database || (currentTab?.schema || "") !== (target.schema || "") || (currentTab?.catalog || "") !== (target.catalog || "");
+
+    const contextTab = queryStore.tabs.find((tab) => tab.connectionId === node.connectionId && tab.database === target.database && (tab.schema || "") === (target.schema || "") && (tab.catalog || "") === (target.catalog || ""));
+    if (contextTab) {
+      queryStore.switchTab(contextTab.id);
+    } else {
+      queryStore.createTab(node.connectionId, target.database, undefined, "query", target.schema, undefined, target.catalog);
+    }
+
+    openRightSidebarPanel("ai");
+    invokeWhenAiReady((handle) => {
+      if (contextChanged) handle.clearContextReferences();
+      if (node.type === "table") handle.addTableMention({ schema: node.schema, table: node.label });
+    });
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+  }
 }
 
 function openAiPanel() {
@@ -2293,6 +2355,66 @@ function activateTabFromHistory(direction: -1 | 1): boolean {
   return false;
 }
 
+const tabSwitcherTabs = computed(() => tabSwitcherOrder(queryStore.tabs, queryStore.recentTabIds));
+const tabSwitcherShortcutHint = computed(() => formatShortcutDisplay(settingsStore.editorSettings.shortcuts.tabSwitcher));
+
+function handleTabSwitcherShortcut(direction: -1 | 1, e: KeyboardEvent): boolean {
+  if (!queryStore.tabs.length) return false;
+  if (!showTabSwitcher.value) {
+    tabSwitcherKeyboard.rememberOpeningEvent(e);
+    tabSwitcherIndex.value = initialTabSwitcherSelection(tabSwitcherTabs.value.length);
+    showTabSwitcher.value = true;
+  } else {
+    tabSwitcherIndex.value = moveTabSwitcherSelection(tabSwitcherIndex.value, direction, tabSwitcherTabs.value.length);
+  }
+  return true;
+}
+
+function closeTabSwitcher(commit: boolean) {
+  tabSwitcherKeyboard.reset();
+  if (!showTabSwitcher.value) return;
+  showTabSwitcher.value = false;
+  if (!commit) return;
+  const tab = tabSwitcherTabs.value[tabSwitcherIndex.value];
+  if (tab) activateQueryTab(tab.id);
+}
+
+function handleKeyup(e: KeyboardEvent) {
+  tabSwitcherKeyboard.handleKeyup(e);
+}
+
+function handleTabSwitcherKeydownCapture(e: KeyboardEvent) {
+  tabSwitcherKeyboard.handleKeydownCapture(e);
+}
+
+function handleTabSwitcherWindowBlur() {
+  tabSwitcherKeyboard.handleWindowBlur();
+}
+
+function handleTabSwitcherVisibilityChange() {
+  tabSwitcherKeyboard.handleVisibilityChange(document.visibilityState);
+}
+
+function handleTabSwitcherSelect(tabId: string) {
+  tabSwitcherKeyboard.reset();
+  showTabSwitcher.value = false;
+  activateQueryTab(tabId);
+}
+
+function handleTabSwitcherOpenChange(open: boolean) {
+  if (!open) closeTabSwitcher(false);
+}
+
+const tabSwitcherKeyboard = createTabSwitcherKeyboardController({
+  isOpen: () => showTabSwitcher.value,
+  shortcut: () => settingsStore.editorSettings.shortcuts.tabSwitcher,
+  move: (direction) => {
+    tabSwitcherIndex.value = moveTabSwitcherSelection(tabSwitcherIndex.value, direction, tabSwitcherTabs.value.length);
+  },
+  commit: () => closeTabSwitcher(true),
+  cancel: () => closeTabSwitcher(false),
+});
+
 function handleNativeSelectAll(e: KeyboardEvent) {
   if (shouldBlockAppNativeSelectAll(e)) e.preventDefault();
 }
@@ -2301,6 +2423,15 @@ async function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
+  const tabSwitcherDirection = tabSwitcherDirectionFromShortcut(e, shortcuts);
+  if (showTabSwitcher.value) return;
+  if (tabSwitcherDirection) {
+    e.preventDefault();
+    e.stopPropagation();
+    handleTabSwitcherShortcut(tabSwitcherDirection, e);
+    return;
+  }
+
   const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
   if (isOpenSettingsShortcut(e, shortcuts)) {
@@ -2574,7 +2705,11 @@ onMounted(async () => {
   applyTheme();
   void applyUiScale(settingsStore.editorSettings.uiScale);
   window.addEventListener("keydown", handleNativeSelectAll, true);
+  window.addEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.addEventListener("keydown", handleKeydown);
+  window.addEventListener("keyup", handleKeyup, true);
+  window.addEventListener("blur", handleTabSwitcherWindowBlur);
+  document.addEventListener("visibilitychange", handleTabSwitcherVisibilityChange);
   window.addEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.addEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   if (isDesktop) {
@@ -2642,7 +2777,12 @@ onUnmounted(() => {
     clearInterval(updateCheckTimer);
   }
   window.removeEventListener("keydown", handleNativeSelectAll, true);
+  window.removeEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.removeEventListener("keydown", handleKeydown);
+  window.removeEventListener("keyup", handleKeyup, true);
+  window.removeEventListener("blur", handleTabSwitcherWindowBlur);
+  document.removeEventListener("visibilitychange", handleTabSwitcherVisibilityChange);
+  tabSwitcherKeyboard.reset();
   window.removeEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   document.removeEventListener("contextmenu", handleContextMenu);
@@ -2700,6 +2840,7 @@ onUnmounted(() => {
             @start-resize="startSidebarResize"
             @collapse="setSidebarOpen(false)"
             @open-settings="(initialTab) => openSettings(initialTab ?? 'appearance')"
+            @add-to-ai="addToAi"
           />
           <div v-show="!sidebarOpen" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
             <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('sidebar.expand')" :aria-label="t('sidebar.expand')" @click="setSidebarOpen(true)">
@@ -2995,6 +3136,7 @@ onUnmounted(() => {
         <ExternalSqlFileChangeDialog :prompt="externalSqlFilePrompt" @decide="externalSqlFileChanges.resolvePrompt" />
         <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" :open="showCloseActionPrompt" @update:open="handleCloseActionPromptOpenChange" @quit="chooseQuit" @minimize="chooseMinimize" />
         <QuickOpenDialog :open="showQuickOpen" @update:open="showQuickOpen = $event" @select="handleQuickOpenSelect" />
+        <TabSwitcherDialog :open="showTabSwitcher" :tabs="tabSwitcherTabs" :selected-index="tabSwitcherIndex" :shortcut-hint="tabSwitcherShortcutHint" @update:open="handleTabSwitcherOpenChange" @update:selected-index="tabSwitcherIndex = $event" @select="handleTabSwitcherSelect" />
       </div>
       <Teleport to="body">
         <FileText

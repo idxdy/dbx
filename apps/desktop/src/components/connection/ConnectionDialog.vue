@@ -106,10 +106,12 @@ import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, fil
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import CloudflareD1ConnectionFields from "@/components/connection/CloudflareD1ConnectionFields.vue";
+import SpannerConnectionFields from "@/components/connection/SpannerConnectionFields.vue";
 import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
 import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudflareD1Connection } from "@/lib/connection/cloudflareD1";
+import { hasSpannerResourcePath, isSpannerConnection, normalizeSpannerConnection } from "@/lib/connection/spannerResourcePath";
 import {
   buildElasticsearchExternalConfig,
   elasticsearchConnectionModeFromConfig,
@@ -191,6 +193,18 @@ const NACOS_CONNECTION_PROFILES: ReadonlyArray<{ value: NacosConnectionProfile; 
   { value: "v3", title: "Nacos 3.x" },
   { value: "rnacos", title: "r-nacos" },
 ];
+
+type IgniteConnectionProfile = "ignite" | "ignite3";
+
+const IGNITE_CONNECTION_PROFILES: ReadonlyArray<{ value: IgniteConnectionProfile; title: string }> = [
+  { value: "ignite", title: "Ignite 2.x" },
+  { value: "ignite3", title: "Ignite 3.x" },
+];
+
+// The picker merges the Ignite 2.x/3.x cards into a single "Apache Ignite"
+// entry; the version is picked inside the connection form instead.
+const MERGED_PICKER_OPTION_FOR_TYPE: Record<string, string> = { ignite3: "ignite" };
+const PICKER_SEARCH_ALIASES: Record<string, string[]> = { ignite: ["ignite3", "ignite 3"] };
 
 type LegacyTransportFields = {
   ssh_enabled?: boolean;
@@ -1027,13 +1041,14 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
 });
 
 const jdbcDriverSelectItemById = computed(() => new Map(jdbcDriverSelectItems.value.map((item) => [item.id, item])));
-const jdbcManualClasspathCount = computed(
-  () =>
-    jdbcDriverPathsInput.value
-      .split(/\r?\n/)
-      .map((value) => value.trim())
-      .filter(Boolean).length,
-);
+const jdbcManualClasspathCount = computed(() => parsedJdbcDriverPaths().length);
+
+function parsedJdbcDriverPaths(): string[] {
+  return jdbcDriverPathsInput.value
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 function applyCustomColor(value: string) {
   form.value.color = value;
@@ -1238,6 +1253,7 @@ const driverProfiles: Record<
     icon: "bigquery",
     host: "https://www.googleapis.com/bigquery/v2",
   },
+  spanner: { type: "spanner", port: 443, user: "", label: "Cloud Spanner", icon: "spanner" },
   kylin: { type: "kylin", port: 7070, user: "ADMIN", label: "Apache Kylin", icon: "kylin" },
   ignite: { type: "ignite", port: 10800, user: "", label: "Apache Ignite", icon: "ignite" },
   ignite3: { type: "ignite3", port: 10800, user: "", label: "Apache Ignite 3", icon: "ignite" },
@@ -2526,6 +2542,15 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
       jdbcManualClasspathOpen.value = true;
     }
+    if (profile.type === "spanner") {
+      // Google Cloud endpoints carry no host; the local emulator is opted into
+      // by typing host `localhost` and port 9010 explicitly.
+      form.value.host = "";
+      form.value.username = "";
+      form.value.password = "";
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+    }
     if (profile.type === "mq") {
       resetMqFields(defaultMqFieldsForProfile(val));
       syncMqSystemKindFromSelectedType();
@@ -2881,6 +2906,16 @@ function onDbTypeChange(val: string) {
   resetVisibleSchemasState();
 }
 
+function selectIgniteConnectionProfile(profile: IgniteConnectionProfile) {
+  if (form.value.db_type === profile) return;
+  const category = dbCategoryForOption(profile);
+  if (category) selectedDbCategory.value = category;
+  customDriverName.value = "";
+  applyProfile(profile, true);
+  resetTestState();
+  resetVisibleSchemasState();
+}
+
 function switchH2ConnectionMode(mode: H2ConnectionMode) {
   h2ConnectionMode.value = mode;
   if (mode === "file") {
@@ -2892,6 +2927,21 @@ function switchH2ConnectionMode(mode: H2ConnectionMode) {
     if (form.value.connection_string && h2FilePathFromJdbcUrl(form.value.connection_string)) {
       form.value.connection_string = undefined;
     }
+  }
+  resetTestState();
+}
+
+function switchH2DriverProfile(profile: "h2" | "h2-v1" | "h2-v2" | "h2-v3" | "h2-custom") {
+  form.value.driver_profile = profile;
+  if (profile === "h2-custom") {
+    form.value.jdbc_driver_class = form.value.jdbc_driver_class?.trim() || "org.h2.Driver";
+    jdbcManualClasspathOpen.value = true;
+  } else {
+    form.value.jdbc_driver_class = undefined;
+    form.value.jdbc_driver_paths = [];
+    jdbcDriverPathsInput.value = "";
+    selectedJdbcDriverPath.value = "";
+    jdbcManualClasspathOpen.value = false;
   }
   resetTestState();
 }
@@ -2986,6 +3036,7 @@ const iconTypeMap: Record<string, string> = {
   neo4j: "neo4j",
   cassandra: "cassandra",
   bigquery: "bigquery",
+  spanner: "spanner",
   kylin: "kylin",
   ignite: "ignite",
   ignite3: "ignite",
@@ -3069,6 +3120,7 @@ const dbOptions: DbOption[] = [
   { value: "neo4j", label: "Neo4j" },
   { value: "cassandra", label: "Cassandra" },
   { value: "bigquery", label: "BigQuery" },
+  { value: "spanner", label: "Cloud Spanner" },
   { value: "kylin", label: "Kylin" },
   { value: "ignite", label: "Apache Ignite" },
   { value: "ignite3", label: "Apache Ignite 3" },
@@ -3106,7 +3158,7 @@ const dbCategoryDefinitions: Array<{
   {
     key: "sql",
     titleKey: "connection.databaseCategorySql",
-    optionValues: ["postgres", "mysql", "oracle", "sqlserver", "mariadb", "cockroachdb", "db2", "informix", "firebird", "iris", "jdbcx", "custom_mysql", "custom_postgres", "dolt"],
+    optionValues: ["postgres", "mysql", "oracle", "sqlserver", "mariadb", "cockroachdb", "db2", "informix", "firebird", "iris", "spanner", "jdbcx", "custom_mysql", "custom_postgres", "dolt"],
   },
   {
     key: "analytics",
@@ -3160,17 +3212,19 @@ assertCompleteDatabaseCategories(
   dbCategoryDefinitions.map((category) => category.optionValues),
 );
 
+const hiddenPickerOptionTypes = new Set(Object.keys(MERGED_PICKER_OPTION_FOR_TYPE));
+
 const dbCategories = computed<DbCategory[]>(() => {
   return dbCategoryDefinitions.map((category) => ({
     key: category.key,
     title: t(category.titleKey),
-    options: dbOptions.filter((option) => category.optionValues.includes(option.value)),
+    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value)),
   }));
 });
 
 function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") {
   const profile = driverProfiles[option.value];
-  return [option.label, option.value, profile?.label, profile?.type, categoryTitle].some((value) =>
+  return [option.label, option.value, profile?.label, profile?.type, categoryTitle, ...(PICKER_SEARCH_ALIASES[option.value] ?? [])].some((value) =>
     String(value || "")
       .toLowerCase()
       .includes(keyword),
@@ -3196,7 +3250,11 @@ const visibleDbCategories = computed<DbCategory[]>(() => {
   return filteredDbCategories.value.filter((category) => category.key === selectedDbCategory.value);
 });
 const hasDbPickerResults = computed(() => visibleDbCategories.value.some((category) => category.options.length > 0));
-const selectedDbOptionIsVisible = computed(() => visibleDbCategories.value.some((category) => category.options.some((option) => option.value === selectedType.value)));
+function isPickerOptionSelected(optionValue: string): boolean {
+  return selectedType.value === optionValue || MERGED_PICKER_OPTION_FOR_TYPE[selectedType.value] === optionValue;
+}
+
+const selectedDbOptionIsVisible = computed(() => visibleDbCategories.value.some((category) => category.options.some((option) => isPickerOptionSelected(option.value))));
 
 function selectDbCategory(category: DbCategoryKey) {
   selectedDbCategory.value = category;
@@ -3212,7 +3270,8 @@ function selectDbPickerView(view: DbPickerView) {
 }
 
 function dbCategoryForOption(value: string): DbCategoryKey | undefined {
-  return dbCategories.value.find((category) => category.options.some((option) => option.value === value))?.key;
+  const pickerValue = MERGED_PICKER_OPTION_FOR_TYPE[value] ?? value;
+  return dbCategories.value.find((category) => category.options.some((option) => option.value === pickerValue))?.key;
 }
 
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
@@ -3233,6 +3292,7 @@ const jdbcxHighPrivilegeExtensionsAllowed = computed({
 });
 const supportsNativeAgentJdbcDriverConfig = computed(() => supportsNativeAgentJdbcDriverConfigType(form.value.db_type));
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
+const isH2CustomDriver = computed(() => form.value.db_type === "h2" && form.value.driver_profile === "h2-custom");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
@@ -3630,6 +3690,8 @@ const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (form.value.db_type === "consul") return !!consulServerAddr.value.trim();
   if (isCloudflareD1Connection(form.value)) return hasCloudflareD1Credentials(form.value);
+  // Cloud Spanner has no host to fall back on: the resource path is the target.
+  if (isSpannerConnection(form.value)) return hasSpannerResourcePath(form.value);
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
   return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
 });
@@ -3969,6 +4031,12 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       throw new Error(t("connection.d1FieldsRequired"));
     }
   }
+  if (isSpannerConnection(config)) {
+    normalizeSpannerConnection(config);
+    if (!hasSpannerResourcePath(config)) {
+      throw new Error(t("connection.spannerFieldsRequired"));
+    }
+  }
   config.transport_layers = (config.transport_layers || []).map(normalizeTransportLayer);
   config.transport_layers = config.transport_layers.map((layer) => {
     if (layer.type !== "ssh") return layer;
@@ -4287,16 +4355,20 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       config.jdbc_driver_class = GAUSSDB_M_JDBC_DRIVER_CLASS;
     }
     config.jdbc_driver_class = config.jdbc_driver_class?.trim() || undefined;
-    config.jdbc_driver_paths = jdbcDriverPathsInput.value
-      .split(/\r?\n/)
-      .map((path) => path.trim())
-      .filter(Boolean);
+    config.jdbc_driver_paths = parsedJdbcDriverPaths();
   } else if (config.db_type === "gaussdb") {
     config.connection_string = undefined;
     config.jdbc_driver_class = undefined;
     config.jdbc_driver_paths = [];
   }
   if (config.db_type === "h2") {
+    if (config.driver_profile === "h2-custom") {
+      config.jdbc_driver_class = config.jdbc_driver_class?.trim() || "org.h2.Driver";
+      config.jdbc_driver_paths = parsedJdbcDriverPaths();
+    } else {
+      config.jdbc_driver_class = undefined;
+      config.jdbc_driver_paths = [];
+    }
     const h2Mode = connectionUrlInput.value.trim() ? h2ConnectionModeForConfig(config) : h2ConnectionMode.value;
     if (h2Mode === "file") {
       const jdbcFilePath = h2FilePathFromJdbcUrl(config.connection_string);
@@ -5868,8 +5940,8 @@ function openExternalUrl(url: string) {
                     type="button"
                     :title="opt.label"
                     class="connection-db-picker-option group flex min-h-24 flex-col items-center justify-center gap-2 rounded-[4px] border bg-background/70 p-3 text-center transition hover:border-primary/40 hover:bg-muted/40 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    :class="selectedType === opt.value ? 'dbx-tile-selected shadow-sm' : 'border-border'"
-                    :aria-pressed="selectedType === opt.value"
+                    :class="isPickerOptionSelected(opt.value) ? 'dbx-tile-selected shadow-sm' : 'border-border'"
+                    :aria-pressed="isPickerOptionSelected(opt.value)"
                     @click="onDbTypeChange(opt.value)"
                     @dblclick="goToConnectionStep(opt.value)"
                   >
@@ -5888,8 +5960,8 @@ function openExternalUrl(url: string) {
                     :key="opt.value"
                     type="button"
                     class="connection-db-picker-option flex items-center gap-3 rounded-[4px] border bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    :class="selectedType === opt.value ? 'dbx-tile-selected' : 'border-border'"
-                    :aria-pressed="selectedType === opt.value"
+                    :class="isPickerOptionSelected(opt.value) ? 'dbx-tile-selected' : 'border-border'"
+                    :aria-pressed="isPickerOptionSelected(opt.value)"
                     @click="onDbTypeChange(opt.value)"
                     @dblclick="goToConnectionStep(opt.value)"
                   >
@@ -6040,27 +6112,51 @@ function openExternalUrl(url: string) {
 
                 <div v-if="form.db_type === 'h2'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">Driver</Label>
-                  <div class="col-span-3 flex gap-2">
-                    <Button
-                      size="sm"
-                      :variant="form.driver_profile !== 'h2-legacy' ? 'default' : 'outline'"
-                      @click="
-                        form.driver_profile = 'h2';
-                        resetTestState();
-                      "
-                      >H2 2.3</Button
-                    >
-                    <Button
-                      size="sm"
-                      :variant="form.driver_profile === 'h2-legacy' ? 'default' : 'outline'"
-                      @click="
-                        form.driver_profile = 'h2-legacy';
-                        resetTestState();
-                      "
-                      >H2 2.1 Legacy</Button
-                    >
+                  <div class="col-span-3 flex flex-wrap gap-2">
+                    <Button size="sm" :variant="!form.driver_profile || form.driver_profile === 'h2' || form.driver_profile === 'h2-auto' ? 'default' : 'outline'" @click="switchH2DriverProfile('h2')">Auto</Button>
+                    <Button size="sm" :variant="form.driver_profile === 'h2-v1' ? 'default' : 'outline'" @click="switchH2DriverProfile('h2-v1')">H2 1.x</Button>
+                    <Button size="sm" :variant="form.driver_profile === 'h2-v2' || form.driver_profile === 'h2-legacy' ? 'default' : 'outline'" @click="switchH2DriverProfile('h2-v2')">H2 2.0–2.1</Button>
+                    <Button size="sm" :variant="form.driver_profile === 'h2-v3' ? 'default' : 'outline'" @click="switchH2DriverProfile('h2-v3')">H2 2.2+</Button>
+                    <Button size="sm" :variant="form.driver_profile === 'h2-custom' ? 'default' : 'outline'" @click="switchH2DriverProfile('h2-custom')">Custom JAR</Button>
                   </div>
                 </div>
+
+                <template v-if="isH2CustomDriver">
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.jdbcDriverPaths") }}</Label>
+                    <div class="col-span-3 space-y-2">
+                      <Select v-if="jdbcDriverSelectItems.length > 0" :model-value="selectedJdbcDriverPath" @update:model-value="onJdbcDriverSelect">
+                        <SelectTrigger>
+                          <SelectValue :placeholder="t('connection.jdbcDriverSelectPlaceholder')" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="driver in jdbcDriverSelectItems" :key="driver.id" :value="driver.id">
+                            {{ driver.label }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div class="flex items-start gap-1">
+                        <textarea
+                          v-model="jdbcDriverPathsInput"
+                          class="flex min-h-12 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          :placeholder="t('connection.jdbcDriverPathsPlaceholder')"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseJdbcDriverPaths">
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.jdbcDriverBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.jdbcDriverClass") }}</Label>
+                    <Input v-model="form.jdbc_driver_class" class="col-span-3" placeholder="org.h2.Driver" />
+                  </div>
+                </template>
 
                 <div v-if="h2DriverMissing" class="grid grid-cols-4 items-center gap-4">
                   <span />
@@ -7313,6 +7409,23 @@ function openExternalUrl(url: string) {
 
                 <!-- MySQL / PostgreSQL: host, port, user, password, database -->
                 <template v-else>
+                  <div v-if="form.db_type === 'ignite' || form.db_type === 'ignite3'" class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.igniteVersion") }}</Label>
+                    <div class="col-span-3 grid grid-cols-2 gap-2">
+                      <button
+                        v-for="profile in IGNITE_CONNECTION_PROFILES"
+                        :key="profile.value"
+                        type="button"
+                        class="min-w-0 rounded-md border px-3 py-2.5 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        :class="form.db_type === profile.value ? 'border-primary bg-primary/5 shadow-sm' : 'border-border bg-background'"
+                        :aria-pressed="form.db_type === profile.value"
+                        @click="selectIgniteConnectionProfile(profile.value)"
+                      >
+                        <span class="block truncate text-sm font-medium">{{ profile.title }}</span>
+                      </button>
+                    </div>
+                  </div>
+
                   <div v-if="form.db_type === 'elasticsearch'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
@@ -7420,17 +7533,17 @@ function openExternalUrl(url: string) {
                     <Input v-model="form.informix_server" class="col-span-3" placeholder="ol_informix1170" />
                   </div>
 
-                  <div v-if="form.db_type !== 'meilisearch'" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="form.db_type !== 'meilisearch' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
                   </div>
 
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ form.db_type === "meilisearch" ? t("connection.mqAuthApiKey") : t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
 
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                     <span />
                     <div class="col-span-3 flex items-center gap-1.5 text-sm">
                       <label class="flex items-center gap-2">
@@ -7443,10 +7556,19 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
 
-                  <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch'" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ databaseLabel }}</Label>
                     <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                   </div>
+
+                  <!-- Cloud Spanner: project/instance/database resource path instead of user/password/database -->
+                  <template v-if="form.db_type === 'spanner'">
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <span />
+                      <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.spannerHostHint") }}</p>
+                    </div>
+                    <SpannerConnectionFields v-model:database="form.database" @change="resetTestState" />
+                  </template>
 
                   <div v-if="form.db_type === 'oracle' && form.oracle_connection_type === 'tns'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">TNS_ADMIN</Label>
@@ -7603,13 +7725,15 @@ function openExternalUrl(url: string) {
                                   ? 'secure=true'
                                   : form.db_type === 'bigquery'
                                     ? 'OAuthType=0;OAuthServiceAcctEmail=svc@project.iam.gserviceaccount.com;OAuthPvtKeyPath=/path/key.json'
-                                    : form.db_type === 'informix'
-                                      ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
-                                      : form.db_type === 'spark'
-                                        ? 'catalog=paimon_catalog'
-                                        : form.db_type === 'cassandra'
-                                          ? 'localdatacenter=dc1'
-                                          : 'sslmode=prefer'
+                                    : form.db_type === 'spanner'
+                                      ? 'credentials=/path/key.json;autocommit=true'
+                                      : form.db_type === 'informix'
+                                        ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
+                                        : form.db_type === 'spark'
+                                          ? 'catalog=paimon_catalog'
+                                          : form.db_type === 'cassandra'
+                                            ? 'localdatacenter=dc1'
+                                            : 'sslmode=prefer'
                         "
                       />
                       <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">

@@ -9,6 +9,8 @@ mod startup_recovery;
 #[cfg(all(not(target_os = "windows"), not(test)))]
 #[path = "startup_recovery_noop.rs"]
 mod startup_recovery;
+#[cfg(any(target_os = "windows", test))]
+mod webview2_recovery;
 mod window_state_guard;
 
 use commands::connection::AppState;
@@ -1485,6 +1487,8 @@ pub fn run() {
             commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
+            #[cfg(target_os = "windows")]
+            webview2_recovery::install(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
             open_connection_deep_links(app.handle(), startup_links);
 
@@ -1727,6 +1731,7 @@ pub fn run() {
             commands::query::build_drop_table_child_object_sql,
             commands::query::build_empty_table_sql,
             commands::query::build_truncate_table_sql,
+            commands::query::build_vacuum_table_sql,
             commands::query::build_mysql_auto_increment_sql,
             commands::query::build_drop_database_sql,
             commands::query::build_create_schema_sql,
@@ -2007,6 +2012,8 @@ pub fn run() {
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
+            commands::mongo_cmd::vector_drop_database,
+            commands::mongo_cmd::vector_drop_collection,
             commands::mongo_cmd::mongo_rename_collection,
             commands::mongo_cmd::mongo_clone_collection,
             commands::docs::docs_collect_snapshot,
