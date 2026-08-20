@@ -384,7 +384,7 @@ class LdapAgentTest {
                 "connection": {
                   "hostname": "ldap.example.com",
                   "port": 636,
-                  "use_ssl": true,
+                  "ssl": true,
                   "tls_skip_verify": true,
                   "security_protocol": "simple",
                   "username": "cn=admin,dc=example,dc=com",
