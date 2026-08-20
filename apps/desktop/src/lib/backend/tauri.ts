@@ -2292,9 +2292,15 @@ export interface LdapSearchResult {
   truncated: boolean;
 }
 
-export async function ldapSearch(_connectionId: string, _baseDn: string, _filter?: string, _scope?: string, _attributes?: string[], _sizeLimit?: number): Promise<LdapSearchResult> {
-  // In Tauri dev, the HTTP backend is used; this stub satisfies the type
-  throw new Error("ldapSearch not yet implemented for Tauri. Use HTTP backend.");
+export async function ldapSearch(connectionId: string, baseDn: string, filter?: string, scope?: string, attributes?: string[], sizeLimit?: number): Promise<LdapSearchResult> {
+  return invokeBackend("ldap_search", {
+    connectionId,
+    baseDn,
+    scope: scope ?? "sub",
+    filter: filter ?? "(objectClass=*)",
+    attributes: attributes ?? null,
+    sizeLimit: sizeLimit ?? null,
+  });
 }
 
 // LDAP login is web-only (the desktop app does not gate itself behind a

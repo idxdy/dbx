@@ -6891,6 +6891,13 @@ function openExternalUrl(url: string) {
                     <Label :class="connectionLabelClass">{{ t("connection.ldapBaseDn") }}</Label>
                     <Input v-model="form.ldap_base_dn" class="col-span-3" placeholder="OU=Users,DC=example,DC=com" />
                   </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex items-center gap-2 text-sm">
+                      <input type="checkbox" v-model="form.ssl" />
+                      <span>{{ t("connection.sslEnable") }}</span>
+                    </label>
+                  </div>
 
                   <!-- Auth method selector -->
                   <div class="grid grid-cols-4 items-center gap-4">
