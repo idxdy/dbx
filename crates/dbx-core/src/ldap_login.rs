@@ -703,7 +703,7 @@ pub async fn authenticate(
 }
 
 async fn bind_raw(login: &LdapLogin, username: &str, password: &str) -> Result<String, String> {
-    let (mut ldap, driver) = open_connection(login, "login connection").await.map_err(|e| e)?;
+    let (mut ldap, driver) = open_connection(login, "login connection").await?;
     let attempt = tokio::time::timeout(login.connect_timeout, ldap.simple_bind(username, password)).await;
     let outcome = match attempt {
         Err(_) => Err(format!("LDAP bind timed out ({}s)", login.connect_timeout.as_secs())),
@@ -984,7 +984,7 @@ mod tests {
         assert_eq!(redacted.service_account_password, "");
         // Everything else survives.
         assert_eq!(redacted.host, "ldap.example.com");
-        assert_eq!(redacted.require_service_account, true);
+        assert!(redacted.require_service_account);
     }
 
     #[test]

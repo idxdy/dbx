@@ -5924,7 +5924,7 @@ mod tests {
 
         let loaded = storage.load_ldap_login_settings().await.unwrap().unwrap();
         assert_eq!(loaded, settings);
-        assert_eq!(loaded.has_service_account_password(), true);
+        assert!(loaded.has_service_account_password());
         assert_eq!(loaded.redacted().service_account_password, "");
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-ldap".to_string()));
     }

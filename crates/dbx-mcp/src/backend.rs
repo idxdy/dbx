@@ -1822,6 +1822,7 @@ pub fn new_connection_config(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn new_connection_config_with_ldap(
     id: String,
     name: String,
