@@ -319,11 +319,17 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    if state.password_disabled {
+    // Auth is only fully open when the password is disabled AND no LDAP login
+    // is configured. When LDAP is enabled it becomes the required auth method,
+    // so the middleware must not let unauthenticated requests through.
+    let ldap_enabled = ldap_login_enabled(&state).await;
+    if state.password_disabled && !ldap_enabled {
         return next.run(req).await;
     }
 
-    if state.password_hash.read().await.is_none() {
+    // Not set up yet: no local password AND no LDAP backend means there is no
+    // way to authenticate, so reject every API request.
+    if state.password_hash.read().await.is_none() && !ldap_enabled {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
