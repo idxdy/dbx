@@ -169,6 +169,7 @@ async fn initializes_lists_tools_and_calls_a_tool() {
     assert!(names.contains(&"dbx_list_connections"));
     assert!(names.contains(&"dbx_duplicate_connection"));
     assert!(names.contains(&"dbx_execute_redis_command"));
+    assert!(names.contains(&"dbx_execute_ldap_search"));
     assert!(names.contains(&"dbx_execute_and_show"));
     assert!(names.contains(&"dbx_open_session"));
     assert!(names.contains(&"dbx_close_session"));
