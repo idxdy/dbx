@@ -322,6 +322,7 @@ async fn main() {
         .unwrap_or(false);
 
     let password_hash = if password_disabled {
+        tracing::info!("Password login disabled");
         None
     } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
         let salt = SaltString::generate(&mut OsRng);

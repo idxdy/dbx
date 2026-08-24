@@ -34,6 +34,9 @@ pub struct AuthCheckResponse {
     pub authenticated: bool,
     pub required: bool,
     pub setup_required: bool,
+    /// `true` when password login is disabled via the `DBX_DISABLE_PASSWORD` env var.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password_disabled: bool,
     /// `true` when LDAP login is enabled in the app settings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ldap_enabled: bool,
@@ -229,19 +232,38 @@ pub async fn ldap_login(
 
 pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Json<AuthCheckResponse> {
     let ldap_enabled = ldap_login_enabled(&state).await;
+    let password_disabled = state.password_disabled;
     if state.password_disabled && !ldap_enabled {
-        return Json(AuthCheckResponse { authenticated: true, required: false, setup_required: false, ldap_enabled });
+        return Json(AuthCheckResponse {
+            authenticated: true,
+            required: false,
+            setup_required: false,
+            password_disabled,
+            ldap_enabled,
+        });
     }
     let has_password = state.password_hash.read().await.is_some();
     if !has_password && !ldap_enabled {
-        return Json(AuthCheckResponse { authenticated: false, required: false, setup_required: true, ldap_enabled });
+        return Json(AuthCheckResponse {
+            authenticated: false,
+            required: false,
+            setup_required: true,
+            password_disabled,
+            ldap_enabled,
+        });
     }
     let authenticated = match extract_session_token(&req) {
         Some(token) => state.sessions.read().await.contains(&token),
         None => false,
     };
     let required = !state.password_disabled || ldap_enabled;
-    Json(AuthCheckResponse { authenticated, required, setup_required: !has_password && !ldap_enabled, ldap_enabled })
+    Json(AuthCheckResponse {
+        authenticated,
+        required,
+        setup_required: !has_password && !ldap_enabled,
+        password_disabled,
+        ldap_enabled,
+    })
 }
 
 pub async fn change_password(
