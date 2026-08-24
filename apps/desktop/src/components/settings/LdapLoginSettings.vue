@@ -196,17 +196,17 @@ onMounted(() => {
           </div>
         </div>
       </template>
+    </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <Button variant="outline" :disabled="testing" @click="test">
-          <Loader2 v-if="testing" class="mr-1 h-3.5 w-3.5 animate-spin" />
-          {{ t("auth.ldapTest") }}
-        </Button>
-        <Button :disabled="saving" @click="save">
-          <Loader2 v-if="saving" class="mr-1 h-3.5 w-3.5 animate-spin" />
-          {{ t("auth.ldapSave") }}
-        </Button>
-      </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <Button v-if="form.enabled" variant="outline" :disabled="testing" @click="test">
+        <Loader2 v-if="testing" class="mr-1 h-3.5 w-3.5 animate-spin" />
+        {{ t("auth.ldapTest") }}
+      </Button>
+      <Button :disabled="saving" @click="save">
+        <Loader2 v-if="saving" class="mr-1 h-3.5 w-3.5 animate-spin" />
+        {{ t("auth.ldapSave") }}
+      </Button>
     </div>
 
     <p v-if="loading" class="text-sm text-muted-foreground">{{ t("auth.processing") }}</p>

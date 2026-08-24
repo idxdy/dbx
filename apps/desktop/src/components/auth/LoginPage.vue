@@ -15,6 +15,7 @@ interface AuthState {
   authenticated: boolean;
   required: boolean;
   setup_required: boolean;
+  password_disabled?: boolean;
   ldap_enabled?: boolean;
 }
 
@@ -54,6 +55,8 @@ async function refreshLdapState() {
 onMounted(() => {
   if (!props.setupMode) void refreshLdapState();
 });
+
+const passwordLoginEnabled = computed(() => authState.value?.password_disabled !== true);
 
 const usernamePlaceholder = t("auth.ldapUsernamePlaceholder");
 
@@ -165,7 +168,7 @@ const ldapEnabled = computed(() => authState.value?.ldap_enabled === true);
           <Loader2 v-if="loading" class="w-4 h-4 animate-spin mr-2" />
           {{ submitLabel }}
         </Button>
-        <div v-if="!setupMode && ldapEnabled" class="flex justify-center">
+        <div v-if="!setupMode && ldapEnabled && passwordLoginEnabled" class="flex justify-center">
           <button type="button" class="text-xs text-muted-foreground hover:text-primary underline-offset-4 hover:underline" @click="authMode = authMode === 'ldap' ? 'password' : 'ldap'">
             {{ authMode === "ldap" ? t("auth.usePassword") : t("auth.ldapLogin") }}
           </button>

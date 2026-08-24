@@ -6807,6 +6807,10 @@ onUnmounted(() => {
                 <PasswordInput v-model="oldPassword" :placeholder="t('auth.oldPassword')" inputClass="h-9" autocomplete="off" />
                 <PasswordInput v-model="newPassword" :placeholder="t('auth.newPassword')" inputClass="h-9" autocomplete="off" />
                 <PasswordInput v-model="confirmNewPassword" :placeholder="t('auth.confirmPassword')" inputClass="h-9" autocomplete="off" />
+                <Button :disabled="changingPassword || !oldPassword || !newPassword || !confirmNewPassword" class="w-fit" @click="changePassword">
+                  <Loader2 v-if="changingPassword" class="mr-1 h-3.5 w-3.5 animate-spin" />
+                  {{ t("auth.changePassword") }}
+                </Button>
                 <p v-if="passwordMessage" class="text-xs" :class="passwordError ? 'text-destructive' : 'text-green-500'">
                   {{ passwordMessage }}
                 </p>
@@ -7033,9 +7037,6 @@ onUnmounted(() => {
           <DialogFooter v-else-if="activeSettingsTab === 'security' && isWeb" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
             <Button variant="outline" @click="closeSettings">
               {{ t("common.close") }}
-            </Button>
-            <Button :disabled="changingPassword || !oldPassword || !newPassword || !confirmNewPassword" @click="changePassword">
-              {{ t("auth.changePassword") }}
             </Button>
           </DialogFooter>
 
