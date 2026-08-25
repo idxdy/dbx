@@ -58,7 +58,7 @@ export interface DataGridCopyInsertStatementOptions {
   insertMode?: DataGridCopyInsertMode;
 }
 
-export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
+export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "is-blank" | "is-not-blank" | "like" | "not-like" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
@@ -115,6 +115,15 @@ export interface DataGridCountSqlOptions {
   countHint?: string;
 }
 
+export interface DataGridConditionalUpdateSqlOptions {
+  databaseType?: DatabaseType;
+  identifierQuote?: string;
+  tableMeta: DataGridTableMeta;
+  columnName: string;
+  value: GridCellValue;
+  whereInput: string;
+}
+
 export interface HiveTablePropertiesSqlOptions {
   schema?: string;
   tableName: string;
@@ -147,6 +156,10 @@ export function buildDataGridColumnDistinctValuesSql(options: DataGridColumnDist
 
 export function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise<string> {
   return api.buildDataGridCountSql(options);
+}
+
+export function buildDataGridConditionalUpdateSql(options: DataGridConditionalUpdateSqlOptions): Promise<string | undefined> {
+  return api.buildDataGridConditionalUpdateSql(options);
 }
 
 export function buildHiveTablePropertiesSql(options: HiveTablePropertiesSqlOptions): Promise<string> {

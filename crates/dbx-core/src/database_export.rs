@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::sync::RwLock;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
@@ -18,6 +21,9 @@ use crate::types::ObjectSourceKind;
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+
+const EXPORT_CANCELLED_ERROR: &str = "Export cancelled";
+const EXPORT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn database_export_client_session_id(export_id: &str) -> String {
     task_client_session_id("database-export", export_id)
@@ -994,54 +1000,63 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     let statement_overhead_bytes = export_sql_statement_bytes(options.database_type, &statement_prefix) + 1;
     let target_statement_bytes = DATABASE_EXPORT_TARGET_STATEMENT_BYTES;
     let separator_bytes = export_sql_statement_bytes(options.database_type, ", ");
-    let mut current_values = Vec::with_capacity(batch_size);
+    let mut current_values = String::new();
     let mut current_values_bytes = 0usize;
+    let mut current_row_count = 0usize;
 
-    let flush_values = |statements: &mut Vec<String>, values: &mut Vec<String>, values_bytes: &mut usize| {
-        if values.is_empty() {
-            return;
-        }
-        let insert_sql = format!("{statement_prefix}{};", values.join(", "));
-        if needs_dameng_identity_insert {
-            statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
-        } else {
-            statements.push(insert_sql);
-        }
-        values.clear();
-        *values_bytes = 0;
-    };
+    let flush_values =
+        |statements: &mut Vec<String>, values: &mut String, values_bytes: &mut usize, row_count: &mut usize| {
+            if *row_count == 0 {
+                return;
+            }
+            let mut insert_sql = String::with_capacity(statement_prefix.len() + values.len() + 1);
+            insert_sql.push_str(&statement_prefix);
+            insert_sql.push_str(values);
+            insert_sql.push(';');
+            if needs_dameng_identity_insert {
+                statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
+            } else {
+                statements.push(insert_sql);
+            }
+            values.clear();
+            *values_bytes = 0;
+            *row_count = 0;
+        };
 
     for row in options.rows {
-        let row_values = insert_columns
-            .iter()
-            .map(|(index, _, sqlserver_unicode_string)| {
-                let value = row.get(*index).unwrap_or(&Value::Null);
-                format_export_sql_literal_typed(
-                    value,
-                    options.database_type,
-                    options.column_types.get(*index).and_then(|value| value.as_deref()),
-                    *sqlserver_unicode_string,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rendered_row = format!("({row_values})");
+        let mut rendered_row = String::with_capacity(insert_columns.len().saturating_mul(16).saturating_add(2));
+        rendered_row.push('(');
+        for (column_index, (index, _, sqlserver_unicode_string)) in insert_columns.iter().enumerate() {
+            if column_index > 0 {
+                rendered_row.push_str(", ");
+            }
+            let value = row.get(*index).unwrap_or(&Value::Null);
+            rendered_row.push_str(&format_export_sql_literal_typed(
+                value,
+                options.database_type,
+                options.column_types.get(*index).and_then(|value| value.as_deref()),
+                *sqlserver_unicode_string,
+            ));
+        }
+        rendered_row.push(')');
         let rendered_row_bytes = export_sql_statement_bytes(options.database_type, &rendered_row);
         let candidate_bytes = statement_overhead_bytes
             + current_values_bytes
-            + if current_values.is_empty() { 0 } else { separator_bytes }
+            + if current_row_count == 0 { 0 } else { separator_bytes }
             + rendered_row_bytes;
 
-        if !current_values.is_empty()
-            && (current_values.len() >= batch_size || candidate_bytes > target_statement_bytes)
-        {
-            flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
+        if current_row_count > 0 && (current_row_count >= batch_size || candidate_bytes > target_statement_bytes) {
+            flush_values(&mut statements, &mut current_values, &mut current_values_bytes, &mut current_row_count);
         }
-        current_values_bytes += if current_values.is_empty() { 0 } else { separator_bytes };
+        if current_row_count > 0 {
+            current_values.push_str(", ");
+            current_values_bytes += separator_bytes;
+        }
+        current_values.push_str(&rendered_row);
         current_values_bytes += rendered_row_bytes;
-        current_values.push(rendered_row);
+        current_row_count += 1;
     }
-    flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
+    flush_values(&mut statements, &mut current_values, &mut current_values_bytes, &mut current_row_count);
 
     Ok(statements)
 }
@@ -1444,6 +1459,74 @@ pub async fn clear_export_cancelled(export_id: &str) {
     }
 }
 
+/// Await one export operation while still observing the export-id cancellation
+/// marker. Metadata helpers ultimately await database-driver futures that do
+/// not accept a cancellation token; polling here keeps the export task
+/// responsive and dropping the pending future follows the same bounded
+/// prefetch cancellation behavior used below.
+async fn await_export_operation<T, F>(export_id: &str, operation: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if is_export_cancelled_now(export_id) {
+            return Err(EXPORT_CANCELLED_ERROR.to_string());
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                return if is_export_cancelled_now(export_id) {
+                    Err(EXPORT_CANCELLED_ERROR.to_string())
+                } else {
+                    result
+                };
+            },
+            _ = tokio::time::sleep(EXPORT_CANCEL_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+fn snapshot_batch_cancelled(db_type: &DatabaseType, export_id: &str) -> bool {
+    *db_type != DatabaseType::Postgres && is_export_cancelled_now(export_id)
+}
+
+/// Unlike metadata operations, a database row stream owns a live server query
+/// and transaction cleanup. Signal its cancellation token, then keep polling
+/// the future until that cleanup finishes before reporting Export cancelled.
+async fn await_export_stream_operation<T, F>(
+    export_id: &str,
+    cancel_token: &CancellationToken,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if is_export_cancelled_now(export_id) {
+            cancel_token.cancel();
+            if let Err(error) = operation.await {
+                if error.contains("Transaction cleanup failed") || error.contains("stream cleanup timed out") {
+                    log::warn!("[database-export] cancellation cleanup was incomplete export_id={export_id}: {error}");
+                }
+            }
+            return Err(EXPORT_CANCELLED_ERROR.to_string());
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                return if is_export_cancelled_now(export_id) {
+                    Err(EXPORT_CANCELLED_ERROR.to_string())
+                } else {
+                    result
+                };
+            },
+            _ = tokio::time::sleep(EXPORT_CANCEL_POLL_INTERVAL) => {}
+        }
+    }
+}
+
 pub async fn begin_database_backup_snapshot_core(
     state: &crate::connection::AppState,
     connection_id: &str,
@@ -1683,6 +1766,27 @@ fn emit_database_export_running(
     });
 }
 
+fn emit_database_export_cancelled(
+    on_progress: &(impl Fn(ExportProgress) + Sync),
+    export_id: &str,
+    current_object: impl Into<String>,
+    object_index: usize,
+    total_objects: usize,
+    rows_exported: u64,
+) {
+    on_progress(ExportProgress {
+        export_id: export_id.to_string(),
+        current_object: current_object.into(),
+        object_index,
+        total_objects,
+        rows_exported,
+        total_rows: None,
+        status: ExportStatus::Cancelled,
+        error: None,
+        preparing: false,
+    });
+}
+
 fn export_destination_state_key(dir: &std::path::Path) -> String {
     format!("database_export_destination:{}", dir.to_string_lossy())
 }
@@ -1880,7 +1984,16 @@ pub async fn export_database_sql_core(
     // Keep the large export state machine on the heap. Besides making the
     // caller future small, this prevents the metadata-prefetch locals from
     // exhausting the bounded stack used by test and runtime worker threads.
-    Box::pin(export_database_sql_core_inner(state, request, on_progress)).await
+    let result = Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await;
+    if result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+        // Every caller (Tauri and web SSE) needs a terminal Cancelled event;
+        // returning the marker as an error would leave the web EventSource
+        // without a terminal event and surface cancellation as Error in Tauri.
+        emit_database_export_cancelled(&on_progress, &request.export_id, String::new(), 0, 0, 0);
+        Ok(())
+    } else {
+        result
+    }
 }
 
 async fn export_database_sql_core_inner(
@@ -2031,18 +2144,22 @@ async fn export_database_sql_core_inner(
         }
     }
     let postgres_sequences = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
-        match list_postgres_export_sequences(
-            state,
-            &pool_key,
-            &request.schema,
-            &request.selected_tables,
-            &request.excluded_tables,
-            request.include_objects,
-            request.fail_on_error,
+        match await_export_operation(
+            &request.export_id,
+            list_postgres_export_sequences(
+                state,
+                &pool_key,
+                &request.schema,
+                &request.selected_tables,
+                &request.excluded_tables,
+                request.include_objects,
+                request.fail_on_error,
+            ),
         )
         .await
         {
             Ok(sequences) => sequences,
+            Err(e) if e == EXPORT_CANCELLED_ERROR => return Err(EXPORT_CANCELLED_ERROR.to_string()),
             Err(e) => {
                 record_export_error(&mut file, request.fail_on_error, format!("exporting sequences: {e}"))?;
                 Vec::new()
@@ -2090,6 +2207,7 @@ async fn export_database_sql_core_inner(
             &request.connection_id,
             &request.database,
             &request.schema,
+            None,
             None,
             None,
             None,
@@ -2176,13 +2294,16 @@ async fn export_database_sql_core_inner(
                 }
                 let ddl = if request.include_structure {
                     Some(
-                        crate::schema::get_table_relation_export_ddl_core(
-                            state,
-                            &request.connection_id,
-                            &request.database,
-                            &request.schema,
-                            &table_name,
-                            None,
+                        await_export_operation(
+                            &request.export_id,
+                            crate::schema::get_table_relation_export_ddl_core(
+                                state,
+                                &request.connection_id,
+                                &request.database,
+                                &request.schema,
+                                &table_name,
+                                None,
+                            ),
                         )
                         .await,
                     )
@@ -2194,12 +2315,15 @@ async fn export_database_sql_core_inner(
                 }
                 let columns = if request.include_data {
                     Some(
-                        crate::schema::get_columns_core(
-                            state,
-                            &request.connection_id,
-                            &request.database,
-                            &request.schema,
-                            &table_name,
+                        await_export_operation(
+                            &request.export_id,
+                            crate::schema::get_columns_core(
+                                state,
+                                &request.connection_id,
+                                &request.database,
+                                &request.schema,
+                                &table_name,
+                            ),
                         )
                         .await,
                     )
@@ -2210,6 +2334,17 @@ async fn export_database_sql_core_inner(
             }))
             .buffer_unordered(database_export_metadata_prefetch_concurrency(db_type));
         while let Some((index, metadata)) = prefetch_stream.next().await {
+            if metadata
+                .ddl
+                .as_ref()
+                .is_some_and(|result| result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR))
+                || metadata
+                    .columns
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR))
+            {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             prefetched_table_metadata[index] = Some(metadata);
             if let Some(table_info) = tables.get(index) {
                 // Presence-only updates: no prepare counter that later resets to 0/N.
@@ -2272,17 +2407,14 @@ async fn export_database_sql_core_inner(
     for (table_index, table_info) in tables.iter().enumerate().filter(|_| exports_database_tables(request)) {
         // Check cancellation
         if is_export_cancelled(&request.export_id).await {
-            on_progress(ExportProgress {
-                export_id: request.export_id.clone(),
-                current_object: table_info.name.clone(),
+            emit_database_export_cancelled(
+                &on_progress,
+                &request.export_id,
+                table_info.name.clone(),
                 object_index,
                 total_objects,
-                rows_exported: total_rows_exported,
-                total_rows: None,
-                status: ExportStatus::Cancelled,
-                error: None,
-                preparing: false,
-            });
+                total_rows_exported,
+            );
             return Ok(());
         }
 
@@ -2334,17 +2466,23 @@ async fn export_database_sql_core_inner(
             {
                 Some(result) => result,
                 None => {
-                    crate::schema::get_table_relation_export_ddl_core(
-                        state,
-                        &request.connection_id,
-                        &request.database,
-                        &request.schema,
-                        table_name,
-                        None,
+                    await_export_operation(
+                        &request.export_id,
+                        crate::schema::get_table_relation_export_ddl_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            table_name,
+                            None,
+                        ),
                     )
                     .await
                 }
             };
+            if ddl_result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             match ddl_result {
                 Ok(ddl) => {
                     let (ddl, triggers) = split_postgres_export_table_triggers(&ddl, db_type);
@@ -2376,16 +2514,22 @@ async fn export_database_sql_core_inner(
             {
                 Some(result) => result,
                 None => {
-                    crate::schema::get_columns_core(
-                        state,
-                        &request.connection_id,
-                        &request.database,
-                        &request.schema,
-                        table_name,
+                    await_export_operation(
+                        &request.export_id,
+                        crate::schema::get_columns_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            table_name,
+                        ),
                     )
                     .await
                 }
             };
+            if columns_result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             let columns = match columns_result {
                 Ok(cols) => cols,
                 Err(e) => {
@@ -2405,39 +2549,48 @@ async fn export_database_sql_core_inner(
             if !col_names.is_empty() {
                 if let Some(snapshot_session_id) = request.snapshot_session_id.as_deref() {
                     let sql = database_export_select_sql(&col_names, &col_types, table_name, &request.schema, &db_type);
-                    crate::query::stream_rows_in_manual_transaction(
-                        state,
-                        snapshot_session_id,
-                        &sql,
-                        batch_size,
-                        |rows| {
-                            if is_export_cancelled_now(&request.export_id) {
-                                return Err("Export cancelled".to_string());
-                            }
-                            write_database_export_rows(
-                                &mut file,
-                                &rows,
-                                &col_names,
-                                &col_types,
-                                &col_extras,
-                                table_name,
-                                &request.schema,
-                                &db_type,
-                            )?;
-                            total_rows_exported += rows.len() as u64;
-                            on_progress(ExportProgress {
-                                export_id: request.export_id.clone(),
-                                current_object: table_name.clone(),
-                                object_index,
-                                total_objects,
-                                rows_exported: total_rows_exported,
-                                total_rows: None,
-                                status: ExportStatus::Running,
-                                error: None,
-                                preparing: false,
-                            });
-                            Ok(())
-                        },
+                    let cancel_token = CancellationToken::new();
+                    await_export_stream_operation(
+                        &request.export_id,
+                        &cancel_token,
+                        crate::query::stream_rows_in_manual_transaction_with_cancel(
+                            state,
+                            snapshot_session_id,
+                            &sql,
+                            batch_size,
+                            Some(cancel_token.clone()),
+                            |rows| {
+                                // PostgreSQL cancellation must unwind through its CancelRequest path so the
+                                // connection reaches ReadyForQuery before rollback. Other snapshot streams do
+                                // not consume the token yet, so retain their existing next-batch cancellation.
+                                if snapshot_batch_cancelled(&db_type, &request.export_id) {
+                                    return Err(EXPORT_CANCELLED_ERROR.to_string());
+                                }
+                                write_database_export_rows(
+                                    &mut file,
+                                    &rows,
+                                    &col_names,
+                                    &col_types,
+                                    &col_extras,
+                                    table_name,
+                                    &request.schema,
+                                    &db_type,
+                                )?;
+                                total_rows_exported += rows.len() as u64;
+                                on_progress(ExportProgress {
+                                    export_id: request.export_id.clone(),
+                                    current_object: table_name.clone(),
+                                    object_index,
+                                    total_objects,
+                                    rows_exported: total_rows_exported,
+                                    total_rows: None,
+                                    status: ExportStatus::Running,
+                                    error: None,
+                                    preparing: false,
+                                });
+                                Ok(())
+                            },
+                        ),
                     )
                     .await?;
                 } else {
@@ -2460,17 +2613,14 @@ async fn export_database_sql_core_inner(
 
                     loop {
                         if is_export_cancelled(&request.export_id).await {
-                            on_progress(ExportProgress {
-                                export_id: request.export_id.clone(),
-                                current_object: table_name.clone(),
+                            emit_database_export_cancelled(
+                                &on_progress,
+                                &request.export_id,
+                                table_name.clone(),
                                 object_index,
                                 total_objects,
-                                rows_exported: total_rows_exported,
-                                total_rows,
-                                status: ExportStatus::Cancelled,
-                                error: None,
-                                preparing: false,
-                            });
+                                total_rows_exported,
+                            );
                             return Ok(());
                         }
 
@@ -2807,6 +2957,12 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
+        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
+        emit_database_export_cancelled, set_export_cancelled, snapshot_batch_cancelled, ExportStatus,
+        EXPORT_CANCELLED_ERROR,
+    };
+    use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
         database_export_select_sql, database_export_total_objects, drop_table_if_exists_sql,
         ensure_export_destination_dir, export_destination_identity_mismatch, filter_export_table_infos,
@@ -2820,12 +2976,132 @@ mod tests {
         DatabaseExportRequest, DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension, PostgresExportSequence,
         PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
-    use super::{concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency};
     use crate::connection::AppState;
     use crate::models::connection::DatabaseType;
     use crate::storage::Storage;
     use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
     use serde_json::{json, Value};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn await_export_operation_drops_pending_metadata_after_cancel() {
+        let export_id = format!("cancel-pending-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let task_export_id = export_id.clone();
+        let task = tokio::spawn(async move {
+            await_export_operation(&task_export_id, async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok::<_, String>(())
+            })
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set_export_cancelled(&export_id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop a pending metadata future")
+            .expect("cancellation task should not panic");
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_operation_preserves_completed_metadata() {
+        let export_id = format!("complete-metadata-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let result = await_export_operation(&export_id, async { Ok::<_, String>(42_u32) }).await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_signals_cancel_and_waits_for_cleanup() {
+        let export_id = format!("cancel-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+        let stream_cancel_token = cancel_token.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_after_cancel = cleaned.clone();
+        let task_export_id = export_id.clone();
+        let task = tokio::spawn(async move {
+            await_export_stream_operation(&task_export_id, &cancel_token, async move {
+                stream_cancel_token.cancelled().await;
+                cleaned_after_cancel.store(true, Ordering::SeqCst);
+                Err::<(), _>(crate::query::QUERY_CANCELED.to_string())
+            })
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set_export_cancelled(&export_id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("export stream cancellation should finish cleanup")
+            .expect("cancellation task should not panic");
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cleaned.load(Ordering::SeqCst));
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_prioritizes_existing_cancel_over_completion() {
+        let export_id = format!("cancel-ready-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cancel_token.is_cancelled());
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_preserves_normal_completion() {
+        let export_id = format!("complete-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Ok(42));
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn non_postgres_snapshot_batches_keep_existing_cancel_check() {
+        let export_id = format!("cancel-non-postgres-batch-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+
+        assert!(snapshot_batch_cancelled(&DatabaseType::Mysql, &export_id));
+        assert!(!snapshot_batch_cancelled(&DatabaseType::Postgres, &export_id));
+
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[test]
+    fn cancelled_progress_is_terminal_and_has_no_error() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        emit_database_export_cancelled(&|progress| sink.lock().unwrap().push(progress), "export-1", "seq", 3, 9, 17);
+
+        let progress = events.lock().unwrap().pop().expect("cancelled progress");
+        assert_eq!(progress.export_id, "export-1");
+        assert_eq!(progress.current_object, "seq");
+        assert_eq!(progress.object_index, 3);
+        assert_eq!(progress.total_objects, 9);
+        assert_eq!(progress.rows_exported, 17);
+        assert!(matches!(progress.status, ExportStatus::Cancelled));
+        assert!(progress.error.is_none());
+        assert!(!progress.preparing);
+    }
 
     fn table(name: &str, table_type: &str) -> TableInfo {
         TableInfo {

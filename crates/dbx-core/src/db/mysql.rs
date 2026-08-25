@@ -18,7 +18,10 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
+use crate::models::connection::{
+    is_mysql_jdbc_tls_param, mysql_jdbc_tls_mode, ConnectionConfig, DatabaseConnectionInfo, DatabaseType,
+    MysqlJdbcTlsMode,
+};
 use crate::schema::{table_name_filter_matches, TableNameFilter};
 use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database};
 use crate::types::{
@@ -29,6 +32,7 @@ use crate::types::{
 };
 
 use super::file_validator::validate_file_path;
+use crate::mysql_event_sql::MysqlEventInfo;
 
 /// DBX-owned MySQL pool handle. The driver does not expose its configured
 /// maximum, so retain that value beside the driver pool for checkout phase
@@ -65,6 +69,44 @@ impl Deref for MySqlPool {
 pub trait MySqlPoolAccess {
     fn driver_pool(&self) -> &mysql_async::Pool;
     fn checkout_max_connections(&self) -> Option<usize>;
+}
+
+pub async fn get_event_info<P: MySqlPoolAccess + ?Sized>(
+    pool: &P,
+    database: &str,
+    name: &str,
+) -> Result<MysqlEventInfo, String> {
+    let mut conn = get_conn_with_health_check(pool).await?;
+    let sql = format!(
+        "SELECT EVENT_SCHEMA, EVENT_NAME, DEFINER, TIME_ZONE, EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD, STARTS, ENDS, STATUS, ON_COMPLETION, EVENT_COMMENT, EVENT_DEFINITION, CREATED, LAST_ALTERED, LAST_EXECUTED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = {} AND EVENT_NAME = {} LIMIT 1",
+        quote_value(database), quote_value(name)
+    );
+    let row = conn
+        .query_first::<mysql_async::Row, _>(sql)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("MySQL event not found: {database}.{name}"))?;
+    Ok(MysqlEventInfo {
+        schema: get_str_by_name(&row, "EVENT_SCHEMA"),
+        name: get_str_by_name(&row, "EVENT_NAME"),
+        definer: get_opt_str(&row, "DEFINER"),
+        time_zone: get_opt_str(&row, "TIME_ZONE"),
+        event_type: get_opt_str(&row, "EVENT_TYPE"),
+        execute_at: get_opt_str(&row, "EXECUTE_AT"),
+        interval_value: get_opt_str(&row, "INTERVAL_VALUE"),
+        interval_field: get_opt_str(&row, "INTERVAL_FIELD"),
+        starts: get_opt_str(&row, "STARTS"),
+        ends: get_opt_str(&row, "ENDS"),
+        status: get_opt_str(&row, "STATUS"),
+        on_completion: get_opt_str(&row, "ON_COMPLETION"),
+        comment: get_opt_str(&row, "EVENT_COMMENT"),
+        event_body: get_opt_str(&row, "EVENT_DEFINITION"),
+        event_definition: get_opt_str(&row, "EVENT_DEFINITION"),
+        created_at: get_opt_str(&row, "CREATED"),
+        updated_at: get_opt_str(&row, "LAST_ALTERED"),
+        last_executed: get_opt_str(&row, "LAST_EXECUTED"),
+        source: None,
+    })
 }
 
 impl MySqlPoolAccess for MySqlPool {
@@ -276,6 +318,19 @@ fn get_opt_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String>
         .or_else(|| row_get::<NaiveDateTime, _>(row, name).map(|value| value.to_string()))
         .or_else(|| row_get::<NaiveDate, _>(row, name).map(|value| value.to_string()))
         .or_else(|| row_get::<NaiveTime, _>(row, name).map(|value| value.to_string()))
+}
+
+fn get_opt_unsigned_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String> {
+    row_get::<u64, _>(row, name)
+        .map(|value| value.to_string())
+        .or_else(|| {
+            row_get::<i64, _>(row, name).and_then(|value| u64::try_from(value).ok()).map(|value| value.to_string())
+        })
+        .or_else(|| {
+            get_opt_str(row, name)
+                .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|value| value.parse::<u64>().ok().map(|parsed| parsed.to_string()))
+        })
 }
 
 fn numeric_metadata_u64_to_i32(value: Option<u64>) -> Option<i32> {
@@ -1914,7 +1969,14 @@ fn mysql_url_requires_ssl(url: &str) -> bool {
     let Some((_, query)) = url.split_once('?') else {
         return false;
     };
-    query.split('&').any(|segment| {
+    let query = query.split('#').next().unwrap_or(query);
+    let has_native_tls_param = query.split('&').any(|segment| {
+        let key = segment.split_once('=').map(|(key, _)| key).unwrap_or(segment).trim();
+        key.eq_ignore_ascii_case("ssl-mode")
+            || key.eq_ignore_ascii_case("sslmode")
+            || key.eq_ignore_ascii_case("require_ssl")
+    });
+    let native_requires_ssl = query.split('&').any(|segment| {
         let Some((key, value)) = segment.split_once('=') else {
             return false;
         };
@@ -1928,7 +1990,13 @@ fn mysql_url_requires_ssl(url: &str) -> bool {
                     value.to_ascii_lowercase().replace('-', "_").as_str(),
                     "required" | "require" | "verify_ca" | "verify_identity"
                 ))
-    })
+    });
+    native_requires_ssl
+        || (!has_native_tls_param
+            && matches!(
+                mysql_jdbc_tls_mode(Some(query)),
+                Some(MysqlJdbcTlsMode::Required | MysqlJdbcTlsMode::VerifyCa)
+            ))
 }
 
 fn mysql_url_attempts_ssl(url: &str) -> bool {
@@ -1939,7 +2007,14 @@ fn mysql_url_attempts_ssl(url: &str) -> bool {
     let Some((_, query)) = url.split_once('?') else {
         return false;
     };
-    query.split('&').any(|segment| {
+    let query = query.split('#').next().unwrap_or(query);
+    let has_native_tls_param = query.split('&').any(|segment| {
+        let key = segment.split_once('=').map(|(key, _)| key).unwrap_or(segment).trim();
+        key.eq_ignore_ascii_case("ssl-mode")
+            || key.eq_ignore_ascii_case("sslmode")
+            || key.eq_ignore_ascii_case("require_ssl")
+    });
+    let native_attempts_ssl = query.split('&').any(|segment| {
         let Some((key, value)) = segment.split_once('=') else {
             return false;
         };
@@ -1947,7 +2022,13 @@ fn mysql_url_attempts_ssl(url: &str) -> bool {
         let value = value.trim();
         (key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
             && matches!(value.to_ascii_lowercase().replace('-', "_").as_str(), "preferred" | "prefer")
-    })
+    });
+    native_attempts_ssl
+        || (!has_native_tls_param
+            && matches!(
+                mysql_jdbc_tls_mode(Some(query)),
+                Some(MysqlJdbcTlsMode::Preferred | MysqlJdbcTlsMode::Required | MysqlJdbcTlsMode::VerifyCa)
+            ))
 }
 
 fn mysql_url_verifies_identity(url: &str) -> bool {
@@ -2069,6 +2150,13 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
     let mut changed = false;
     let mut has_catalog = false;
     let mut enable_cleartext_plugin = false;
+    let has_native_tls_param = query.split('&').any(|segment| {
+        let key = segment.split_once('=').map(|(key, _)| key).unwrap_or(segment).trim();
+        key.eq_ignore_ascii_case("ssl-mode")
+            || key.eq_ignore_ascii_case("sslmode")
+            || key.eq_ignore_ascii_case("require_ssl")
+    });
+    let jdbc_tls_mode = mysql_jdbc_tls_mode(Some(query));
     for segment in query.split('&') {
         let segment = segment.trim();
         if segment.is_empty() {
@@ -2086,6 +2174,10 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
         if is_mysql_cleartext_password_param(key) {
             changed = true;
             enable_cleartext_plugin |= mysql_url_param_value_is_true(value);
+            continue;
+        }
+        if is_mysql_jdbc_tls_param(key) {
+            changed = true;
             continue;
         }
         if is_dbx_handled_mysql_url_param(key) {
@@ -2120,6 +2212,22 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
             continue;
         }
         filtered.push(segment.to_string());
+    }
+    if !has_native_tls_param {
+        match jdbc_tls_mode {
+            Some(MysqlJdbcTlsMode::Disabled) => filtered.push("require_ssl=false".to_string()),
+            Some(MysqlJdbcTlsMode::Preferred | MysqlJdbcTlsMode::Required) => {
+                filtered.push("require_ssl=true".to_string());
+                filtered.push("verify_ca=false".to_string());
+                filtered.push("verify_identity=false".to_string());
+            }
+            Some(MysqlJdbcTlsMode::VerifyCa) => {
+                filtered.push("require_ssl=true".to_string());
+                filtered.push("verify_ca=true".to_string());
+                filtered.push("verify_identity=false".to_string());
+            }
+            None => {}
+        }
     }
     if enable_cleartext_plugin {
         filtered.push("enable_cleartext_plugin=true".to_string());
@@ -2747,7 +2855,10 @@ pub(super) struct TableStatusMeta {
     comment: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+    auto_increment: Option<String>,
 }
+
+const MYSQL_FRESH_TABLE_STATUS_SESSION_SQL: &str = "/*!80000 SET SESSION information_schema_stats_expiry = 0 */";
 
 async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<HashMap<String, TableStatusMeta>, String> {
     query_table_status_show(pool, database, None).await
@@ -2777,8 +2888,19 @@ async fn query_table_status_show(
     filter: Option<&str>,
 ) -> Result<HashMap<String, TableStatusMeta>, String> {
     let sql = show_table_status_sql(database, filter);
+    query_table_status_sql(pool, &sql).await
+}
+
+async fn query_table_status_sql(pool: &MySqlPool, sql: &str) -> Result<HashMap<String, TableStatusMeta>, String> {
     let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    query_table_status_sql_with_conn(&mut conn, sql).await
+}
+
+async fn query_table_status_sql_with_conn(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> Result<HashMap<String, TableStatusMeta>, String> {
+    let result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
@@ -2791,11 +2913,23 @@ async fn query_table_status_show(
                         .filter(|s| !s.is_empty()),
                     created_at: get_opt_metadata_string(row, "Create_time"),
                     updated_at: get_opt_metadata_string(row, "Update_time"),
+                    auto_increment: get_opt_unsigned_metadata_string(row, "Auto_increment"),
                 },
             )
         })
         .filter(|(name, _)| !name.is_empty())
         .collect())
+}
+
+pub async fn get_table_auto_increment(pool: &MySqlPool, database: &str, table: &str) -> Result<Option<String>, String> {
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    // MySQL 8 caches SHOW TABLE STATUS statistics by default, including the
+    // counter after ALTER TABLE. The version comment is a no-op on MySQL 5.7.
+    if let Err(error) = conn.query_drop(MYSQL_FRESH_TABLE_STATUS_SESSION_SQL).await {
+        log::debug!("Failed to disable cached MySQL table statistics before reading AUTO_INCREMENT: {error}");
+    }
+    let status = query_table_status_sql_with_conn(&mut conn, &show_table_status_exact_sql(database, table)).await?;
+    Ok(status.into_values().next().and_then(|meta| meta.auto_increment))
 }
 
 fn filter_table_status_fallback(
@@ -2970,6 +3104,15 @@ fn show_table_status_sql(database: &str, filter: Option<&str>) -> String {
         sql.push_str(&conditions.join(" OR "));
     }
     sql
+}
+
+fn show_table_status_exact_sql(database: &str, table: &str) -> String {
+    let prefix = if database.trim().is_empty() {
+        "SHOW TABLE STATUS".to_string()
+    } else {
+        format!("SHOW TABLE STATUS FROM {}", quote_identifier(database))
+    };
+    format!("{prefix} WHERE Name = {}", quote_value(table))
 }
 
 fn show_tables_filter_conditions(database: &str, filter: Option<&str>, exact_names: &[String]) -> Vec<String> {
@@ -6412,6 +6555,33 @@ mod tests {
     }
 
     #[test]
+    fn mysql_table_status_auto_increment_is_lossless_and_nullable() {
+        let auto_increment_column = Column::new(ColumnType::MYSQL_TYPE_LONGLONG).with_name(b"Auto_increment");
+        let maximum = mysql_test_row_with_columns(vec![Value::UInt(u64::MAX)], vec![auto_increment_column.clone()]);
+        let null = mysql_test_row_with_columns(vec![Value::NULL], vec![auto_increment_column]);
+
+        assert_eq!(
+            get_opt_unsigned_metadata_string(&maximum, "Auto_increment").as_deref(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(get_opt_unsigned_metadata_string(&null, "Auto_increment"), None);
+    }
+
+    #[test]
+    fn mysql_exact_table_status_sql_quotes_identifiers_and_names() {
+        assert_eq!(
+            show_table_status_exact_sql("sales`archive", "order's"),
+            "SHOW TABLE STATUS FROM `sales``archive` WHERE Name = 'order\\'s'"
+        );
+    }
+
+    #[test]
+    fn mysql_table_status_refresh_directive_is_version_gated() {
+        assert!(MYSQL_FRESH_TABLE_STATUS_SESSION_SQL.starts_with("/*!80000 "));
+        assert!(MYSQL_FRESH_TABLE_STATUS_SESSION_SQL.contains("information_schema_stats_expiry = 0"));
+    }
+
+    #[test]
     fn mysql_list_tables_sql_applies_table_name_filter_before_pagination() {
         let filter = TableNameFilter {
             include_patterns: vec!["ads_cp%".to_string(), "user_%".to_string()],
@@ -7619,15 +7789,77 @@ mod tests {
     }
 
     #[test]
-    fn mysql_async_url_strips_jdbc_params() {
+    fn mysql_async_url_translates_connector_j_tls_params() {
         let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&allowPublicKeyRetrieval=true";
-        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db");
+        assert_eq!(
+            mysql_async_url(url).as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+    }
+
+    #[test]
+    fn mysql_async_url_translates_connector_j_required_verified_tls_params() {
+        let url = "mysql://host:3306/db?useSSL=true&requireSSL=true&verifyServerCertificate=true";
+        assert_eq!(
+            mysql_async_url(url).as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=true&verify_identity=false"
+        );
+    }
+
+    #[test]
+    fn mysql_async_url_preserves_connector_j_tls_truth_table() {
+        assert_eq!(
+            mysql_async_url("mysql://host:3306/db?verifyServerCertificate=true").as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=true&verify_identity=false"
+        );
+        assert_eq!(
+            mysql_async_url("mysql://host:3306/db?useSSL=false&requireSSL=true&verifyServerCertificate=true").as_ref(),
+            "mysql://host:3306/db?require_ssl=false"
+        );
+        assert_eq!(
+            mysql_async_url("mysql://host:3306/db?requireSSL=false").as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+    }
+
+    #[test]
+    fn mysql_async_url_uses_last_connector_j_tls_param_value() {
+        assert_eq!(
+            mysql_async_url("mysql://host:3306/db?useSSL=false&useSSL=true").as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+        assert_eq!(
+            mysql_async_url("mysql://host:3306/db?useSSL=true&useSSL=false&verifyServerCertificate=true").as_ref(),
+            "mysql://host:3306/db?require_ssl=false"
+        );
+    }
+
+    #[test]
+    fn mysql_async_url_prefers_native_tls_mode_over_connector_j_aliases() {
+        let url = "mysql://host:3306/db?sslMode=REQUIRED&useSSL=false&requireSSL=false";
+        assert_eq!(
+            mysql_async_url(url).as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
     }
 
     #[test]
     fn mysql_async_url_keeps_valid_params_while_stripping_jdbc() {
         let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&require_ssl=true&charset=utf8mb4&autoReconnect=true&allowMultiQueries=true";
         assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true");
+    }
+
+    #[test]
+    fn connector_j_preferred_tls_falls_back_but_required_tls_does_not() {
+        assert_eq!(
+            ssl_fallback_url("mysql://host:3306/db?useSSL=true&characterEncoding=utf8"),
+            Some("mysql://host:3306/db?useSSL=true&characterEncoding=utf8&ssl-mode=disabled".to_string())
+        );
+        assert_eq!(ssl_fallback_url("mysql://host:3306/db?useSSL=true&requireSSL=true"), None);
+        assert_eq!(ssl_fallback_url("mysql://host:3306/db?verifyServerCertificate=true"), None);
+        let disabled = "mysql://host:3306/db?useSSL=false&requireSSL=true&verifyServerCertificate=true";
+        assert!(!mysql_url_requires_ssl(disabled));
+        assert!(!mysql_url_attempts_ssl(disabled));
     }
 
     #[test]

@@ -144,7 +144,8 @@ export function useSqlExecution(deps: {
 
   async function resolvedExecutableSql(source?: SqlExecutionOverride): Promise<{ sql: string; sourceOffset?: number; editorViewportRequestId?: number }> {
     const atSetEnabled = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, deps.activeConnection.value?.db_type, settingsStore.editorSettings.sqlVariableSubstitutionEnabled).atSet;
-    const expand = (sql: string, declarationSql?: string) => (atSetEnabled ? expandSqlVariables(sql, { declarationSql }).sql : sql);
+    const databaseType = effectiveDatabaseTypeForConnection(deps.activeConnection.value) ?? deps.activeConnection.value?.db_type;
+    const expand = (sql: string, declarationSql?: string) => (atSetEnabled ? expandSqlVariables(sql, { declarationSql, databaseType }).sql : sql);
     if (typeof source === "string") return { sql: expand(source) };
 
     const resolved = deps.resolveExecutableSql ? await deps.resolveExecutableSql(source) : isSqlExecutionSnapshot(source) ? resolveExecutableSql(source.fullSql, source.selectedSql, { cursorPos: source.cursorPos }) : deps.executableSql.value;
@@ -301,14 +302,15 @@ export function useSqlExecution(deps: {
       ...(options.editorViewportRequestId !== undefined ? { onExecutionStarted: () => deps.onExecutionStarted?.(options.editorViewportRequestId!) } : {}),
     });
     if (producedResult === false) return;
+    const executionTabStillActive = deps.activeTab.value?.id === tab.id;
     const sqlServerMessageResultIndex = executionDatabaseType === "sqlserver" ? tab.results?.findIndex((result) => result.server_message === true) : undefined;
     if (sqlServerMessageResultIndex !== undefined && sqlServerMessageResultIndex >= 0) {
       focusSqlServerDataResult(tab.id, executionDatabaseType, tab);
-      deps.activeOutputView.value = "result";
+      if (executionTabStillActive) deps.activeOutputView.value = "result";
     } else if (executionDatabaseType === "sqlserver" && tab.result?.server_message === true) {
-      deps.activeOutputView.value = "result";
+      if (executionTabStillActive) deps.activeOutputView.value = "result";
     } else if (tab.result && !tab.result.columns.length && !tab.results?.some((result) => result.columns.length > 0)) {
-      deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(tab.result) : "summary";
+      if (executionTabStillActive) deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(tab.result) : "summary";
     }
     const elapsed = Date.now() - start;
     const failure = firstQueryExecutionError(tab);
@@ -480,7 +482,7 @@ export function useSqlExecution(deps: {
       // 会让多个 worker 几乎同时改这个共享 ref，导致主视图在 result/summary 间反复
       // 跳动（闪烁/竞态）。worker 结果已由 captureMultiDbExecutionWorkerResult 记录
       // 到 source tab 的 result run 并通过 projectResultRun 投影显示，无需再切主视图。
-      if (!workerId) {
+      if (!workerId && deps.activeTab.value?.id === tab.id) {
         deps.activeOutputView.value = success && (latest.result?.columns.length || latest.results?.some((result) => result.columns.length)) ? "result" : "summary";
       }
       return finish(success ? { status: "success", errorMessage } : { status: "failed", errorMessage });
