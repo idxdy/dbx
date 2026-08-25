@@ -22,6 +22,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.net.URI;
 import java.security.PrivilegedAction;
 import java.time.Duration;
 import java.util.*;
@@ -266,8 +267,7 @@ public final class LdapAgent {
         int responseTimeout = intOrDefault(conn, "response_timeout_ms", DEFAULT_RESPONSE_TIMEOUT_MS);
 
         String protocol = useSsl ? "ldaps" : "ldap";
-        String hostForUrl = hostname.contains(":") ? "[" + hostname + "]" : hostname;
-        String providerUrl = protocol + "://" + hostForUrl + ":" + port;
+        String providerUrl = new URI(protocol, null, hostname, port, null, null, null).toString();
 
         Hashtable<String, Object> env = new Hashtable<>();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
