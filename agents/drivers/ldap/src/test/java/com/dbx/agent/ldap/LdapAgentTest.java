@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 
 class LdapAgentTest {
 
@@ -277,7 +278,7 @@ class LdapAgentTest {
                 "connection": {
                   "host": "ldap.example.com",
                   "port": 636,
-                  "use_ssl": true,
+                  "ssl": true,
                   "tls_skip_verify": true,
                   "security_protocol": "simple",
                   "bind_dn": "cn=admin,dc=example,dc=com",
@@ -402,23 +403,89 @@ class LdapAgentTest {
 
     // =======================================================================
     // Integration tests — real LDAP server
+    //
+    // These tests exercise the agent against a live OpenLDAP server launched
+    // from `deploy/database/ldap/compose.yml` (image `mlan/openldap`, root
+    // suffix `dc=example,dc=com`, admin `cn=admin,dc=example,dc=com` /
+    // `123456`, demo users `uid=alice|bob|charlie,ou=users,dc=example,dc=com`
+    // with password `123456`).
+    //
+    // Every value can be overridden with environment variables so the same
+    // test file can target any LDAP server:
+    //
+    //   DBX_LDAP_TEST_HOST            default localhost
+    //   DBX_LDAP_TEST_PORT            default 389
+    //   DBX_LDAP_TEST_SSL_PORT        default 636   (LDAPS — see note below)
+    //   DBX_LDAP_TEST_BASE_DN         default dc=example,dc=com
+    //   DBX_LDAP_TEST_BIND_DN         default cn=admin,dc=example,dc=com
+    //   DBX_LDAP_TEST_BIND_PASSWORD   default 123456
+    //   DBX_LDAP_TEST_USER_DN         default uid=alice,ou=users,dc=example,dc=com
+    //   DBX_LDAP_TEST_USER_PASSWORD   default 123456
+    //   DBX_LDAP_TEST_USER_UID        default alice
+    //   DBX_LDAP_TEST_USER_FILTER     default (uid=alice)
+    //
+    // If the server is unreachable the integration tests are skipped (not
+    // failed) so a plain `gradle test` still succeeds without the container.
     // =======================================================================
 
-    private static final String LDAP_HOST = "ldap.example.com";
-    private static final int LDAP_PORT = 389;
-    private static final String BASE_DN = "dc=example,dc=com";
-    private static final String SIMPLE_USER = "username";
-    private static final String SIMPLE_PASS = "123456";
-
-    private static String simpleBindTestConnectionRequest(int id) {
-        return simpleBindRequest(id, "test_connection");
+    private static String envOr(String key, String fallback) {
+        String v = System.getenv(key);
+        return (v == null || v.isBlank()) ? fallback : v;
     }
 
-    private static String simpleBindConnectRequest(int id) {
-        return simpleBindRequest(id, "connect");
+    private static int envIntOr(String key, int fallback) {
+        try {
+            return Integer.parseInt(envOr(key, String.valueOf(fallback)));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
-    private static String simpleBindRequest(int id, String method) {
+    private static final int LDAP_PORT = envIntOr("DBX_LDAP_TEST_PORT", 389);
+    private static final int LDAP_SSL_PORT = envIntOr("DBX_LDAP_TEST_SSL_PORT", 636);
+
+    /**
+     * Resolves the LDAP host to use. An explicit {@code DBX_LDAP_TEST_HOST}
+     * always wins; otherwise the first reachable candidate wins so the tests
+     * work out of the box with common local setups. On WSL2 + podman the
+     * published port is reachable via {@code localhost} or IPv6 {@code ::1}
+     * but NOT necessarily via {@code 127.0.0.1} (which is what {@code
+     * InetSocketAddress("localhost")} normally prefers), so both are probed.
+     */
+    private static String resolveLdapHost() {
+        String explicit = System.getenv("DBX_LDAP_TEST_HOST");
+        if (explicit != null && !explicit.isBlank()) return explicit;
+        for (String candidate : new String[]{"localhost", "::1"}) {
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress(candidate, LDAP_PORT), 1000);
+                return candidate;
+            } catch (Exception e) {
+                // try next candidate
+            }
+        }
+        return "localhost";
+    }
+
+    private static final String LDAP_HOST = resolveLdapHost();
+    private static final String BASE_DN = envOr("DBX_LDAP_TEST_BASE_DN", "dc=example,dc=com");
+    private static final String BIND_DN = envOr("DBX_LDAP_TEST_BIND_DN", "cn=admin,dc=example,dc=com");
+    private static final String BIND_PASS = envOr("DBX_LDAP_TEST_BIND_PASSWORD", "123456");
+    private static final String USER_DN = envOr("DBX_LDAP_TEST_USER_DN", "uid=alice,ou=users,dc=example,dc=com");
+    private static final String USER_PASS = envOr("DBX_LDAP_TEST_USER_PASSWORD", "123456");
+    private static final String USER_UID = envOr("DBX_LDAP_TEST_USER_UID", "alice");
+    private static final String USER_FILTER = envOr("DBX_LDAP_TEST_USER_FILTER", "(uid=alice)");
+
+    /** @return true when the configured LDAP server is reachable on the plain port. */
+    private static boolean serverReachable() {
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new java.net.InetSocketAddress(LDAP_HOST, LDAP_PORT), 2000);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String simpleBindRequest(int id, String method, String dn, String password, int port) {
         JsonObject req = new JsonObject();
         req.addProperty("jsonrpc", "2.0");
         req.addProperty("id", id);
@@ -426,18 +493,67 @@ class LdapAgentTest {
         JsonObject params = new JsonObject();
         JsonObject conn = new JsonObject();
         conn.addProperty("hostname", LDAP_HOST);
-        conn.addProperty("port", LDAP_PORT);
+        conn.addProperty("port", port);
         conn.addProperty("security_protocol", "simple");
-        conn.addProperty("username", SIMPLE_USER);
-        conn.addProperty("password", SIMPLE_PASS);
+        conn.addProperty("username", dn);
+        conn.addProperty("password", password);
         params.add("connection", conn);
         req.add("params", params);
         return req.toString();
     }
 
+    private static String adminTestConnectionRequest(int id) {
+        return simpleBindRequest(id, "test_connection", BIND_DN, BIND_PASS, LDAP_PORT);
+    }
+
+    private static String adminConnectRequest(int id) {
+        return simpleBindRequest(id, "connect", BIND_DN, BIND_PASS, LDAP_PORT);
+    }
+
+    private static String userTestConnectionRequest(int id) {
+        return simpleBindRequest(id, "test_connection", USER_DN, USER_PASS, LDAP_PORT);
+    }
+
+    private static String userConnectRequest(int id) {
+        return simpleBindRequest(id, "connect", USER_DN, USER_PASS, LDAP_PORT);
+    }
+
+    private static String ldapsAdminTestConnectionRequest(int id) {
+        JsonObject req = new JsonObject();
+        req.addProperty("jsonrpc", "2.0");
+        req.addProperty("id", id);
+        req.addProperty("method", "test_connection");
+        JsonObject params = new JsonObject();
+        JsonObject conn = new JsonObject();
+        conn.addProperty("hostname", LDAP_HOST);
+        conn.addProperty("port", LDAP_SSL_PORT);
+        conn.addProperty("ssl", true);
+        conn.addProperty("tls_skip_verify", true);
+        conn.addProperty("security_protocol", "simple");
+        conn.addProperty("username", BIND_DN);
+        conn.addProperty("password", BIND_PASS);
+        params.add("connection", conn);
+        req.add("params", params);
+        return req.toString();
+    }
+
+    private static String searchRequest(int id, String filter, int sizeLimit) {
+        JsonObject req = new JsonObject();
+        req.addProperty("jsonrpc", "2.0");
+        req.addProperty("id", id);
+        req.addProperty("method", "ldap_search");
+        JsonObject params = new JsonObject();
+        params.addProperty("base_dn", BASE_DN);
+        params.addProperty("filter", filter);
+        params.addProperty("size_limit", sizeLimit);
+        req.add("params", params);
+        return req.toString();
+    }
+
     @Test
-    void integrationSimpleBindTestConnectionSucceeds() {
-        String response = LdapAgent.handleRequest(simpleBindTestConnectionRequest(100));
+    void integrationSimpleBindAdminTestConnectionSucceeds() {
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String response = LdapAgent.handleRequest(adminTestConnectionRequest(100));
 
         var payload = JsonParser.parseString(response).getAsJsonObject();
         if (payload.has("error")) {
@@ -452,26 +568,30 @@ class LdapAgentTest {
     }
 
     @Test
+    void integrationSimpleBindUserTestConnectionSucceeds() {
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String response = LdapAgent.handleRequest(userTestConnectionRequest(105));
+
+        var payload = JsonParser.parseString(response).getAsJsonObject();
+        assertTrue(payload.has("result"), "Expected result but got error: "
+            + (payload.has("error") ? payload.getAsJsonObject("error").get("message").getAsString() : "unknown"));
+        var result = payload.getAsJsonObject("result");
+        assertTrue(result.get("ok").getAsBoolean());
+        assertTrue(result.get("connected").getAsBoolean());
+    }
+
+    @Test
     void integrationSimpleBindConnectAndSearch() {
-        // Step 1: connect
-        String connectResp = LdapAgent.handleRequest(simpleBindConnectRequest(101));
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        // Step 1: connect as the demo user
+        String connectResp = LdapAgent.handleRequest(userConnectRequest(101));
         var connectPayload = JsonParser.parseString(connectResp).getAsJsonObject();
         assertTrue(connectPayload.has("result"),
             "Connect failed: " + connectPayload);
         assertTrue(connectPayload.getAsJsonObject("result").get("ok").getAsBoolean());
 
-        // Step 2: search
-        JsonObject searchReq = new JsonObject();
-        searchReq.addProperty("jsonrpc", "2.0");
-        searchReq.addProperty("id", 102);
-        searchReq.addProperty("method", "ldap_search");
-        JsonObject searchParams = new JsonObject();
-        searchParams.addProperty("base_dn", BASE_DN);
-        searchParams.addProperty("filter", "(&(objectClass=user)(sAMAccountName=username))");
-        searchParams.addProperty("size_limit", 10);
-        searchReq.add("params", searchParams);
-
-        String searchResp = LdapAgent.handleRequest(searchReq.toString());
+        // Step 2: search for the demo user by uid
+        String searchResp = LdapAgent.handleRequest(searchRequest(102, USER_FILTER, 10));
         var searchPayload = JsonParser.parseString(searchResp).getAsJsonObject();
         if (searchPayload.has("error")) {
             var err = searchPayload.getAsJsonObject("error");
@@ -484,28 +604,21 @@ class LdapAgentTest {
         assertEquals(1, result.getAsJsonArray("entries").size());
         var entry = result.getAsJsonArray("entries").get(0).getAsJsonObject();
         assertNotNull(entry.get("dn"));
-        assertNotNull(entry.get("attributes"));
+        var attrs = entry.getAsJsonObject("attributes");
+        assertNotNull(attrs);
+        assertTrue(attrs.has("uid") || attrs.has("cn"), "Expected user attributes, got: " + attrs);
     }
 
     @Test
     void integrationSimpleBindSearchWithLimit() {
-        // Connect
-        String connectResp = LdapAgent.handleRequest(simpleBindConnectRequest(103));
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        // Connect as admin to list all demo users
+        String connectResp = LdapAgent.handleRequest(adminConnectRequest(103));
         var cp = JsonParser.parseString(connectResp).getAsJsonObject();
         assertTrue(cp.has("result"), "Connect failed: " + cp);
 
-        // Search with limit=3
-        JsonObject searchReq = new JsonObject();
-        searchReq.addProperty("jsonrpc", "2.0");
-        searchReq.addProperty("id", 104);
-        searchReq.addProperty("method", "ldap_search");
-        JsonObject searchParams = new JsonObject();
-        searchParams.addProperty("base_dn", BASE_DN);
-        searchParams.addProperty("filter", "(objectClass=user)");
-        searchParams.addProperty("size_limit", 3);
-        searchReq.add("params", searchParams);
-
-        String searchResp = LdapAgent.handleRequest(searchReq.toString());
+        // Search with limit=3 across inetOrgPerson users
+        String searchResp = LdapAgent.handleRequest(searchRequest(104, "(objectClass=inetOrgPerson)", 3));
         var sp = JsonParser.parseString(searchResp).getAsJsonObject();
         assertTrue(sp.has("result"), "Search failed: " + sp);
         var result = sp.getAsJsonObject("result");
@@ -514,10 +627,39 @@ class LdapAgentTest {
         assertTrue(result.get("count").getAsInt() <= 3 || result.has("truncated"));
     }
 
-    // =======================================================================
-    // GSSAPI integration tests
-    // =======================================================================
+    // -----------------------------------------------------------------------
+    // LDAPS (636) integration test
+    //
+    // The `mlan/openldap` image does not ship TLS support out of the box, so
+    // `deploy/database/ldap/compose.yml` was extended to enable it: the config
+    // bootstrap (`ldif/0/0.ldif`) sets olcTLSCertificateFile/Key on cn=config
+    // and `LDAPURI` includes `ldaps:///`; a self-signed CA + server cert live
+    // under `deploy/database/ldap/certs/`. The client uses `tls_skip_verify`
+    // (TrustAllSSLSocketFactory) because the CA is self-signed.
+    // -----------------------------------------------------------------------
+    @Test
+    void integrationSimpleBindOverLdapsSucceeds() {
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String response = LdapAgent.handleRequest(ldapsAdminTestConnectionRequest(106));
 
+        var payload = JsonParser.parseString(response).getAsJsonObject();
+        assertTrue(payload.has("result"), "Expected result but got error: "
+            + (payload.has("error") ? payload.getAsJsonObject("error").get("message").getAsString() : "unknown"));
+        var result = payload.getAsJsonObject("result");
+        assertTrue(result.get("ok").getAsBoolean());
+        assertTrue(result.get("connected").getAsBoolean());
+    }
+
+    // =======================================================================
+    // GSSAPI integration tests — DISABLED
+    //
+    // GSSAPI (Kerberos) requires a KDC and a keytab/ticket; the OpenLDAP
+    // container from `compose.yml` provides neither, so these cannot run
+    // against the local test server. They are left commented out for
+    // reference and can be re-enabled when a Kerberos-enabled LDAP server is
+    // available (set DBX_LDAP_TEST_HOST / DBX_LDAP_TEST_PORT accordingly).
+    // =======================================================================
+    /*
     private static final String GSSAPI_HOST = "dc.example.com";
     private static final String GSSAPI_PRINCIPAL = "user@example.com";
     private static final String GSSAPI_PASS = "123456";
@@ -537,14 +679,6 @@ class LdapAgentTest {
             .example.com = EXAMPLE.COM
             example.com = EXAMPLE.COM
         """;
-
-    private static String gssapiConnectRequest(int id) {
-        return gssapiRequest(id, "connect");
-    }
-
-    private static String gssapiTestConnectionRequest(int id) {
-        return gssapiRequest(id, "test_connection");
-    }
 
     private static String gssapiRequest(int id, String method) {
         JsonObject req = new JsonObject();
@@ -566,13 +700,10 @@ class LdapAgentTest {
 
     @Test
     void integrationGssapiPasswordTestConnectionSucceeds() {
-        String response = LdapAgent.handleRequest(gssapiTestConnectionRequest(110));
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String response = LdapAgent.handleRequest(gssapiRequest(110, "test_connection"));
 
         var payload = JsonParser.parseString(response).getAsJsonObject();
-        if (payload.has("error")) {
-            System.err.println("GSSAPI test_connection failed: "
-                + payload.getAsJsonObject("error").get("message").getAsString());
-        }
         assertTrue(payload.has("result"), "Expected result but got error: "
             + (payload.has("error") ? payload.getAsJsonObject("error").get("message").getAsString() : "unknown"));
         var result = payload.getAsJsonObject("result");
@@ -582,58 +713,30 @@ class LdapAgentTest {
 
     @Test
     void integrationGssapiConnectAndSearch() {
-        // Step 1: connect with GSSAPI
-        String connectResp = LdapAgent.handleRequest(gssapiConnectRequest(111));
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String connectResp = LdapAgent.handleRequest(gssapiRequest(111, "connect"));
         var connectPayload = JsonParser.parseString(connectResp).getAsJsonObject();
-        assertTrue(connectPayload.has("result"),
-            "GSSAPI connect failed: " + connectPayload);
+        assertTrue(connectPayload.has("result"), "GSSAPI connect failed: " + connectPayload);
         assertTrue(connectPayload.getAsJsonObject("result").get("ok").getAsBoolean());
 
-        // Step 2: search
-        JsonObject searchReq = new JsonObject();
-        searchReq.addProperty("jsonrpc", "2.0");
-        searchReq.addProperty("id", 112);
-        searchReq.addProperty("method", "ldap_search");
-        JsonObject searchParams = new JsonObject();
-        searchParams.addProperty("base_dn", BASE_DN);
-        searchParams.addProperty("filter", "(&(objectClass=user)(sAMAccountName=username))");
-        searchParams.addProperty("size_limit", 10);
-        searchReq.add("params", searchParams);
-
-        String searchResp = LdapAgent.handleRequest(searchReq.toString());
+        String searchResp = LdapAgent.handleRequest(searchRequest(112, USER_FILTER, 10));
         var searchPayload = JsonParser.parseString(searchResp).getAsJsonObject();
-        if (searchPayload.has("error")) {
-            System.err.println("GSSAPI search failed: "
-                + searchPayload.getAsJsonObject("error").get("message").getAsString());
-        }
-        assertTrue(searchPayload.has("result"),
-            "GSSAPI search failed: " + searchPayload);
+        assertTrue(searchPayload.has("result"), "GSSAPI search failed: " + searchPayload);
         var result = searchPayload.getAsJsonObject("result");
         assertTrue(result.get("count").getAsInt() > 0);
         var entry = result.getAsJsonArray("entries").get(0).getAsJsonObject();
         assertNotNull(entry.get("dn"));
-        assertNotNull(entry.get("attributes").getAsJsonObject().get("sAMAccountName"));
+        assertNotNull(entry.getAsJsonObject("attributes").get("uid"));
     }
 
     @Test
     void integrationGssapiSearchAllAttributes() {
-        // Connect
-        String connectResp = LdapAgent.handleRequest(gssapiConnectRequest(113));
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String connectResp = LdapAgent.handleRequest(gssapiRequest(113, "connect"));
         var cp = JsonParser.parseString(connectResp).getAsJsonObject();
         assertTrue(cp.has("result"), "GSSAPI connect failed: " + cp);
 
-        // Search without specifying attributes → returns all
-        JsonObject searchReq = new JsonObject();
-        searchReq.addProperty("jsonrpc", "2.0");
-        searchReq.addProperty("id", 114);
-        searchReq.addProperty("method", "ldap_search");
-        JsonObject searchParams = new JsonObject();
-        searchParams.addProperty("base_dn", BASE_DN);
-        searchParams.addProperty("filter", "(&(objectClass=user)(sAMAccountName=username))");
-        searchParams.addProperty("size_limit", 1);
-        searchReq.add("params", searchParams);
-
-        String searchResp = LdapAgent.handleRequest(searchReq.toString());
+        String searchResp = LdapAgent.handleRequest(searchRequest(114, USER_FILTER, 1));
         var sp = JsonParser.parseString(searchResp).getAsJsonObject();
         assertTrue(sp.has("result"), "Search failed: " + sp);
         var result = sp.getAsJsonObject("result");
@@ -641,6 +744,7 @@ class LdapAgentTest {
         var entry = result.getAsJsonArray("entries").get(0).getAsJsonObject();
         var attrs = entry.getAsJsonObject("attributes");
         assertNotNull(attrs.get("cn"));
-        assertNotNull(attrs.get("sAMAccountName"));
+        assertNotNull(attrs.get("uid"));
     }
+    */
 }

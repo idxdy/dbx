@@ -266,7 +266,8 @@ public final class LdapAgent {
         int responseTimeout = intOrDefault(conn, "response_timeout_ms", DEFAULT_RESPONSE_TIMEOUT_MS);
 
         String protocol = useSsl ? "ldaps" : "ldap";
-        String providerUrl = protocol + "://" + hostname + ":" + port;
+        String hostForUrl = hostname.contains(":") ? "[" + hostname + "]" : hostname;
+        String providerUrl = protocol + "://" + hostForUrl + ":" + port;
 
         Hashtable<String, Object> env = new Hashtable<>();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
