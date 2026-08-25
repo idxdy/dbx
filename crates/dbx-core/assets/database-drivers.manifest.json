@@ -2769,7 +2769,7 @@
       "agentKey": "ldap",
       "singleConnectionPool": true,
       "metadataConnectionScoped": false,
-      "skipTcpProbe": false,
+      "skipTcpProbe": true,
       "defaultPort": 389,
       "supportLevel": "connect",
       "capabilities": {
