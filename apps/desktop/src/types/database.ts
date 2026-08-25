@@ -116,6 +116,11 @@ export interface ConnectionConfig {
   redis_scan_page_size?: number;
   redis_database_aliases?: Record<string, string>;
   etcd_endpoints?: string;
+  ldap_security_protocol?: "simple" | "gssapi" | "none";
+  ldap_principal?: string;
+  ldap_keytab_path?: string;
+  ldap_krb5_conf?: string;
+  ldap_base_dn?: string;
   gbase_server?: string;
   informix_server?: string;
   external_config?: unknown;
@@ -911,6 +916,8 @@ export type TreeNodeType =
   | "zookeeper-root"
   | "consul-root"
   | "consul-overview"
+  | "ldap-root"
+  | "ldap-entry"
   | "mongo-db"
   | "mongo-gridfs"
   | "mongo-buckets"
@@ -1154,6 +1161,8 @@ export interface QueryTab {
     | "zookeeper"
     | "consul"
     | "consul-overview"
+    | "ldap"
+    | "ldap-search"
     | "mq"
     | "mqtt"
     | "nacos"

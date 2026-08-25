@@ -1970,6 +1970,7 @@ async fn do_execute_typed(
         }
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err(MONGO_SHELL_COMMAND_HINT.to_string()),
+        PoolKind::Ldap(_) => Err("LDAP connections do not support SQL execution".to_string()),
         PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
         #[cfg(feature = "mq-admin")]
         PoolKind::Mqtt(_) => Err("Use MQTT-specific commands".to_string()),
@@ -3564,6 +3565,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Nacos
         | PoolKind::Consul(_)
         | PoolKind::HBase(_)
+        | PoolKind::Ldap(_)
         | PoolKind::DuckDbWorker(_)
         | PoolKind::Redis(_)
         | PoolKind::MongoDb(_)
@@ -3830,7 +3832,9 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
                 TxPath::Explicit
             }
             PoolKind::Agent(client) => TxPath::Agent(client.clone()),
-            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => TxPath::None,
+            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) | PoolKind::Ldap(_) => {
+                TxPath::None
+            }
             #[cfg(feature = "mq-admin")]
             PoolKind::Mqtt(_) => TxPath::None,
             PoolKind::DuckDbWorker(_)
@@ -5659,6 +5663,11 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
@@ -7649,6 +7658,11 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
