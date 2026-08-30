@@ -260,7 +260,8 @@ public final class LdapAgent {
         String hostname = stringOrEmpty(conn, "hostname");
         if (hostname.isBlank()) hostname = stringOrEmpty(conn, "host");
         int port = intOrDefault(conn, "port", 389);
-        boolean useSsl = boolOrDefault(conn, "ssl", false) || boolOrDefault(conn, "use_ssl", false);
+        boolean useSsl = boolOrDefault(conn, "ssl", false) || boolOrDefault(conn, "use_ssl", false)
+            || port == 636;
         boolean tlsSkipVerify = boolOrDefault(conn, "tls_skip_verify", false);
 
         int connectTimeout = intOrDefault(conn, "connect_timeout_ms", DEFAULT_CONNECT_TIMEOUT_MS);
