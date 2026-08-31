@@ -40,6 +40,7 @@ import {
   Scissors,
   CopyPlus,
   Plus,
+  Replace,
   ScrollText,
   Code2,
   Wrench,
@@ -178,6 +179,7 @@ import { sidebarStructureExportTargets } from "@/lib/sidebar/sidebarExportRuntim
 import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseBackup";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { openLdapCreateEntryDialog, openLdapDeleteEntryDialog, openLdapRenameEntryDialog } from "@/lib/ldap/ldapEntryDialogState";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
@@ -5324,7 +5326,41 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   }
 
   if (node.type === "ldap-entry") {
-    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+    items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
+    const ldapReadOnly = Boolean((node.connectionId ? connectionStore.getConfig(node.connectionId) : (undefined as any))?.read_only);
+    if (node.connectionId && node.database) {
+      items.push({
+        label: t("ldap.addChildEntry"),
+        action: () => openLdapCreateEntryDialog(node.connectionId!, node.database!),
+        icon: Plus,
+        disabled: ldapReadOnly,
+      });
+      items.push({
+        label: t("ldap.renameEntry"),
+        action: () => openLdapRenameEntryDialog(node.connectionId!, node.database!),
+        icon: Replace,
+        disabled: ldapReadOnly,
+      });
+      items.push({ label: "", separator: true });
+      items.push({
+        label: t("contextMenu.refreshChildren"),
+        action: refresh,
+        icon: RefreshCw,
+        shortcut: shortcutRefresh,
+      });
+      items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+      items.push({ label: "", separator: true });
+      items.push({
+        label: t("ldap.deleteEntry"),
+        action: () => openLdapDeleteEntryDialog(node.connectionId!, node.database!),
+        icon: Trash2,
+        shortcut: shortcutDelete,
+        variant: "destructive" as const,
+        disabled: ldapReadOnly,
+      });
+    } else {
+      items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+    }
     return true;
   }
 

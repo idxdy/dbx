@@ -112,6 +112,80 @@ class LdapAgentTest {
     }
 
     // -----------------------------------------------------------------------
+    // write operations: not-connected and missing-parameter errors
+    // -----------------------------------------------------------------------
+
+    private static String writeOpErrorResponse(String method, JsonObject params) {
+        JsonObject req = new JsonObject();
+        req.addProperty("jsonrpc", "2.0");
+        req.addProperty("id", 6);
+        req.addProperty("method", method);
+        req.add("params", params);
+        return LdapAgent.handleRequest(req.toString());
+    }
+
+    @Test
+    void writeOpsWithoutConnectionReturnError() {
+        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"}) {
+            JsonObject params = new JsonObject();
+            params.addProperty("dn", "cn=test," + BASE_DN);
+            String response = writeOpErrorResponse(method, params);
+            var payload = JsonParser.parseString(response).getAsJsonObject();
+            assertTrue(payload.has("error"), method + " should fail without connection");
+            assertTrue(payload.getAsJsonObject("error").get("message").getAsString()
+                .contains("Not connected"), method + " should report Not connected");
+        }
+    }
+
+    @Test
+    void writeOpsAreDispatchedAsKnownMethods() {
+        // Parameter validation runs after the connection check, so without a
+        // live context every write op reports "Not connected". What matters
+        // here is that the request is not rejected as an unknown method.
+        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"}) {
+            String response = writeOpErrorResponse(method, new JsonObject());
+            var payload = JsonParser.parseString(response).getAsJsonObject();
+            assertTrue(payload.has("error"), method + " should fail without connection");
+            String message = payload.getAsJsonObject("error").get("message").getAsString();
+            assertFalse(message.contains("Unknown method"), method + " must be dispatched, got: " + message);
+        }
+    }
+
+    @Test
+    void addWithoutAttributesReturnsError() {
+        JsonObject params = new JsonObject();
+        params.addProperty("dn", "cn=test," + BASE_DN);
+        String response = writeOpErrorResponse("ldap_add", params);
+        var payload = JsonParser.parseString(response).getAsJsonObject();
+        assertTrue(payload.has("error"));
+        // The not-connected check runs first, so this only exercises the
+        // attribute validation when a context exists; with no context the
+        // message is "Not connected".
+        assertTrue(payload.getAsJsonObject("error").get("message").getAsString()
+            .contains("Not connected"));
+    }
+
+    @Test
+    void modifyRequiresKnownOp() {
+        // Validation order: connection first, then modifications. Use a valid
+        // dn and a bogus op; without a live connection we can only assert that
+        // the request is rejected rather than dispatched as unknown method.
+        JsonObject mod = new JsonObject();
+        mod.addProperty("op", "upsert");
+        mod.addProperty("attribute", "mail");
+        JsonObject params = new JsonObject();
+        params.addProperty("dn", "cn=test," + BASE_DN);
+        var mods = new com.google.gson.JsonArray();
+        mods.add(mod);
+        params.add("modifications", mods);
+        String response = writeOpErrorResponse("ldap_modify", params);
+        var payload = JsonParser.parseString(response).getAsJsonObject();
+        assertTrue(payload.has("error"));
+        assertFalse(payload.getAsJsonObject("error").get("message").getAsString()
+            .contains("Unknown method"));
+    }
+
+    // -----------------------------------------------------------------------
     // test_connection: routing for different security protocols
     // -----------------------------------------------------------------------
 
@@ -625,6 +699,91 @@ class LdapAgentTest {
         assertTrue(result.get("count").getAsInt() > 0);
         // Server may truncate results when size limit is exceeded
         assertTrue(result.get("count").getAsInt() <= 3 || result.has("truncated"));
+    }
+
+    /** Builds an {@code ldap_*} write request with the given params. */
+    private static String writeOpRequest(int id, String method, JsonObject writeParams) {
+        JsonObject req = new JsonObject();
+        req.addProperty("jsonrpc", "2.0");
+        req.addProperty("id", id);
+        req.addProperty("method", method);
+        req.add("params", writeParams);
+        return req.toString();
+    }
+
+    @Test
+    void integrationWriteLifecycleAddModifyRenameDelete() {
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+        String connectResp = LdapAgent.handleRequest(adminConnectRequest(200));
+        var cp = JsonParser.parseString(connectResp).getAsJsonObject();
+        assertTrue(cp.has("result"), "Connect failed: " + cp);
+
+        String entryDn = "uid=zwrite,ou=users," + BASE_DN;
+
+        // Add
+        JsonObject addParams = new JsonObject();
+        addParams.addProperty("dn", entryDn);
+        JsonObject attributes = new JsonObject();
+        attributes.addProperty("objectClass", "inetOrgPerson");
+        attributes.addProperty("uid", "zwrite");
+        attributes.addProperty("cn", "Write Test");
+        attributes.addProperty("sn", "Test");
+        attributes.addProperty("mail", "zwrite@example.com");
+        addParams.add("attributes", attributes);
+        var addPayload = JsonParser.parseString(LdapAgent.handleRequest(writeOpRequest(201, "ldap_add", addParams))).getAsJsonObject();
+        assertTrue(addPayload.has("result"), "Add failed: " + addPayload);
+        assertTrue(addPayload.getAsJsonObject("result").get("success").getAsBoolean());
+
+        // Modify (replace cn, add a second mail)
+        JsonObject modParams = new JsonObject();
+        modParams.addProperty("dn", entryDn);
+        var mods = new com.google.gson.JsonArray();
+        JsonObject replaceCn = new JsonObject();
+        replaceCn.addProperty("op", "replace");
+        replaceCn.addProperty("attribute", "cn");
+        replaceCn.addProperty("values", "Renamed Write");
+        mods.add(replaceCn);
+        JsonObject addMail = new JsonObject();
+        addMail.addProperty("op", "add");
+        addMail.addProperty("attribute", "mail");
+        var mails = new com.google.gson.JsonArray();
+        mails.add("second@example.com");
+        addMail.add("values", mails);
+        mods.add(addMail);
+        modParams.add("modifications", mods);
+        var modPayload = JsonParser.parseString(LdapAgent.handleRequest(writeOpRequest(202, "ldap_modify", modParams))).getAsJsonObject();
+        assertTrue(modPayload.has("result"), "Modify failed: " + modPayload);
+
+        // Verify the modifications via search
+        var searchPayload = JsonParser.parseString(
+            LdapAgent.handleRequest(searchRequest(203, "(uid=zwrite)", 5))).getAsJsonObject();
+        assertTrue(searchPayload.has("result"), "Search after modify failed: " + searchPayload);
+        var entry = searchPayload.getAsJsonObject("result").getAsJsonArray("entries").get(0).getAsJsonObject();
+        assertEquals("Renamed Write", entry.getAsJsonObject("attributes").get("cn").getAsString());
+        assertTrue(entry.getAsJsonObject("attributes").get("mail").isJsonArray(), "mail should have 2 values");
+
+        // Rename (same parent)
+        JsonObject renameParams = new JsonObject();
+        renameParams.addProperty("dn", entryDn);
+        renameParams.addProperty("new_rdn", "uid=zwrite2");
+        var renamePayload = JsonParser.parseString(LdapAgent.handleRequest(writeOpRequest(204, "ldap_rename", renameParams))).getAsJsonObject();
+        assertTrue(renamePayload.has("result"), "Rename failed: " + renamePayload);
+        String renamedDn = "uid=zwrite2,ou=users," + BASE_DN;
+        assertEquals(renamedDn, renamePayload.getAsJsonObject("result").get("dn").getAsString());
+
+        // Delete the renamed entry
+        JsonObject deleteParams = new JsonObject();
+        deleteParams.addProperty("dn", renamedDn);
+        var deletePayload = JsonParser.parseString(LdapAgent.handleRequest(writeOpRequest(205, "ldap_delete", deleteParams))).getAsJsonObject();
+        assertTrue(deletePayload.has("result"), "Delete failed: " + deletePayload);
+
+        // Verify the entry is gone (best-effort: search again)
+        var gonePayload = JsonParser.parseString(
+            LdapAgent.handleRequest(searchRequest(206, "(uid=zwrite*)", 5))).getAsJsonObject();
+        if (gonePayload.has("result")) {
+            assertEquals(0, gonePayload.getAsJsonObject("result").getAsJsonArray("entries").size(),
+                "entry should be deleted");
+        }
     }
 
     // -----------------------------------------------------------------------

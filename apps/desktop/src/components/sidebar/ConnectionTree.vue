@@ -57,6 +57,11 @@ import { createSidebarTableSearchDebouncer, invalidateSidebarTableSearchBuild, l
 import TreeItem from "./TreeItem.vue";
 import SidebarTreeRuntimeHost from "./SidebarTreeRuntimeHost.vue";
 import SidebarTreeItemDialogs from "./SidebarTreeItemDialogs.vue";
+import LdapEntryCreateDialog from "@/components/ldap/LdapEntryCreateDialog.vue";
+import LdapEntryRenameDialog from "@/components/ldap/LdapEntryRenameDialog.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
+import { ldapEntryDialogState } from "@/lib/ldap/ldapEntryDialogState";
+import * as api from "@/lib/backend/api";
 import InstallExtensionDialog from "@/components/objects/InstallExtensionDialog.vue";
 import ExtensionDetailsDialog from "@/components/objects/ExtensionDetailsDialog.vue";
 import { RecycleScroller } from "vue-virtual-scroller";
@@ -87,6 +92,64 @@ import { compileSearchRegex } from "@/lib/common/searchPattern";
 
 const { t } = useI18n();
 const store = useConnectionStore();
+
+/** Parent DN of an LDAP entry DN, or the DN itself when it has no RDN part. */
+function ldapParentDn(dn: string): string {
+  const comma = dn.indexOf(",");
+  return comma >= 0 ? dn.substring(comma + 1) : dn;
+}
+
+async function refreshLdapChildren(connectionId: string, dn: string) {
+  const config = store.getConfig(connectionId) as any;
+  if ((config?.ldap_base_dn || "") === dn) {
+    await store.loadLdapRoot(connectionId);
+  } else {
+    await store.loadLdapEntryChildren(connectionId, dn);
+  }
+}
+
+async function onLdapEntryCreated() {
+  try {
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.createParentDn);
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  }
+}
+
+async function onLdapEntryRenamed(newDn: string) {
+  try {
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.renameDn);
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  }
+  // When the entry was moved to a new parent, refresh that parent too.
+  const newParent = ldapParentDn(newDn);
+  if (newParent !== ldapParentDn(ldapEntryDialogState.renameDn)) {
+    try {
+      await refreshLdapChildren(ldapEntryDialogState.connectionId, newParent);
+    } catch (e: unknown) {
+      toast(e instanceof Error ? e.message : String(e), 5000);
+    }
+  }
+}
+
+const ldapDeleting = ref(false);
+
+async function confirmLdapDelete() {
+  if (ldapDeleting.value) return;
+  ldapDeleting.value = true;
+  try {
+    const dn = ldapEntryDialogState.deleteDn;
+    await api.ldapDelete(ldapEntryDialogState.connectionId, dn);
+    toast(t("ldap.writeSuccess"), 2500);
+    ldapEntryDialogState.deleteOpen = false;
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapParentDn(dn));
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  } finally {
+    ldapDeleting.value = false;
+  }
+}
 const queryStore = useQueryStore();
 const savedSqlStore = useSavedSqlStore();
 const settingsStore = useSettingsStore();
@@ -2722,6 +2785,9 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
       </template>
     </SidebarDangerConfirmDialog>
     <SidebarTreeItemDialogs v-if="sidebarTreeItemDialogController" :key="sidebarTreeItemDialogController.node?.id" :controller="sidebarTreeItemDialogController" @closed="sidebarTreeItemDialogController = null" />
+    <LdapEntryCreateDialog v-model:open="ldapEntryDialogState.createOpen" :connection-id="ldapEntryDialogState.connectionId" :parent-dn="ldapEntryDialogState.createParentDn" @created="onLdapEntryCreated" />
+    <LdapEntryRenameDialog v-model:open="ldapEntryDialogState.renameOpen" :connection-id="ldapEntryDialogState.connectionId" :dn="ldapEntryDialogState.renameDn" @renamed="onLdapEntryRenamed" />
+    <DangerConfirmDialog v-model:open="ldapEntryDialogState.deleteOpen" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="ldapEntryDialogState.deleteDn" :confirm-label="t('ldap.deleteEntry')" :loading="ldapDeleting" @confirm="confirmLdapDelete" />
     <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" @changed="refreshSidebarActionTarget" />
     <ExtensionDetailsDialog v-if="sidebarExtensionDetailsTarget" ref="sidebarExtensionDetailsDialogRef" :node="sidebarExtensionDetailsTarget" />
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">

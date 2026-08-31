@@ -40,7 +40,8 @@ public final class LdapAgent {
     private static final int DEFAULT_RESPONSE_TIMEOUT_MS = 10_000;
 
     private static final List<String> CAPABILITIES = Collections.unmodifiableList(Arrays.asList(
-        "ldap_connect", "ldap_test_connection", "ldap_search"
+        "ldap_connect", "ldap_test_connection", "ldap_search",
+        "ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"
     ));
 
     private static LdapContext ldapContext;
@@ -120,6 +121,10 @@ public final class LdapAgent {
             case "disconnect" -> { closeClients(); yield Collections.singletonMap("ok", true); }
             case "shutdown" -> { closeClients(); shutdownRequested = true; yield Collections.singletonMap("ok", true); }
             case "ldap_search" -> search(params);
+            case "ldap_add" -> add(params);
+            case "ldap_modify" -> modify(params);
+            case "ldap_delete" -> delete(params);
+            case "ldap_rename" -> rename(params);
             case "list_databases" -> listDatabases(params);
             default -> throw new IllegalArgumentException("Unknown method: " + method);
         };
@@ -741,6 +746,108 @@ public final class LdapAgent {
     }
 
     // -----------------------------------------------------------------------
+    // LDAP write operations
+    // -----------------------------------------------------------------------
+
+    private static LdapContext requireContext() {
+        if (ldapContext == null) {
+            throw new IllegalStateException("Not connected. Call connect first.");
+        }
+        return ldapContext;
+    }
+
+    private static Object add(JsonObject params) throws Exception {
+        LdapContext context = requireContext();
+        String dn = requiredDn(params);
+        Map<String, Object> attributes = attributesFromParams(params);
+        if (attributes.isEmpty()) {
+            throw new IllegalArgumentException("attributes is required");
+        }
+        BasicAttributes attrs = new BasicAttributes(true);
+        for (Map.Entry<String, Object> entry : attributes.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof List<?> list) {
+                Attribute attr = new BasicAttribute(entry.getKey());
+                for (Object item : list) {
+                    attr.add(String.valueOf(item));
+                }
+                attrs.put(attr);
+            } else {
+                attrs.put(new BasicAttribute(entry.getKey(), String.valueOf(value)));
+            }
+        }
+        context.createSubcontext(dn, attrs);
+        return writeResult(dn);
+    }
+
+    private static Object modify(JsonObject params) throws Exception {
+        LdapContext context = requireContext();
+        String dn = requiredDn(params);
+        JsonElement modsEl = params.get("modifications");
+        if (modsEl == null || !modsEl.isJsonArray() || modsEl.getAsJsonArray().isEmpty()) {
+            throw new IllegalArgumentException("modifications is required");
+        }
+        List<ModificationItem> items = new ArrayList<>();
+        for (JsonElement element : modsEl.getAsJsonArray()) {
+            if (!element.isJsonObject()) {
+                throw new IllegalArgumentException("each modification must be an object");
+            }
+            JsonObject mod = element.getAsJsonObject();
+            String op = stringOrEmpty(mod, "op").toLowerCase(Locale.ROOT);
+            String attribute = stringOrEmpty(mod, "attribute");
+            if (attribute.isBlank()) {
+                throw new IllegalArgumentException("modification.attribute is required");
+            }
+            int opCode = switch (op) {
+                case "add" -> DirContext.ADD_ATTRIBUTE;
+                case "replace" -> DirContext.REPLACE_ATTRIBUTE;
+                case "delete" -> DirContext.REMOVE_ATTRIBUTE;
+                default -> throw new IllegalArgumentException(
+                    "modification.op must be 'add', 'replace' or 'delete', got '" + op + "'");
+            };
+            BasicAttribute attr = new BasicAttribute(attribute);
+            JsonElement valuesEl = mod.get("values");
+            if (valuesEl != null && valuesEl.isJsonArray()) {
+                for (JsonElement value : valuesEl.getAsJsonArray()) {
+                    if (!value.isJsonNull()) {
+                        attr.add(value.getAsString());
+                    }
+                }
+            } else if (valuesEl != null && !valuesEl.isJsonNull()) {
+                attr.add(valuesEl.getAsString());
+            }
+            items.add(new ModificationItem(opCode, attr));
+        }
+        context.modifyAttributes(dn, items.toArray(new ModificationItem[0]));
+        return writeResult(dn);
+    }
+
+    private static Object delete(JsonObject params) throws Exception {
+        LdapContext context = requireContext();
+        String dn = requiredDn(params);
+        context.destroySubcontext(dn);
+        return writeResult(dn);
+    }
+
+    private static Object rename(JsonObject params) throws Exception {
+        LdapContext context = requireContext();
+        String dn = requiredDn(params);
+        String newRdn = stringOrEmpty(params, "new_rdn");
+        if (newRdn.isBlank()) newRdn = stringOrEmpty(params, "newRdn");
+        if (newRdn.isBlank()) {
+            throw new IllegalArgumentException("new_rdn is required");
+        }
+        boolean deleteOldRdn = boolOrDefault(params, "delete_old_rdn", true);
+        String newParent = stringOrEmpty(params, "new_parent_dn");
+        if (newParent.isBlank()) newParent = stringOrEmpty(params, "newParentDn");
+        String newDn = composeNewDn(dn, newRdn, newParent);
+        context.rename(dn, newDn);
+        Map<String, Object> result = writeResult(newDn);
+        result.put("delete_old_rdn", deleteOldRdn);
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -774,6 +881,58 @@ public final class LdapAgent {
     private static String stringOrEmpty(JsonObject object, String key) {
         JsonElement element = object.get(key);
         return element == null || element.isJsonNull() ? "" : element.getAsString();
+    }
+
+    private static String requiredDn(JsonObject params) {
+        String dn = stringOrEmpty(params, "dn");
+        if (dn.isBlank()) {
+            throw new IllegalArgumentException("dn is required");
+        }
+        return dn;
+    }
+
+    private static Map<String, Object> attributesFromParams(JsonObject params) {
+        JsonElement element = params.get("attributes");
+        if (element == null || !element.isJsonObject()) {
+            return Collections.emptyMap();
+        }
+        Map<String, Object> attributes = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonElement> entry : element.getAsJsonObject().entrySet()) {
+            JsonElement value = entry.getValue();
+            if (value == null || value.isJsonNull()) {
+                continue;
+            }
+            if (value.isJsonArray()) {
+                List<String> values = new ArrayList<>();
+                for (JsonElement item : value.getAsJsonArray()) {
+                    if (!item.isJsonNull()) {
+                        values.add(item.getAsString());
+                    }
+                }
+                if (!values.isEmpty()) {
+                    attributes.put(entry.getKey(), values);
+                }
+            } else {
+                attributes.put(entry.getKey(), value.getAsString());
+            }
+        }
+        return attributes;
+    }
+
+    // Full DN of a renamed entry: same parent unless a new parent DN is given.
+    private static String composeNewDn(String dn, String newRdn, String newParent) {
+        if (!newParent.isBlank()) {
+            return newRdn + "," + newParent;
+        }
+        int comma = dn.indexOf(',');
+        return comma >= 0 ? newRdn + dn.substring(comma) : newRdn;
+    }
+
+    private static Map<String, Object> writeResult(String dn) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("dn", dn);
+        return result;
     }
 
     private static int intOrDefault(JsonObject object, String key, int fallback) {

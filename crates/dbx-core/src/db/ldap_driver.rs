@@ -8,8 +8,8 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ldap3::{Ldap, LdapConnAsync, Scope, SearchEntry};
-use serde::Serialize;
+use ldap3::{Ldap, LdapConnAsync, Mod, Scope, SearchEntry};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use crate::models::connection::ConnectionConfig;
 
 const DEFAULT_BIND_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 30;
+/// Upper bound for directory writes. Writes are much cheaper than searches,
+/// but the same class of runaway-caller protection applies.
+const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_LDAP_PORT: u16 = 389;
 const DEFAULT_LDAPS_PORT: u16 = 636;
 /// Hard upper bound for entries returned by a single search. Web / MCP layers
@@ -104,6 +107,82 @@ impl LdapClient {
         Ok(LdapSearchOutput { entries, count, truncated: truncated || (limit > 0 && count > limit) })
     }
 
+    /// Add a new entry with the given attributes. Values must be strings or
+    /// arrays of strings; attributes without values are dropped because the
+    /// protocol forbids empty value sets.
+    pub async fn add(&self, dn: &str, attributes: &Map<String, Value>, timeout: Duration) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        if guard.closed {
+            return Err("LDAP connection is closed".to_string());
+        }
+        let attrs = attributes_to_ldap3(attributes)?;
+        let result = tokio::time::timeout(timeout, guard.conn.add(dn, attrs))
+            .await
+            .map_err(|_| format!("LDAP add timed out after {}s", timeout.as_secs()))?;
+        let op_result = result.map_err(|e| format!("LDAP add failed: {e}"))?;
+        op_result.success().map_err(|e| format!("LDAP add rejected: {e}"))?;
+        Ok(())
+    }
+
+    /// Apply a batch of attribute modifications to an entry atomically (the
+    /// server applies the whole Modify request or none of it).
+    pub async fn modify(
+        &self,
+        dn: &str,
+        modifications: &[LdapAttributeModification],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        if guard.closed {
+            return Err("LDAP connection is closed".to_string());
+        }
+        let mods = modifications_to_ldap3(modifications)?;
+        let result = tokio::time::timeout(timeout, guard.conn.modify(dn, mods))
+            .await
+            .map_err(|_| format!("LDAP modify timed out after {}s", timeout.as_secs()))?;
+        let op_result = result.map_err(|e| format!("LDAP modify failed: {e}"))?;
+        op_result.success().map_err(|e| format!("LDAP modify rejected: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete the entry named by `dn`.
+    pub async fn delete(&self, dn: &str, timeout: Duration) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        if guard.closed {
+            return Err("LDAP connection is closed".to_string());
+        }
+        let result = tokio::time::timeout(timeout, guard.conn.delete(dn))
+            .await
+            .map_err(|_| format!("LDAP delete timed out after {}s", timeout.as_secs()))?;
+        let op_result = result.map_err(|e| format!("LDAP delete failed: {e}"))?;
+        op_result.success().map_err(|e| format!("LDAP delete rejected: {e}"))?;
+        Ok(())
+    }
+
+    /// Rename an entry to `new_rdn` and optionally move it under
+    /// `new_parent_dn`. When moving, the full new DN is
+    /// `{new_rdn},{new_parent_dn}`.
+    pub async fn rename(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old_rdn: bool,
+        new_parent_dn: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut guard = self.inner.lock().await;
+        if guard.closed {
+            return Err("LDAP connection is closed".to_string());
+        }
+        let new_dn = compose_renamed_dn(dn, new_rdn, new_parent_dn);
+        let result = tokio::time::timeout(timeout, guard.conn.modifydn(dn, new_rdn, delete_old_rdn, new_parent_dn))
+            .await
+            .map_err(|_| format!("LDAP rename timed out after {}s", timeout.as_secs()))?;
+        let op_result = result.map_err(|e| format!("LDAP rename failed: {e}"))?;
+        op_result.success().map_err(|e| format!("LDAP rename rejected: {e}"))?;
+        Ok(new_dn)
+    }
+
     /// Issue a root-DSE style validation search to confirm the connection is
     /// still alive.
     pub async fn ping(&self, timeout: Duration) -> Result<(), String> {
@@ -160,6 +239,17 @@ pub struct LdapSearchOutput {
 pub struct LdapEntryOutput {
     pub dn: String,
     pub attributes: serde_json::Map<String, Value>,
+}
+
+/// A single attribute change in a Modify request. `op` is `add`, `replace` or
+/// `delete`; `values` are text values (`delete` may carry no values to remove
+/// the whole attribute).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LdapAttributeModification {
+    pub op: String,
+    pub attribute: String,
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,6 +390,138 @@ pub async fn search(
     let limit = size_limit.unwrap_or(100).clamp(1, MAX_LDAP_SEARCH_SIZE);
     let timeout = timeout.unwrap_or(Duration::from_secs(DEFAULT_SEARCH_TIMEOUT_SECS));
     client.search(scope, base_dn, filter, attributes, limit, timeout).await
+}
+
+/// Add an entry against the pooled connection and return the shared write
+/// result JSON (`{"success": true, "dn": ...}`).
+pub async fn add(
+    client: &Arc<LdapClient>,
+    dn: &str,
+    attributes: &Map<String, Value>,
+    timeout: Option<Duration>,
+) -> Result<Value, String> {
+    if dn.trim().is_empty() {
+        return Err("LDAP add requires a non-empty dn".to_string());
+    }
+    if attributes.is_empty() {
+        return Err("LDAP add requires at least one attribute".to_string());
+    }
+    client.add(dn, attributes, write_timeout(timeout)).await?;
+    Ok(json!({ "success": true, "dn": dn }))
+}
+
+/// Apply attribute modifications against the pooled connection.
+pub async fn modify(
+    client: &Arc<LdapClient>,
+    dn: &str,
+    modifications: &[LdapAttributeModification],
+    timeout: Option<Duration>,
+) -> Result<Value, String> {
+    if dn.trim().is_empty() {
+        return Err("LDAP modify requires a non-empty dn".to_string());
+    }
+    if modifications.is_empty() {
+        return Err("LDAP modify requires at least one modification".to_string());
+    }
+    client.modify(dn, modifications, write_timeout(timeout)).await?;
+    Ok(json!({ "success": true, "dn": dn }))
+}
+
+/// Delete an entry against the pooled connection.
+pub async fn delete(client: &Arc<LdapClient>, dn: &str, timeout: Option<Duration>) -> Result<Value, String> {
+    if dn.trim().is_empty() {
+        return Err("LDAP delete requires a non-empty dn".to_string());
+    }
+    client.delete(dn, write_timeout(timeout)).await?;
+    Ok(json!({ "success": true, "dn": dn }))
+}
+
+/// Rename (and optionally move) an entry against the pooled connection.
+pub async fn rename(
+    client: &Arc<LdapClient>,
+    dn: &str,
+    new_rdn: &str,
+    delete_old_rdn: bool,
+    new_parent_dn: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<Value, String> {
+    if dn.trim().is_empty() {
+        return Err("LDAP rename requires a non-empty dn".to_string());
+    }
+    if new_rdn.trim().is_empty() {
+        return Err("LDAP rename requires a non-empty new_rdn".to_string());
+    }
+    let new_dn = client.rename(dn, new_rdn, delete_old_rdn, new_parent_dn, write_timeout(timeout)).await?;
+    Ok(json!({ "success": true, "dn": new_dn }))
+}
+
+fn write_timeout(timeout: Option<Duration>) -> Duration {
+    timeout.unwrap_or(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS))
+}
+
+/// Convert a JSON attribute map into ldap3 `add` attributes. Values must be
+/// strings or arrays of strings; null/empty values are dropped.
+fn attributes_to_ldap3(
+    attributes: &Map<String, Value>,
+) -> Result<Vec<(String, std::collections::HashSet<String>)>, String> {
+    let mut attrs = Vec::with_capacity(attributes.len());
+    for (name, value) in attributes {
+        let values = parse_attribute_values(value).map_err(|e| format!("LDAP add attribute '{name}': {e}"))?;
+        if values.is_empty() {
+            continue;
+        }
+        attrs.push((name.clone(), values.into_iter().collect()));
+    }
+    Ok(attrs)
+}
+
+/// Convert the shared modification shape into ldap3 `Mod` values.
+fn modifications_to_ldap3(modifications: &[LdapAttributeModification]) -> Result<Vec<Mod<String>>, String> {
+    let mut mods = Vec::with_capacity(modifications.len());
+    for modification in modifications {
+        let values: std::collections::HashSet<String> = modification.values.iter().cloned().collect();
+        let attribute = modification.attribute.clone();
+        let ldap_mod = match modification.op.as_str() {
+            "add" => Mod::Add(attribute, values),
+            "delete" => Mod::Delete(attribute, values),
+            "replace" => Mod::Replace(attribute, values),
+            other => return Err(format!("LDAP modify op must be 'add', 'replace' or 'delete', got '{other}'")),
+        };
+        mods.push(ldap_mod);
+    }
+    Ok(mods)
+}
+
+/// Parse one JSON attribute value into a list of text values.
+fn parse_attribute_values(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(vec![text.clone()]),
+        Value::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text) => values.push(text.clone()),
+                    other => return Err(format!("array values must be strings, got {other}")),
+                }
+            }
+            Ok(values)
+        }
+        other => Err(format!("value must be a string or an array of strings, got {other}")),
+    }
+}
+
+/// Compose the full DN of a renamed entry. Without a new parent the entry
+/// keeps its current parent: `cn=old,dc=example,dc=com` renamed to
+/// `cn=new` becomes `cn=new,dc=example,dc=com`.
+fn compose_renamed_dn(dn: &str, new_rdn: &str, new_parent_dn: Option<&str>) -> String {
+    match new_parent_dn.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(parent) => format!("{new_rdn},{parent}"),
+        None => match dn.split_once(',') {
+            Some((_, parent)) => format!("{new_rdn},{parent}"),
+            None => new_rdn.to_string(),
+        },
+    }
 }
 
 /// Convenience wrapper used by stale / keepalive checks.
@@ -555,6 +777,62 @@ mod tests {
         let _ = scope;
     }
 
+    #[test]
+    fn parse_attribute_values_accepts_scalar_and_array() {
+        assert_eq!(parse_attribute_values(&Value::Null).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_attribute_values(&Value::String("a".into())).unwrap(), vec!["a"]);
+        assert_eq!(parse_attribute_values(&json!(["a", "b"])).unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert!(parse_attribute_values(&json!(42)).is_err());
+        assert!(parse_attribute_values(&json!([1])).is_err());
+    }
+
+    #[test]
+    fn attributes_to_ldap3_drops_empty_and_rejects_non_text() {
+        let mut map = Map::new();
+        map.insert("cn".into(), Value::String("alice".into()));
+        map.insert("mail".into(), json!(["a@x.com", "b@x.com"]));
+        map.insert("empty".into(), Value::Null);
+        let attrs = attributes_to_ldap3(&map).unwrap();
+        assert_eq!(attrs.len(), 2);
+        let cn = attrs.iter().find(|(name, _)| name == "cn").unwrap();
+        assert!(cn.1.contains("alice"));
+
+        let mut bad = Map::new();
+        bad.insert("num".into(), json!(7));
+        assert!(attributes_to_ldap3(&bad).is_err());
+    }
+
+    #[test]
+    fn modifications_to_ldap3_maps_ops_and_rejects_unknown() {
+        let mods = vec![
+            LdapAttributeModification { op: "add".into(), attribute: "mail".into(), values: vec!["x@x.com".into()] },
+            LdapAttributeModification { op: "delete".into(), attribute: "title".into(), values: Vec::new() },
+            LdapAttributeModification { op: "replace".into(), attribute: "cn".into(), values: vec!["bob".into()] },
+        ];
+        let converted = modifications_to_ldap3(&mods).unwrap();
+        assert_eq!(converted.len(), 3);
+        assert!(matches!(&converted[0], Mod::Add(attr, _) if attr == "mail"));
+        assert!(matches!(&converted[1], Mod::Delete(attr, _) if attr == "title"));
+        assert!(matches!(&converted[2], Mod::Replace(attr, _) if attr == "cn"));
+
+        let bad = vec![LdapAttributeModification { op: "upsert".into(), attribute: "cn".into(), values: Vec::new() }];
+        assert!(modifications_to_ldap3(&bad).is_err());
+    }
+
+    #[test]
+    fn compose_renamed_dn_keeps_or_replaces_parent() {
+        assert_eq!(
+            compose_renamed_dn("cn=old,ou=people,dc=example,dc=com", "cn=new", None),
+            "cn=new,ou=people,dc=example,dc=com"
+        );
+        assert_eq!(
+            compose_renamed_dn("cn=old,ou=people,dc=example,dc=com", "cn=new", Some("ou=archive,dc=example,dc=com")),
+            "cn=new,ou=archive,dc=example,dc=com"
+        );
+        // A bare RDN without a parent and without a new parent stays a bare RDN.
+        assert_eq!(compose_renamed_dn("dc=com", "dc=org", None), "dc=org");
+    }
+
     // -----------------------------------------------------------------------
     // Integration tests — only run when DBX_LDAP_INTEGRATION is set and the
     // server is reachable. Mirrors the Java integration tests in
@@ -669,6 +947,83 @@ mod tests {
         let attrs = &result.entries[0].attributes;
         assert!(attrs.contains_key("cn"), "expected cn attribute");
         assert!(attrs.contains_key("uid"), "expected uid attribute");
+    }
+
+    #[tokio::test]
+    async fn integration_write_lifecycle_add_modify_rename_delete() {
+        if !integration_enabled() {
+            eprintln!("skipping integration test (set DBX_LDAP_INTEGRATION=1 to enable)");
+            return;
+        }
+        let cfg = integration_simple_config();
+        let client = connect(&cfg, &cfg.host, cfg.port, std::time::Duration::from_secs(15))
+            .await
+            .expect("simple bind should succeed");
+
+        let dn = format!("uid=zwrite-rs,ou=users,{}", cfg.ldap_base_dn);
+        let renamed_dn = format!("uid=zwrite2-rs,ou=users,{}", cfg.ldap_base_dn);
+
+        // Add
+        let mut attributes = Map::new();
+        attributes.insert("objectClass".into(), Value::String("inetOrgPerson".into()));
+        attributes.insert("uid".into(), Value::String("zwrite-rs".into()));
+        attributes.insert("cn".into(), Value::String("Rust Write Test".into()));
+        attributes.insert("sn".into(), Value::String("Test".into()));
+        add(&client, &dn, &attributes, Some(std::time::Duration::from_secs(15))).await.expect("add should succeed");
+
+        // Modify: replace cn, add a second mail
+        let modifications = vec![
+            LdapAttributeModification {
+                op: "replace".into(),
+                attribute: "cn".into(),
+                values: vec!["Renamed Write".into()],
+            },
+            LdapAttributeModification {
+                op: "add".into(),
+                attribute: "mail".into(),
+                values: vec!["a@x.com".into(), "b@x.com".into()],
+            },
+        ];
+        modify(&client, &dn, &modifications, Some(std::time::Duration::from_secs(15)))
+            .await
+            .expect("modify should succeed");
+
+        let result = search(
+            &client,
+            &cfg.ldap_base_dn,
+            "sub",
+            "(uid=zwrite-rs)",
+            None,
+            Some(5),
+            Some(std::time::Duration::from_secs(15)),
+        )
+        .await
+        .expect("search after modify should succeed");
+        assert_eq!(result.count, 1);
+        assert_eq!(result.entries[0].attributes["cn"], "Renamed Write");
+        assert!(result.entries[0].attributes["mail"].as_array().unwrap().len() == 2);
+
+        // Rename (same parent)
+        let value = rename(&client, &dn, "uid=zwrite2-rs", true, None, Some(std::time::Duration::from_secs(15)))
+            .await
+            .expect("rename should succeed");
+        assert_eq!(value["dn"], renamed_dn.as_str());
+
+        // Delete the renamed entry
+        delete(&client, &renamed_dn, Some(std::time::Duration::from_secs(15))).await.expect("delete should succeed");
+
+        let gone = search(
+            &client,
+            &cfg.ldap_base_dn,
+            "sub",
+            "(uid=zwrite*-rs)",
+            None,
+            Some(5),
+            Some(std::time::Duration::from_secs(15)),
+        )
+        .await
+        .expect("search after delete should succeed");
+        assert_eq!(gone.count, 0, "entry should be deleted");
     }
 
     fn config_with_defaults() -> ConnectionConfig {

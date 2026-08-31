@@ -454,6 +454,10 @@ export const redisListDatabases = forward("redisListDatabases");
 
 // LDAP
 export const ldapSearch = forward("ldapSearch");
+export const ldapAdd = forward("ldapAdd");
+export const ldapModify = forward("ldapModify");
+export const ldapDelete = forward("ldapDelete");
+export const ldapRename = forward("ldapRename");
 export const ldapAuthLogin = forward("ldapAuthLogin");
 export const loadLdapLoginConfig = forward("loadLdapLoginConfig");
 export const saveLdapLoginConfig = forward("saveLdapLoginConfig");

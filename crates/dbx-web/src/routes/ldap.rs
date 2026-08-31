@@ -1,4 +1,5 @@
 use axum::{extract::State, Json};
+use dbx_core::db::ldap_driver::LdapAttributeModification;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -72,6 +73,96 @@ pub async fn list_children(
         &request.connection_id,
         &request.base_dn,
         clamp_size_limit(request.size_limit),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LdapAddRequest {
+    pub connection_id: String,
+    pub dn: String,
+    #[serde(default)]
+    pub attributes: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LdapModifyRequest {
+    pub connection_id: String,
+    pub dn: String,
+    pub modifications: Vec<LdapAttributeModification>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LdapDeleteRequest {
+    pub connection_id: String,
+    pub dn: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LdapRenameRequest {
+    pub connection_id: String,
+    pub dn: String,
+    pub new_rdn: String,
+    #[serde(default = "default_true")]
+    pub delete_old_rdn: bool,
+    #[serde(default)]
+    pub new_parent_dn: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Add a new LDAP entry. Write access is gated in the core layer
+/// (read-only / production connections are rejected there).
+pub async fn add(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LdapAddRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let attributes = request.attributes.unwrap_or_default();
+    let result = dbx_core::ldap_ops::ldap_add_core(&state.app, &request.connection_id, &request.dn, &attributes)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+/// Apply attribute modifications to an existing entry.
+pub async fn modify(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LdapModifyRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result =
+        dbx_core::ldap_ops::ldap_modify_core(&state.app, &request.connection_id, &request.dn, &request.modifications)
+            .await
+            .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+/// Delete an entry.
+pub async fn delete(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LdapDeleteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::ldap_ops::ldap_delete_core(&state.app, &request.connection_id, &request.dn)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+/// Rename (and optionally move) an entry.
+pub async fn rename(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LdapRenameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::ldap_ops::ldap_rename_core(
+        &state.app,
+        &request.connection_id,
+        &request.dn,
+        &request.new_rdn,
+        request.delete_old_rdn,
+        request.new_parent_dn.as_deref(),
     )
     .await
     .map_err(AppError::from)?;

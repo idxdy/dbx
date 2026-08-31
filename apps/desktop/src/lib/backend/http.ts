@@ -2602,6 +2602,49 @@ export async function ldapSearch(connectionId: string, baseDn: string, filter?: 
   });
 }
 
+export interface LdapModification {
+  op: "add" | "replace" | "delete";
+  attribute: string;
+  values: string[];
+}
+export interface LdapWriteResult {
+  success: boolean;
+  dn: string;
+}
+
+export async function ldapAdd(connectionId: string, dn: string, attributes: Record<string, string | string[]>): Promise<LdapWriteResult> {
+  return post("/api/ldap/add", {
+    connection_id: connectionId,
+    dn,
+    attributes,
+  });
+}
+
+export async function ldapModify(connectionId: string, dn: string, modifications: LdapModification[]): Promise<LdapWriteResult> {
+  return post("/api/ldap/modify", {
+    connection_id: connectionId,
+    dn,
+    modifications,
+  });
+}
+
+export async function ldapDelete(connectionId: string, dn: string): Promise<LdapWriteResult> {
+  return post("/api/ldap/delete", {
+    connection_id: connectionId,
+    dn,
+  });
+}
+
+export async function ldapRename(connectionId: string, dn: string, newRdn: string, deleteOldRdn?: boolean, newParentDn?: string): Promise<LdapWriteResult> {
+  return post("/api/ldap/rename", {
+    connection_id: connectionId,
+    dn,
+    new_rdn: newRdn,
+    delete_old_rdn: deleteOldRdn ?? true,
+    new_parent_dn: newParentDn ?? null,
+  });
+}
+
 export interface LdapLoginSettings {
   enabled: boolean;
   name: string;

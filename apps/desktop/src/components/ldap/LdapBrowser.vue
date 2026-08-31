@@ -3,7 +3,14 @@
     <!-- Toolbar -->
     <div class="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0">
       <span v-if="baseDn" class="text-xs font-mono text-muted-foreground truncate flex-1 min-w-0" :title="baseDn">{{ baseDn }}</span>
-      <span v-if="baseDn" class="text-xs text-muted-foreground shrink-0">Copy as:</span>
+      <Badge v-if="readOnly" variant="secondary" class="shrink-0">{{ t("connection.readOnly") }}</Badge>
+      <template v-if="baseDn">
+        <Button variant="outline" size="sm" class="h-6 px-2 text-xs" :disabled="readOnly" @click="showCreateDialog = true"> <Plus class="size-3 mr-1" />{{ t("ldap.addEntry") }} </Button>
+        <Button variant="outline" size="sm" class="h-6 px-2 text-xs" :disabled="readOnly" @click="showEditDialog = true"> <Pencil class="size-3 mr-1" />{{ t("ldap.editEntry") }} </Button>
+        <Button variant="outline" size="sm" class="h-6 px-2 text-xs" :disabled="readOnly" @click="showRenameDialog = true"> <Replace class="size-3 mr-1" />{{ t("ldap.renameEntry") }} </Button>
+        <Button variant="outline" size="sm" class="h-6 px-2 text-xs text-destructive hover:text-destructive" :disabled="readOnly" @click="showDeleteDialog = true"> <Trash2 class="size-3 mr-1" />{{ t("ldap.deleteEntry") }} </Button>
+      </template>
+      <span class="text-xs text-muted-foreground shrink-0">Copy as:</span>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyLdapsearchTooltip')" @click="copyAsLdapSearch"> <Copy class="size-3 mr-1" />ldapsearch </Button>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyGetAdObjectTooltip')" @click="copyAsPowershellGetAdObject"> <Copy class="size-3 mr-1" />Get-ADObject </Button>
       <span v-if="copiedFlash" class="text-xs text-green-600 dark:text-green-400">Copied</span>
@@ -69,20 +76,34 @@
         </div>
       </div>
     </div>
+
+    <!-- Write dialogs -->
+    <LdapEntryCreateDialog v-model:open="showCreateDialog" :connection-id="connectionId" :parent-dn="baseDn || ''" @created="reloadEntryDetail" />
+    <LdapEntryEditDialog v-model:open="showEditDialog" :connection-id="connectionId" :entry="entryDetail" @saved="reloadEntryDetail" />
+    <LdapEntryRenameDialog v-model:open="showRenameDialog" :connection-id="connectionId" :dn="baseDn || ''" @renamed="onEntryRenamed" />
+    <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="baseDn" :confirm-label="t('ldap.deleteEntry')" :loading="deleting" @confirm="deleteEntry" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from "vue";
-import { Loader2, FileSearch, X, Copy } from "@lucide/vue";
+import { computed, ref, watch } from "vue";
+import { Loader2, FileSearch, X, Copy, Plus, Pencil, Trash2, Replace } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { useI18n } from "vue-i18n";
 import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useQueryStore } from "@/stores/queryStore";
+import { useToast } from "@/composables/useToast";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildGetAdObjectIdentityCommand, buildLdapSearchByDnCommand } from "@/lib/ldap/ldapSearchSyntax";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
+import LdapEntryCreateDialog from "@/components/ldap/LdapEntryCreateDialog.vue";
+import LdapEntryEditDialog from "@/components/ldap/LdapEntryEditDialog.vue";
+import LdapEntryRenameDialog from "@/components/ldap/LdapEntryRenameDialog.vue";
 
 const { t } = useI18n();
+const { toast } = useToast();
 
 const props = defineProps<{
   connectionId: string;
@@ -90,9 +111,18 @@ const props = defineProps<{
 }>();
 
 const connectionStore = useConnectionStore();
+const queryStore = useQueryStore();
 
 const entryDetail = ref<{ dn: string; attributes: Record<string, string | string[]> } | null>(null);
 const entryDetailLoading = ref(false);
+
+const readOnly = computed(() => Boolean((connectionStore.getConfig(props.connectionId) as any)?.read_only));
+
+const showCreateDialog = ref(false);
+const showEditDialog = ref(false);
+const showRenameDialog = ref(false);
+const showDeleteDialog = ref(false);
+const deleting = ref(false);
 
 const popupOpen = ref(false);
 const popupAttrName = ref("");
@@ -145,19 +175,57 @@ function openValuePopup(name: string, value: unknown) {
   popupOpen.value = true;
 }
 
+async function reloadEntryDetail() {
+  if (!props.baseDn || !props.connectionId) return;
+  entryDetailLoading.value = true;
+  try {
+    const result = await api.ldapSearch(props.connectionId, props.baseDn, "(objectClass=*)", "base");
+    entryDetail.value = result.entries.length > 0 ? result.entries[0] : null;
+  } catch (_e: unknown) {
+    entryDetail.value = null;
+  } finally {
+    entryDetailLoading.value = false;
+  }
+}
+
+function onEntryRenamed(newDn: string) {
+  // The tab's base DN must follow the renamed entry, otherwise the panel
+  // would reload a DN that no longer exists.
+  const oldDn = props.baseDn;
+  const tab = queryStore.tabs.find((tab) => tab.connectionId === props.connectionId && tab.mode === "ldap" && tab.database === oldDn);
+  if (tab) {
+    tab.database = newDn;
+    tab.title = `${newDn.split(",")[0] ?? newDn} - ${connectionStore.getConfig(props.connectionId)?.name || "LDAP"}`;
+  }
+  entryDetail.value = null;
+}
+
+async function deleteEntry() {
+  if (!props.baseDn || deleting.value) return;
+  deleting.value = true;
+  try {
+    await api.ldapDelete(props.connectionId, props.baseDn);
+    toast(t("ldap.writeSuccess"), 2500);
+    // Close the LDAP browser tab for the deleted entry.
+    const tab = queryStore.tabs.find((tab) => tab.connectionId === props.connectionId && tab.mode === "ldap" && tab.database === props.baseDn);
+    if (tab) queryStore.closeTab(tab.id);
+    entryDetail.value = null;
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  } finally {
+    deleting.value = false;
+    showDeleteDialog.value = false;
+  }
+}
+
 watch(
   () => props.baseDn,
   async (dn) => {
-    if (!dn || !props.connectionId) return;
-    entryDetailLoading.value = true;
-    try {
-      const result = await api.ldapSearch(props.connectionId, dn, "(objectClass=*)", "base");
-      if (result.entries.length > 0) entryDetail.value = result.entries[0];
-    } catch (_e: unknown) {
+    if (!dn || !props.connectionId) {
       entryDetail.value = null;
-    } finally {
-      entryDetailLoading.value = false;
+      return;
     }
+    await reloadEntryDetail();
   },
   { immediate: true },
 );

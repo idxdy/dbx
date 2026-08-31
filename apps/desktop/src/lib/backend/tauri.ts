@@ -2475,6 +2475,38 @@ export async function ldapSearch(connectionId: string, baseDn: string, filter?: 
   });
 }
 
+export interface LdapModification {
+  op: "add" | "replace" | "delete";
+  attribute: string;
+  values: string[];
+}
+export interface LdapWriteResult {
+  success: boolean;
+  dn: string;
+}
+
+export async function ldapAdd(connectionId: string, dn: string, attributes: Record<string, string | string[]>): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_add", { connectionId, dn, attributes });
+}
+
+export async function ldapModify(connectionId: string, dn: string, modifications: LdapModification[]): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_modify", { connectionId, dn, modifications });
+}
+
+export async function ldapDelete(connectionId: string, dn: string): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_delete", { connectionId, dn });
+}
+
+export async function ldapRename(connectionId: string, dn: string, newRdn: string, deleteOldRdn?: boolean, newParentDn?: string): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_rename", {
+    connectionId,
+    dn,
+    newRdn,
+    deleteOldRdn: deleteOldRdn ?? true,
+    newParentDn: newParentDn ?? null,
+  });
+}
+
 // LDAP login is web-only (the desktop app does not gate itself behind a
 // password). These stubs satisfy the `api.ts` forward type so the desktop
 // build compiles; they are never reached in practice.

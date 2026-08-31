@@ -1,4 +1,5 @@
 use crate::connection::{AppState, PoolKind};
+use crate::db::ldap_driver::LdapAttributeModification;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,23 +44,8 @@ async fn dispatch_ldap_search(
     attributes: Option<&[String]>,
     size_limit: Option<i32>,
 ) -> Result<Value, String> {
-    state.get_or_create_pool(connection_id, None).await?;
-    // Copy out the data we need while holding the read lock, then drop the
-    // lock before any async work.
-    enum Dispatch {
-        Native(Arc<ldap_driver::LdapClient>),
-        Agent(Arc<crate::db::agent_driver::PooledAgentClient>),
-    }
-    let dispatch = {
-        let connections = state.connections.read().await;
-        match connections.get(connection_id) {
-            Some(PoolKind::Ldap(client)) => Dispatch::Native(client.clone()),
-            Some(PoolKind::Agent(client)) => Dispatch::Agent(client.clone()),
-            _ => return Err("Not an LDAP connection".to_string()),
-        }
-    };
-    match dispatch {
-        Dispatch::Native(client) => {
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(client) => {
             let result = ldap_driver::search(
                 &client,
                 base_dn,
@@ -72,7 +58,7 @@ async fn dispatch_ldap_search(
             .await?;
             Ok(ldap_driver::output_to_json(result))
         }
-        Dispatch::Agent(client) => {
+        LdapBackend::Agent(client) => {
             let mut agent = client.lock().await;
             let mut params = serde_json::json!({
                 "base_dn": base_dn,
@@ -89,6 +75,128 @@ async fn dispatch_ldap_search(
             Ok(result)
         }
     }
+}
+
+/// Add an entry (`dn` + attribute map) on either backend, applying the shared
+/// read-only / production write guards first.
+pub async fn ldap_add_core(
+    state: &AppState,
+    connection_id: &str,
+    dn: &str,
+    attributes: &serde_json::Map<String, Value>,
+) -> Result<Value, String> {
+    guard_ldap_writes(state, connection_id, "add", dn).await?;
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(client) => ldap_driver::add(&client, dn, attributes, None).await,
+        LdapBackend::Agent(client) => {
+            let mut agent = client.lock().await;
+            let params = serde_json::json!({ "dn": dn, "attributes": attributes });
+            agent.call_with_timeout("ldap_add", params, Some(Duration::from_secs(60))).await
+        }
+    }
+}
+
+/// Apply attribute modifications (`modifications: [{op, attribute, values}]`)
+/// to an entry on either backend.
+pub async fn ldap_modify_core(
+    state: &AppState,
+    connection_id: &str,
+    dn: &str,
+    modifications: &[LdapAttributeModification],
+) -> Result<Value, String> {
+    guard_ldap_writes(state, connection_id, "modify", dn).await?;
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(client) => ldap_driver::modify(&client, dn, modifications, None).await,
+        LdapBackend::Agent(client) => {
+            let mut agent = client.lock().await;
+            let params = serde_json::json!({ "dn": dn, "modifications": modifications });
+            agent.call_with_timeout("ldap_modify", params, Some(Duration::from_secs(60))).await
+        }
+    }
+}
+
+/// Delete an entry on either backend.
+pub async fn ldap_delete_core(state: &AppState, connection_id: &str, dn: &str) -> Result<Value, String> {
+    guard_ldap_writes(state, connection_id, "delete", dn).await?;
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(client) => ldap_driver::delete(&client, dn, None).await,
+        LdapBackend::Agent(client) => {
+            let mut agent = client.lock().await;
+            let params = serde_json::json!({ "dn": dn });
+            agent.call_with_timeout("ldap_delete", params, Some(Duration::from_secs(60))).await
+        }
+    }
+}
+
+/// Rename (and optionally move) an entry on either backend.
+pub async fn ldap_rename_core(
+    state: &AppState,
+    connection_id: &str,
+    dn: &str,
+    new_rdn: &str,
+    delete_old_rdn: bool,
+    new_parent_dn: Option<&str>,
+) -> Result<Value, String> {
+    guard_ldap_writes(state, connection_id, "rename", dn).await?;
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(client) => {
+            ldap_driver::rename(&client, dn, new_rdn, delete_old_rdn, new_parent_dn, None).await
+        }
+        LdapBackend::Agent(client) => {
+            let mut agent = client.lock().await;
+            let mut params = serde_json::json!({
+                "dn": dn,
+                "new_rdn": new_rdn,
+                "delete_old_rdn": delete_old_rdn,
+            });
+            if let Some(parent) = new_parent_dn {
+                params["new_parent_dn"] = serde_json::json!(parent);
+            }
+            agent.call_with_timeout("ldap_rename", params, Some(Duration::from_secs(60))).await
+        }
+    }
+}
+
+/// The backend holding an active LDAP connection.
+enum LdapBackend {
+    Native(Arc<ldap_driver::LdapClient>),
+    Agent(Arc<crate::db::agent_driver::PooledAgentClient>),
+}
+
+/// Resolve the pooled backend for an LDAP connection, mirroring the pool
+/// lookup in `dispatch_ldap_search`.
+async fn resolve_ldap_backend(state: &AppState, connection_id: &str) -> Result<LdapBackend, String> {
+    state.get_or_create_pool(connection_id, None).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id) {
+        Some(PoolKind::Ldap(client)) => Ok(LdapBackend::Native(client.clone())),
+        Some(PoolKind::Agent(client)) => Ok(LdapBackend::Agent(client.clone())),
+        _ => Err("Not an LDAP connection".to_string()),
+    }
+}
+
+/// Shared write gate for every LDAP write path: refuse when the connection is
+/// flagged read-only or marked as production. Checked here (not only in the
+/// UI) so Tauri, web and any future caller share one enforcement point.
+async fn guard_ldap_writes(state: &AppState, connection_id: &str, operation: &str, dn: &str) -> Result<(), String> {
+    let config = {
+        let configs = state.configs.read().await;
+        match configs.get(connection_id) {
+            Some(config) => config.clone(),
+            None => return Err("Unknown connection".to_string()),
+        }
+    };
+    let name = if config.name.is_empty() { connection_id } else { config.name.as_str() };
+    if config.read_only {
+        return Err(format!("LDAP {operation} blocked: connection '{name}' is read-only"));
+    }
+    if config.is_production {
+        return Err(format!(
+            "LDAP {operation} blocked: connection '{name}' is marked as production \
+             (target dn: {dn}); writes to production directories are disabled"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

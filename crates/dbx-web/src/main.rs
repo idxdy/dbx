@@ -616,6 +616,10 @@ async fn main() {
         // LDAP
         .route("/ldap/search", post(routes::ldap::search))
         .route("/ldap/list-child", post(routes::ldap::list_children))
+        .route("/ldap/add", post(routes::ldap::add))
+        .route("/ldap/modify", post(routes::ldap::modify))
+        .route("/ldap/delete", post(routes::ldap::delete))
+        .route("/ldap/rename", post(routes::ldap::rename))
         .route("/redis/scan-keys", post(routes::redis::scan_keys))
         .route("/redis/scan-keys-batch", post(routes::redis::scan_keys_batch))
         .route("/redis/scan-values", post(routes::redis::scan_values))
