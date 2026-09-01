@@ -5326,7 +5326,6 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   }
 
   if (node.type === "ldap-entry") {
-    items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
     const ldapReadOnly = Boolean((node.connectionId ? connectionStore.getConfig(node.connectionId) : (undefined as any))?.read_only);
     if (node.connectionId && node.database) {
       items.push({
