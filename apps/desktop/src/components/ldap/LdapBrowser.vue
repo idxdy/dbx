@@ -10,6 +10,10 @@
         <Button variant="outline" size="sm" class="h-6 px-2 text-xs" :disabled="readOnly" @click="showRenameDialog = true"> <Replace class="size-3 mr-1" />{{ t("ldap.renameEntry") }} </Button>
         <Button variant="outline" size="sm" class="h-6 px-2 text-xs text-destructive hover:text-destructive" :disabled="readOnly" @click="showDeleteDialog = true"> <Trash2 class="size-3 mr-1" />{{ t("ldap.deleteEntry") }} </Button>
       </template>
+      <Button size="sm" variant="secondary" class="h-7 px-2" @click="reloadEntryDetail" :disabled="entryDetailLoading" title="Refresh">
+        <Loader2 v-if="entryDetailLoading" class="size-3.5 animate-spin" />
+        <RefreshCw v-else class="size-3.5" />
+      </Button>
       <span class="text-xs text-muted-foreground shrink-0">Copy as:</span>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyLdapsearchTooltip')" @click="copyAsLdapSearch"> <Copy class="size-3 mr-1" />ldapsearch </Button>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyGetAdObjectTooltip')" @click="copyAsPowershellGetAdObject"> <Copy class="size-3 mr-1" />Get-ADObject </Button>
@@ -87,7 +91,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Loader2, FileSearch, X, Copy, Plus, Pencil, Trash2, Replace } from "@lucide/vue";
+import { Loader2, FileSearch, X, Copy, Plus, Pencil, Trash2, Replace, RefreshCw } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useI18n } from "vue-i18n";
