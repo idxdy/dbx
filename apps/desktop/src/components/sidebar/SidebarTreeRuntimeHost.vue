@@ -5324,7 +5324,6 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   }
 
   if (node.type === "ldap-entry") {
-    items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
     return true;
   }
