@@ -1951,10 +1951,33 @@ async function openDdl() {
   emit("open-ddl", targets[0]!);
 }
 
+async function refreshLdapEntry(node: TreeNode) {
+  if (!node.connectionId || !node.database) return;
+  // Refresh this node's children if it is expanded
+  if (node.isExpanded) {
+    await connectionStore.loadLdapEntryChildren(node.connectionId, node.database);
+    // Recursively refresh expanded children
+    if (node.children) {
+      for (const child of node.children) {
+        if (child.isExpanded) {
+          await refreshLdapEntry(child);
+        }
+      }
+    }
+  }
+}
+
 async function refresh() {
   const node = activeNode.value;
   try {
-    await connectionStore.refreshTreeNode(node);
+    if (node.type === "ldap-entry") {
+      await refreshLdapEntry(node);
+      void nextTick(() => {
+        window.dispatchEvent(new CustomEvent("dbx-refresh-active-kv-browser", { detail: { mode: "ldap", connectionId: node.connectionId } }));
+      });
+    } else {
+      await connectionStore.refreshTreeNode(node);
+    }
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
     openDriverStoreForInstallError(e?.message || String(e), node);

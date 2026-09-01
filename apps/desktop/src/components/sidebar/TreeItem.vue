@@ -734,6 +734,10 @@ const canExpand = computed(() => {
   if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
     return activeNode.value.hasMembers === true;
   }
+  // LDAP entry nodes: hide expander after first expand when no children found
+  if (activeNode.value.type === "ldap-entry" && activeNode.value.isExpanded && (activeNode.value.children?.length ?? 0) === 0) {
+    return false;
+  }
   return canTreeNodeShowExpander({
     type: activeNode.value.type,
     childCount: activeNode.value.children?.length ?? 0,

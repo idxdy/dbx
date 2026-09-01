@@ -233,4 +233,6 @@ watch(
   },
   { immediate: true },
 );
+
+defineExpose({ refresh: reloadEntryDetail });
 </script>

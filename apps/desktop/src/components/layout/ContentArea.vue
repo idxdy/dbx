@@ -317,6 +317,7 @@ const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
+const ldapBrowserRef = ref<{ refresh?: () => void }>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeResultExecutionTarget = computed(() => queryStore.activeResultExecutionTarget(props.activeTab.id));
@@ -918,6 +919,10 @@ function refreshData(): boolean {
   if (props.activeTab.mode === "consul-overview") return consulOverviewRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "consul") return consulWorkspaceRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "databases") return databaseBrowserRef.value?.refresh?.() ?? false;
+  if (props.activeTab.mode === "ldap") {
+    ldapBrowserRef.value?.refresh?.();
+    return true;
+  }
   // Restored data tabs intentionally omit row data, so refresh must work before DataGrid mounts.
   if (canReloadUnavailableDataTab(props.activeTab)) {
     emit("reload");
@@ -2250,7 +2255,7 @@ defineExpose({
     <!-- LDAP mode: entry browser -->
     <template v-else-if="activeTab.mode === 'ldap'">
       <div class="flex-1 min-h-0">
-        <LdapBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :base-dn="activeTab.database" />
+        <LdapBrowser ref="ldapBrowserRef" :key="activeTab.id" :connection-id="activeTab.connectionId" :base-dn="activeTab.database" />
       </div>
     </template>
 
