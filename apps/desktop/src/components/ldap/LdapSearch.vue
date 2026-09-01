@@ -25,6 +25,10 @@
         <Input v-model.number="sizeLimit" type="number" class="h-7 w-20 text-xs" min="1" />
       </div>
       <div class="flex items-center gap-2 px-3 pb-1.5 shrink-0">
+        <Button size="sm" variant="secondary" class="h-7 px-2" @click="executeSearch" :disabled="loading" title="Refresh">
+          <Loader2 v-if="loading" class="size-3.5 animate-spin" />
+          <RefreshCw v-else class="size-3.5" />
+        </Button>
         <span class="text-xs text-muted-foreground shrink-0">Copy as:</span>
         <Button variant="outline" size="sm" class="h-7 px-2 text-xs font-mono" :disabled="!searchBaseDn" @click="copyAsLdapSearch"> <Copy class="size-3.5 mr-1" />ldapsearch </Button>
         <Button variant="outline" size="sm" class="h-7 px-2 text-xs font-mono" :disabled="!searchBaseDn" @click="copyAsPowershellGetAdObject"> <Copy class="size-3.5 mr-1" />Get-ADObject </Button>
@@ -116,7 +120,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import { Search, Loader2, FileText, FileSearch, X, Copy } from "@lucide/vue";
+import { Search, Loader2, FileText, FileSearch, X, Copy, RefreshCw } from "@lucide/vue";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import * as api from "@/lib/backend/api";
