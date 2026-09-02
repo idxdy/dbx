@@ -60,6 +60,9 @@ async fn dispatch_ldap_search(
         }
         LdapBackend::Agent(client) => {
             let mut agent = client.lock().await;
+            // An empty base DN targets the Root DSE, which is only reachable
+            // at base scope (mirrors the native driver's coercion).
+            let scope = if base_dn.trim().is_empty() { "base" } else { scope };
             let mut params = serde_json::json!({
                 "base_dn": base_dn,
                 "scope": scope,

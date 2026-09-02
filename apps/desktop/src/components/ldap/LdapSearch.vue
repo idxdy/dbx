@@ -50,7 +50,7 @@
         <div v-else class="flex-1 overflow-auto">
           <div v-for="entry in entries" :key="entry.dn" class="flex items-center h-7 px-3 cursor-pointer hover:bg-accent text-sm select-none gap-1.5" :class="{ 'bg-accent': selectedDn === entry.dn }" @click="selectedDn = entry.dn">
             <FileText class="size-3.5 text-blue-500 shrink-0" />
-            <span class="truncate text-xs">{{ entry.dn.split(",")[0] }}</span>
+            <span class="truncate text-xs">{{ entry.dn ? entry.dn.split(",")[0] : "Root DSE" }}</span>
           </div>
         </div>
       </div>
@@ -219,16 +219,20 @@ function openValuePopup(name: string, value: unknown) {
 }
 
 async function executeSearch() {
-  if (!props.connectionId || !searchBaseDn.value) return;
+  if (!props.connectionId) return;
   loading.value = true;
   try {
+    const baseDn = searchBaseDn.value.trim();
+    // An empty base DN targets the Root DSE, which is only reachable at
+    // base scope — mirror `ldapsearch -b "" -s base` instead of erroring.
+    const effectiveScope = baseDn ? scope.value : "base";
     const attrList = attributes.value.trim()
       ? attributes.value
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean)
       : undefined;
-    const result = await api.ldapSearch(props.connectionId, searchBaseDn.value, filter.value || "(objectClass=*)", scope.value, attrList, sizeLimit.value || undefined);
+    const result = await api.ldapSearch(props.connectionId, baseDn, filter.value || "(objectClass=*)", effectiveScope, attrList, sizeLimit.value || undefined);
     entries.value = result.entries.map((e: { dn: string; attributes: Record<string, string | string[]> }) => ({
       dn: e.dn,
       attributes: e.attributes,

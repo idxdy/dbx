@@ -4436,6 +4436,14 @@ export const useConnectionStore = defineStore("connection", () => {
     return undefined;
   }
 
+  /** Query the Root DSE (empty base DN, base scope) and return its naming contexts as pseudo entries. */
+  async function loadLdapRootDseNamingContexts(connectionId: string) {
+    const result = await withMetadataLoadTimeout(connectionId, api.ldapSearch(connectionId, "", "(objectClass=*)", "base", ["namingContexts"]), "LDAP Root DSE");
+    const raw = result.entries[0]?.attributes?.namingContexts;
+    const contexts = Array.isArray(raw) ? raw.map(String) : raw ? [String(raw)] : [];
+    return contexts.map((dn) => ({ dn, attributes: { namingContexts: dn } }));
+  }
+
   async function loadLdapRoot(connectionId: string) {
     const node = findConnectionNode(connectionId);
     if (!node) return;
@@ -4445,13 +4453,21 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureConnected(connectionId);
       const config = getConfig(connectionId);
       const baseDn = (config as any)?.ldap_base_dn || "";
-      const result = await withMetadataLoadTimeout(connectionId, api.ldapSearch(connectionId, baseDn, "(objectClass=*)", "one", ["objectClass"]), "LDAP entries");
+      let entries: { dn: string; attributes: Record<string, unknown> }[];
+      if (!baseDn.trim()) {
+        // No configured base DN: show the Root DSE's naming contexts as the
+        // top-level entries (mirrors Apache Directory Studio's Root DSE view).
+        entries = await loadLdapRootDseNamingContexts(connectionId);
+      } else {
+        const result = await withMetadataLoadTimeout(connectionId, api.ldapSearch(connectionId, baseDn, "(objectClass=*)", "one", ["objectClass"]), "LDAP entries");
+        entries = result.entries;
+      }
       const ldapConfig = await api.getLdapConfig();
       setChildren(
         node,
         withSavedSqlRoot(
           connectionId,
-          result.entries.map((entry) => ({
+          entries.map((entry) => ({
             id: `${connectionId}:ldap:${entry.dn}`,
             label: entry.dn.split(",")[0],
             type: "ldap-entry" as const,

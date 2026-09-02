@@ -32,7 +32,7 @@
       <div v-else class="space-y-4">
         <div>
           <h3 class="text-sm font-semibold mb-1">DN</h3>
-          <p class="text-sm font-mono bg-muted rounded px-2 py-1 break-all">{{ entryDetail.dn }}</p>
+          <p class="text-sm font-mono bg-muted rounded px-2 py-1 break-all">{{ entryDetail.dn || "Root DSE" }}</p>
         </div>
         <div>
           <h3 class="text-sm font-semibold mb-2">Attributes</h3>
@@ -192,10 +192,12 @@ function openValuePopup(name: string, value: unknown) {
 }
 
 async function reloadEntryDetail() {
-  if (!props.baseDn || !props.connectionId) return;
+  if (!props.connectionId) return;
+  // An empty base DN shows the Root DSE (read-only; the write buttons are
+  // hidden for it).
   entryDetailLoading.value = true;
   try {
-    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn, "(objectClass=*)", "base"), getOrFetchLdapConfig()]);
+    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn || "", "(objectClass=*)", "base"), getOrFetchLdapConfig()]);
     entryDetail.value = result.entries.length > 0 ? result.entries[0] : null;
     ldapConfig.value = config;
   } catch (_e: unknown) {
@@ -251,10 +253,12 @@ async function deleteEntry() {
 watch(
   () => props.baseDn,
   async (dn) => {
-    if (!dn || !props.connectionId) {
+    // An empty DN is valid: it shows the Root DSE.
+    if (!props.connectionId) {
       entryDetail.value = null;
       return;
     }
+    void dn;
     await reloadEntryDetail();
   },
   { immediate: true },

@@ -74,8 +74,11 @@ impl LdapClient {
             return Err("LDAP connection is closed".to_string());
         }
         let ldap_scope = scope.to_ldap_scope();
+        // Root DSE attributes are operational and are not returned by `*`;
+        // request `+` as well so namingContexts and friends come back.
         let attrs: Vec<String> = match attributes {
             Some(list) if !list.is_empty() => list.to_vec(),
+            _ if base_dn.trim().is_empty() => vec!["*".to_string(), "+".to_string()],
             _ => vec!["*".to_string()],
         };
 
@@ -388,8 +391,14 @@ pub async fn search(
     size_limit: Option<i32>,
     timeout: Option<Duration>,
 ) -> Result<LdapSearchOutput, String> {
-    let scope = LdapScope::from_request(scope);
+    let mut scope = LdapScope::from_request(scope);
     let base_dn = if base_dn.is_empty() { client.base_dn() } else { base_dn };
+    // An empty base DN (and no configured base to fall back to) targets the
+    // Root DSE, which is only reachable at base scope — mirroring
+    // `ldapsearch -b "" -s base`.
+    if base_dn.trim().is_empty() {
+        scope = LdapScope::Base;
+    }
     let filter = if filter.trim().is_empty() { "(objectClass=*)" } else { filter };
     let limit = size_limit.unwrap_or(100).clamp(1, MAX_LDAP_SEARCH_SIZE);
     let timeout = timeout.unwrap_or(Duration::from_secs(DEFAULT_SEARCH_TIMEOUT_SECS));
