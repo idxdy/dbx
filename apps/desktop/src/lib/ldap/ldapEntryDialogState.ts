@@ -1,4 +1,5 @@
 import { reactive } from "vue";
+import * as api from "@/lib/backend/api";
 
 /**
  * Shared, framework-free state for the LDAP entry write dialogs mounted in
@@ -8,10 +9,12 @@ import { reactive } from "vue";
  */
 export const ldapEntryDialogState = reactive({
   createOpen: false,
+  editOpen: false,
   renameOpen: false,
   deleteOpen: false,
   connectionId: "",
   createParentDn: "",
+  editEntry: null as { dn: string; attributes: Record<string, string | string[]> } | null,
   renameDn: "",
   deleteDn: "",
 });
@@ -20,6 +23,19 @@ export function openLdapCreateEntryDialog(connectionId: string, parentDn: string
   ldapEntryDialogState.connectionId = connectionId;
   ldapEntryDialogState.createParentDn = parentDn;
   ldapEntryDialogState.createOpen = true;
+}
+
+/**
+ * Fetch the entry's current attributes (the sidebar only knows the DN) and
+ * open the edit dialog. Rejects with the backend error when the entry cannot
+ * be read; the caller is responsible for surfacing the failure.
+ */
+export async function openLdapEditEntryDialog(connectionId: string, dn: string) {
+  const result = await api.ldapSearch(connectionId, dn, "(objectClass=*)", "base");
+  const entry = result.entries.length > 0 ? result.entries[0] : { dn, attributes: {} };
+  ldapEntryDialogState.connectionId = connectionId;
+  ldapEntryDialogState.editEntry = entry;
+  ldapEntryDialogState.editOpen = true;
 }
 
 export function openLdapRenameEntryDialog(connectionId: string, dn: string) {
