@@ -5104,6 +5104,7 @@ export default {
     deleteConfirmMessage: "This will permanently delete the LDAP entry below and all of its attributes. This action cannot be undone.",
     invalidRdn: "The RDN must look like attribute=value",
     attributesRequired: "At least one attribute is required",
+    rdnAttributeLocked: "The naming attribute '{attribute}' must keep at least one value; rename the entry to change it",
     writeSuccess: "LDAP directory updated",
     save: "Save",
     create: "Create",

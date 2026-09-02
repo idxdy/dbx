@@ -83,7 +83,7 @@
 
     <!-- Write dialogs -->
     <LdapEntryCreateDialog v-model:open="showCreateDialog" :connection-id="connectionId" :parent-dn="baseDn || ''" @created="reloadEntryDetail" />
-    <LdapEntryEditDialog v-model:open="showEditDialog" :connection-id="connectionId" :entry="entryDetail" @saved="reloadEntryDetail" />
+    <LdapEntryEditDialog v-model:open="showEditDialog" :connection-id="connectionId" :entry="entryDetail" @saved="onEntrySaved" />
     <LdapEntryRenameDialog v-model:open="showRenameDialog" :connection-id="connectionId" :dn="baseDn || ''" @renamed="onEntryRenamed" />
     <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="baseDn" :confirm-label="t('ldap.deleteEntry')" :loading="deleting" @confirm="deleteEntry" />
   </div>
@@ -205,7 +205,7 @@ async function reloadEntryDetail() {
   }
 }
 
-function onEntryRenamed(newDn: string) {
+function followTabDn(newDn: string) {
   // The tab's base DN must follow the renamed entry, otherwise the panel
   // would reload a DN that no longer exists.
   const oldDn = props.baseDn;
@@ -215,6 +215,19 @@ function onEntryRenamed(newDn: string) {
     tab.title = `${newDn.split(",")[0] ?? newDn} - ${connectionStore.getConfig(props.connectionId)?.name || "LDAP"}`;
   }
   entryDetail.value = null;
+}
+
+function onEntryRenamed(newDn: string) {
+  followTabDn(newDn);
+}
+
+function onEntrySaved(newDn: string) {
+  // An edit can rename the entry when the RDN attribute's value changed.
+  if (newDn && newDn !== props.baseDn) {
+    followTabDn(newDn);
+  } else {
+    reloadEntryDetail();
+  }
 }
 
 async function deleteEntry() {

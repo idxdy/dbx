@@ -4925,6 +4925,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "La voce LDAP indicata qui sotto e tutti i suoi attributi verranno eliminati definitivamente. L'azione non può essere annullata.",
     invalidRdn: "Il RDN deve avere il formato attributo=valore",
     attributesRequired: "È richiesto almeno un attributo",
+    rdnAttributeLocked: "L'attributo di denominazione '{attribute}' deve conservare almeno un valore; rinomina la voce per modificarlo",
     writeSuccess: "Directory LDAP aggiornata",
     save: "Salva",
     create: "Crea",

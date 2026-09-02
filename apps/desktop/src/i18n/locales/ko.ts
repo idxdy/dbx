@@ -4480,6 +4480,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "아래 LDAP 항목과 모든 속성을 영구적으로 삭제합니다. 이 작업은 되돌릴 수 없습니다.",
     invalidRdn: "RDN은 attribute=value 형식이어야 합니다",
     attributesRequired: "최소 한 개의 속성이 필요합니다",
+    rdnAttributeLocked: "이름 지정 속성 '{attribute}'는 최소한 하나의 값을 유지해야 합니다. 변경하려면 이름 바꾸기를 사용하세요",
     writeSuccess: "LDAP 디렉터리가 업데이트되었습니다",
     save: "저장",
     create: "만들기",

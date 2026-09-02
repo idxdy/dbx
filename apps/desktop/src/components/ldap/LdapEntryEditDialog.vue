@@ -29,7 +29,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  saved: [];
+  saved: [newDn: string];
 }>();
 
 interface AttributeRow {
@@ -110,18 +110,63 @@ function buildModifications(): LdapModification[] {
   return modifications;
 }
 
+/** First RDN component of a DN, e.g. `ou=jaime.su` from `ou=jaime.su,ou=users,dc=example,dc=com`. */
+function splitDnRdn(dn: string): { attribute: string; value: string } | null {
+  const first = dn.split(",")[0] ?? "";
+  const eq = first.indexOf("=");
+  if (eq <= 0) return null;
+  return { attribute: first.slice(0, eq).trim(), value: first.slice(eq + 1).trim() };
+}
+
 async function save() {
   if (!props.entry) return;
-  const modifications = buildModifications();
-  if (modifications.length === 0) {
+  let modifications = buildModifications();
+
+  // The naming attribute's value cannot be changed or removed via Modify —
+  // the server rejects it with a namingViolation (rc=64) because the entry
+  // would no longer match its DN. Route RDN value changes through a rename
+  // (MODDN) instead.
+  let renameNewValue: string | null = null;
+  const rdn = splitDnRdn(props.entry.dn);
+  if (rdn) {
+    const rdnLower = rdn.attribute.toLowerCase();
+    const rdnRow = rows.value.find((row) => row.name.trim().toLowerCase() === rdnLower);
+    const editor = rdnRow && ldapConfig.value ? getLdapEditor(rdnRow.name, ldapConfig.value) : undefined;
+    const serializedValues = rdnRow ? rdnRow.values.filter((v) => v.length > 0).map((v) => (editor ? editor.serialize(v) : v)) : [];
+    if (serializedValues.length === 0) {
+      toast(t("ldap.rdnAttributeLocked", { attribute: rdn.attribute }), 5000);
+      return;
+    }
+    if (!serializedValues.includes(rdn.value)) {
+      renameNewValue = serializedValues[0];
+      modifications = modifications.filter((m) => m.attribute.toLowerCase() !== rdnLower);
+    }
+  }
+
+  if (modifications.length === 0 && !renameNewValue) {
     open.value = false;
     return;
   }
   saving.value = true;
   try {
-    await api.ldapModify(props.connectionId, props.entry.dn, modifications);
+    if (modifications.length > 0) {
+      await api.ldapModify(props.connectionId, props.entry.dn, modifications);
+    }
+    let resultDn = props.entry.dn;
+    if (renameNewValue) {
+      const renamed = await api.ldapRename(props.connectionId, props.entry.dn, `${rdn!.attribute}=${renameNewValue}`, true);
+      resultDn = renamed.dn;
+      // After the rename removed the old RDN value, sync the remaining
+      // values of the naming attribute (only needed for multi-valued RDNs).
+      const rdnRow = rows.value.find((row) => row.name.trim().toLowerCase() === rdn!.attribute.toLowerCase());
+      const editor = rdnRow && ldapConfig.value ? getLdapEditor(rdnRow.name, ldapConfig.value) : undefined;
+      const serializedValues = rdnRow!.values.filter((v) => v.length > 0).map((v) => (editor ? editor.serialize(v) : v));
+      if (serializedValues.length > 1) {
+        await api.ldapModify(props.connectionId, resultDn, [{ op: "replace", attribute: rdn!.attribute, values: serializedValues }]);
+      }
+    }
     toast(t("ldap.writeSuccess"), 2500);
-    emit("saved");
+    emit("saved", resultDn);
     open.value = false;
   } catch (e: unknown) {
     toast(e instanceof Error ? e.message : String(e), 5000);

@@ -4251,6 +4251,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "將永久刪除該 LDAP 條目及其全部屬性,此操作無法復原。",
     invalidRdn: "RDN 需形如 attribute=value",
     attributesRequired: "至少需要一個屬性",
+    rdnAttributeLocked: "命名屬性「{attribute}」至少需保留一個值;如需修改請使用重新命名",
     writeSuccess: "LDAP 目錄已更新",
     save: "儲存",
     create: "建立",

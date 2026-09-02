@@ -4927,6 +4927,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "A entrada LDAP abaixo e todos os seus atributos serão excluídos permanentemente. Esta ação não pode ser desfeita.",
     invalidRdn: "O RDN deve estar no formato atributo=valor",
     attributesRequired: "É necessário pelo menos um atributo",
+    rdnAttributeLocked: "O atributo de nomenclatura '{attribute}' deve manter pelo menos um valor; renomeie a entrada para alterá-lo",
     writeSuccess: "Diretório LDAP atualizado",
     save: "Salvar",
     create: "Criar",

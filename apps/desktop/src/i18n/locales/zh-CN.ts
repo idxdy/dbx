@@ -5089,6 +5089,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "将永久删除该 LDAP 条目及其全部属性,此操作不可撤销。",
     invalidRdn: "RDN 需形如 attribute=value",
     attributesRequired: "至少需要一个属性",
+    rdnAttributeLocked: "命名属性 “{attribute}” 至少需保留一个值;如需修改请使用重命名",
     writeSuccess: "LDAP 目录已更新",
     save: "保存",
     create: "创建",

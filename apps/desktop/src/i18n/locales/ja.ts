@@ -4954,6 +4954,7 @@ export default withEnglishFallback({
     deleteConfirmMessage: "下記の LDAP エントリとそのすべての属性を完全に削除します。この操作は元に戻せません。",
     invalidRdn: "RDN は 属性=値 の形式で指定してください",
     attributesRequired: "少なくとも 1 つの属性が必要です",
+    rdnAttributeLocked: "命名属性「{attribute}」は少なくとも 1 つの値を保持する必要があります。変更には名前の変更を使用してください",
     writeSuccess: "LDAP ディレクトリを更新しました",
     save: "保存",
     create: "作成",

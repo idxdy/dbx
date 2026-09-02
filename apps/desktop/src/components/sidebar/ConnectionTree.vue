@@ -117,10 +117,16 @@ async function onLdapEntryCreated() {
   }
 }
 
-async function onLdapEntryEdited() {
+async function onLdapEntryEdited(newDn: string) {
+  const oldDn = ldapEntryDialogState.editEntry?.dn;
+  if (!oldDn) return;
   try {
-    if (ldapEntryDialogState.editEntry) {
-      await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.editEntry.dn);
+    // An edit that changed the RDN value renamed the entry; refresh the
+    // parent so the tree shows the new label.
+    if (newDn && newDn !== oldDn) {
+      await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapParentDn(oldDn));
+    } else {
+      await refreshLdapChildren(ldapEntryDialogState.connectionId, oldDn);
     }
   } catch (e: unknown) {
     toast(e instanceof Error ? e.message : String(e), 5000);
