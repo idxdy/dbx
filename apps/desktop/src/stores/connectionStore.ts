@@ -4426,6 +4426,16 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  function resolveLdapIcon(attributes: Record<string, unknown>, ldapConfig: { objectClasses: { name: string; icon?: string }[] }): string | undefined {
+    const raw = attributes?.objectClass;
+    const classes: string[] = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+    for (const name of classes) {
+      const oc = ldapConfig.objectClasses.find((c) => c.name.toLowerCase() === name.toLowerCase());
+      if (oc?.icon) return oc.icon;
+    }
+    return undefined;
+  }
+
   async function loadLdapRoot(connectionId: string) {
     const node = findConnectionNode(connectionId);
     if (!node) return;
@@ -4436,6 +4446,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const config = getConfig(connectionId);
       const baseDn = (config as any)?.ldap_base_dn || "";
       const result = await withMetadataLoadTimeout(connectionId, api.ldapSearch(connectionId, baseDn, "(objectClass=*)", "one", ["objectClass"]), "LDAP entries");
+      const ldapConfig = await api.getLdapConfig();
       setChildren(
         node,
         withSavedSqlRoot(
@@ -4448,6 +4459,7 @@ export const useConnectionStore = defineStore("connection", () => {
             database: entry.dn,
             isExpanded: false,
             children: [],
+            ldapIcon: resolveLdapIcon(entry.attributes, ldapConfig),
           })),
           node,
         ),
@@ -4469,6 +4481,7 @@ export const useConnectionStore = defineStore("connection", () => {
     node.isLoading = true;
     try {
       const result = await api.ldapSearch(connectionId, baseDn, "(objectClass=*)", "one", ["objectClass"]);
+      const ldapConfig = await api.getLdapConfig();
       setChildren(
         node,
         result.entries.map((entry) => ({
@@ -4479,6 +4492,7 @@ export const useConnectionStore = defineStore("connection", () => {
           database: entry.dn,
           isExpanded: false,
           children: [],
+          ldapIcon: resolveLdapIcon(entry.attributes, ldapConfig),
         })),
       );
       node.isExpanded = true;

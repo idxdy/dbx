@@ -2645,6 +2645,28 @@ export async function ldapRename(connectionId: string, dn: string, newRdn: strin
   });
 }
 
+export interface LdapObjectClass {
+  name: string;
+  system: string[];
+  description: string;
+  superior: string[];
+  inheritanceChain: string[];
+  must: string[];
+  may: string[];
+  type: "STRUCTURAL" | "ABSTRACT" | "AUXILIARY";
+  icon?: string;
+  note?: string;
+}
+
+export interface LdapSchemaConfig {
+  objectClasses: LdapObjectClass[];
+  attributesEditor: Record<string, string>;
+}
+
+export async function getLdapConfig(): Promise<LdapSchemaConfig> {
+  return get("/api/ldap/config");
+}
+
 export interface LdapLoginSettings {
   enabled: boolean;
   name: string;

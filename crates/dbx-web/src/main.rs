@@ -620,6 +620,7 @@ async fn main() {
         .route("/ldap/modify", post(routes::ldap::modify))
         .route("/ldap/delete", post(routes::ldap::delete))
         .route("/ldap/rename", post(routes::ldap::rename))
+        .route("/ldap/config", get(routes::ldap::get_config))
         .route("/redis/scan-keys", post(routes::redis::scan_keys))
         .route("/redis/scan-keys-batch", post(routes::redis::scan_keys_batch))
         .route("/redis/scan-values", post(routes::redis::scan_values))

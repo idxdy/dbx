@@ -168,3 +168,10 @@ pub async fn rename(
     .map_err(AppError::from)?;
     Ok(Json(result))
 }
+
+/// Serve the static LDAP schema configuration (objectClasses, editors, etc.).
+pub async fn get_config() -> Json<serde_json::Value> {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../dbx-core/assets/ldap.json")).expect("invalid ldap.json in assets");
+    Json(config)
+}

@@ -48,7 +48,7 @@
                 <tr v-for="(value, name) in entryDetail.attributes" :key="name" class="hover:bg-muted/30">
                   <td class="px-3 py-1 font-mono text-xs whitespace-nowrap align-top">{{ name }}</td>
                   <td class="px-3 py-1 font-mono text-xs max-w-md">
-                    <span :class="{ 'cursor-pointer hover:text-primary hover:underline': isLongValue(value) }" @click="isLongValue(value) && openValuePopup(name, value)">{{ formatCellValue(value) }}</span>
+                    <span :class="{ 'cursor-pointer hover:text-primary hover:underline': isLongValue(value) }" @click="isLongValue(value) && openValuePopup(name, value)">{{ formatCellValue(value, name) }}</span>
                   </td>
                 </tr>
               </tbody>
@@ -101,6 +101,9 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildGetAdObjectIdentityCommand, buildLdapSearchByDnCommand } from "@/lib/ldap/ldapSearchSyntax";
+import { getOrFetchLdapConfig } from "@/lib/ldap/ldapSchema";
+import { getLdapEditor } from "@/lib/ldap/ldapEditors";
+import type { LdapSchemaConfig } from "@/lib/backend/http";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import LdapEntryCreateDialog from "@/components/ldap/LdapEntryCreateDialog.vue";
 import LdapEntryEditDialog from "@/components/ldap/LdapEntryEditDialog.vue";
@@ -119,6 +122,7 @@ const queryStore = useQueryStore();
 
 const entryDetail = ref<{ dn: string; attributes: Record<string, string | string[]> } | null>(null);
 const entryDetailLoading = ref(false);
+const ldapConfig = ref<LdapSchemaConfig | null>(null);
 
 const readOnly = computed(() => Boolean((connectionStore.getConfig(props.connectionId) as any)?.read_only));
 
@@ -164,18 +168,26 @@ function isLongValue(value: unknown): boolean {
   return String(value).length > 120;
 }
 
-function formatCellValue(value: unknown): string {
+function formatCellValue(value: unknown, attrName?: string): string {
+  const deserialize = (v: string) => {
+    if (!ldapConfig.value || !attrName) return v;
+    return getLdapEditor(attrName, ldapConfig.value).deserialize(v);
+  };
   if (Array.isArray(value)) {
-    const joined = value.join(", ");
+    const joined = value.map(deserialize).join(", ");
     return joined.length <= 120 ? joined : joined.slice(0, 117) + "...";
   }
-  const str = String(value);
+  const str = deserialize(String(value));
   return str.length <= 120 ? str : str.slice(0, 117) + "...";
 }
 
 function openValuePopup(name: string, value: unknown) {
   popupAttrName.value = name;
-  popupValues.value = Array.isArray(value) ? value : String(value);
+  const deserialize = (v: string) => {
+    if (!ldapConfig.value) return v;
+    return getLdapEditor(name, ldapConfig.value).deserialize(v);
+  };
+  popupValues.value = Array.isArray(value) ? value.map(deserialize) : deserialize(String(value));
   popupOpen.value = true;
 }
 
@@ -183,8 +195,9 @@ async function reloadEntryDetail() {
   if (!props.baseDn || !props.connectionId) return;
   entryDetailLoading.value = true;
   try {
-    const result = await api.ldapSearch(props.connectionId, props.baseDn, "(objectClass=*)", "base");
+    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn, "(objectClass=*)", "base"), getOrFetchLdapConfig()]);
     entryDetail.value = result.entries.length > 0 ? result.entries[0] : null;
+    ldapConfig.value = config;
   } catch (_e: unknown) {
     entryDetail.value = null;
   } finally {

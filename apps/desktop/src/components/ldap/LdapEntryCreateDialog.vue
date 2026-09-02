@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Plus, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
+import { getOrFetchLdapConfig, getStructuralObjectClasses, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
+import { getLdapEditor } from "@/lib/ldap/ldapEditors";
+import type { LdapSchemaConfig, LdapObjectClass } from "@/lib/backend/http";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -27,20 +30,61 @@ const emit = defineEmits<{
 interface AttributeRow {
   name: string;
   value: string;
+  required?: boolean;
 }
 
-const rdn = ref("");
-const objectClass = ref("inetOrgPerson");
-const rows = ref<AttributeRow[]>([{ name: "", value: "" }]);
+const rdnAttr = ref("");
+const rdnValue = ref("");
+const rdn = computed(() => `${rdnAttr.value.trim()}=${rdnValue.value.trim()}`);
+const selectedObjectClass = ref("");
+const rows = ref<AttributeRow[]>([]);
 const saving = ref(false);
+const ldapConfig = ref<LdapSchemaConfig | null>(null);
+const structuralClasses = ref<LdapObjectClass[]>([]);
 
-watch(open, (value) => {
+watch(open, async (value) => {
   if (value) {
-    rdn.value = "";
-    objectClass.value = "inetOrgPerson";
-    rows.value = [{ name: "", value: "" }];
+    rdnAttr.value = "";
+    rdnValue.value = "";
+    selectedObjectClass.value = "";
+    rows.value = [];
     saving.value = false;
+    try {
+      ldapConfig.value = await getOrFetchLdapConfig();
+      structuralClasses.value = getStructuralObjectClasses(ldapConfig.value);
+      if (structuralClasses.value.length > 0) {
+        selectedObjectClass.value = structuralClasses.value[0].name;
+      }
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 5000);
+    }
   }
+});
+
+/** Rebuild required rows when objectClass or RDN changes. */
+function rebuildRequiredRows() {
+  if (!ldapConfig.value || !selectedObjectClass.value) return;
+  const rdnAttrLower = rdnAttr.value.trim().toLowerCase();
+  const required = getRequiredAttributes(ldapConfig.value, selectedObjectClass.value);
+  // Keep user-added rows that are not required or not the RDN attr
+  const userRows = rows.value.filter((r) => !r.required || (rdnAttrLower && r.name.toLowerCase() === rdnAttrLower));
+  const requiredRows: AttributeRow[] = required
+    .filter((a) => a.toLowerCase() !== rdnAttrLower && a.toLowerCase() !== "objectclass")
+    .map((a) => ({
+      name: a,
+      value: userRows.find((r) => r.name.toLowerCase() === a.toLowerCase())?.value ?? "",
+      required: true,
+    }));
+  rows.value = [...requiredRows, ...userRows.filter((r) => !r.required)];
+}
+
+watch(selectedObjectClass, rebuildRequiredRows);
+watch(rdnAttr, rebuildRequiredRows);
+watch(rdnValue, rebuildRequiredRows);
+
+const hasMissingRequired = computed(() => {
+  if (!rdnAttr.value.trim() || !rdnValue.value.trim()) return true;
+  return rows.value.some((r) => r.required && !r.value.trim());
 });
 
 function addRow() {
@@ -53,31 +97,35 @@ function removeRow(index: number) {
 
 function buildAttributes(): Record<string, string | string[]> | null {
   const attributes: Record<string, string | string[]> = {};
-  const classes = objectClass.value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (classes.length > 0) attributes.objectClass = classes.length === 1 ? classes[0] : classes;
+  const oc = ldapConfig.value?.objectClasses.find((c) => c.name === selectedObjectClass.value);
+  attributes.objectClass = oc ? oc.inheritanceChain : selectedObjectClass.value;
+  const rdnAttrName = rdnAttr.value.trim();
+  const rdnVal = rdnValue.value.trim();
+  if (rdnAttrName && rdnVal) {
+    attributes[rdnAttrName] = rdnVal;
+  }
   for (const row of rows.value) {
     const name = row.name.trim();
     if (!name || name === "objectClass") continue;
     const value = row.value;
     if (!value) continue;
+    const editor = ldapConfig.value ? getLdapEditor(name, ldapConfig.value) : undefined;
+    const serialized = editor ? editor.serialize(value) : value;
     const existing = attributes[name];
     if (existing === undefined) {
-      attributes[name] = value;
+      attributes[name] = serialized;
     } else if (Array.isArray(existing)) {
-      existing.push(value);
+      existing.push(serialized);
     } else {
-      attributes[name] = [existing, value];
+      attributes[name] = [existing, serialized];
     }
   }
   return Object.keys(attributes).length > 0 ? attributes : null;
 }
 
 async function save() {
-  const rdnTrimmed = rdn.value.trim();
-  if (!rdnTrimmed || !rdnTrimmed.includes("=")) {
+  const rdnTrimmed = rdn.value;
+  if (!rdnAttr.value.trim() || !rdnValue.value.trim()) {
     toast(t("ldap.invalidRdn"), 3000);
     return;
   }
@@ -114,12 +162,24 @@ async function save() {
           <div class="col-span-3 text-xs font-mono break-all bg-muted rounded px-2 py-1">{{ parentDn }}</div>
         </div>
         <div class="grid grid-cols-4 items-center gap-2">
-          <Label for="ldap-create-rdn" class="text-right text-xs">{{ t("ldap.rdn") }}</Label>
-          <Input id="ldap-create-rdn" v-model="rdn" class="col-span-3 h-7 text-xs font-mono" placeholder="uid=new-user" />
+          <Label class="text-right text-xs">{{ t("ldap.rdn") }}</Label>
+          <div class="col-span-3 flex items-center gap-1.5">
+            <Input v-model="rdnAttr" class="h-7 w-28 text-xs font-mono" placeholder="cn" />
+            <span class="text-muted-foreground">=</span>
+            <Input v-model="rdnValue" class="h-7 flex-1 min-w-0 text-xs font-mono" placeholder="new-user" />
+          </div>
         </div>
         <div class="grid grid-cols-4 items-center gap-2">
           <Label for="ldap-create-objectclass" class="text-right text-xs">{{ t("ldap.objectClass") }}</Label>
-          <Input id="ldap-create-objectclass" v-model="objectClass" class="col-span-3 h-7 text-xs font-mono" placeholder="inetOrgPerson" />
+          <select id="ldap-create-objectclass" v-model="selectedObjectClass" class="col-span-3 h-7 text-xs font-mono rounded-md border border-input bg-background px-2">
+            <option v-for="oc in structuralClasses" :key="oc.name" :value="oc.name">{{ oc.name }} — {{ oc.description }}</option>
+          </select>
+        </div>
+        <div class="grid grid-cols-4 items-center gap-2">
+          <Label class="text-right text-xs">DN</Label>
+          <div class="col-span-3 text-xs font-mono break-all text-muted-foreground">
+            {{ rdnAttr.trim() && rdnValue.trim() ? rdn + "," + parentDn : parentDn }}
+          </div>
         </div>
 
         <div class="space-y-1.5">
@@ -128,9 +188,9 @@ async function save() {
             <Button variant="ghost" size="sm" class="h-6 px-2 text-xs" @click="addRow"> <Plus class="size-3 mr-1" />{{ t("ldap.addAttribute") }} </Button>
           </div>
           <div v-for="(row, index) in rows" :key="index" class="flex items-center gap-2">
-            <Input v-model="row.name" class="h-7 w-40 text-xs font-mono" placeholder="sn" />
-            <Input v-model="row.value" class="h-7 flex-1 min-w-0 text-xs" @keydown.enter="save" />
-            <Button variant="ghost" size="icon-sm" class="shrink-0 text-muted-foreground" @click="removeRow(index)">
+            <Input v-model="row.name" class="h-7 w-40 text-xs font-mono" placeholder="sn" :disabled="row.required" />
+            <Input v-model="row.value" class="h-7 flex-1 min-w-0 text-xs" :class="{ 'border-destructive': row.required && !row.value }" @keydown.enter="save" />
+            <Button v-if="!row.required" variant="ghost" size="icon-sm" class="shrink-0 text-muted-foreground" @click="removeRow(index)">
               <X class="size-3.5" />
             </Button>
           </div>

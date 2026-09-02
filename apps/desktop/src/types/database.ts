@@ -999,6 +999,8 @@ export interface TreeNode {
     offset: number;
     pageSize: number;
   };
+  /** Icon filename from ldap.json objectClass definition (e.g. "ldap-person.png"). */
+  ldapIcon?: string;
 }
 
 export interface CustomTypeTreeMemberMeta {

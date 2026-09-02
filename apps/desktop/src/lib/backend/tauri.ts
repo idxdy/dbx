@@ -2507,6 +2507,28 @@ export async function ldapRename(connectionId: string, dn: string, newRdn: strin
   });
 }
 
+export interface LdapObjectClass {
+  name: string;
+  system: string[];
+  description: string;
+  superior: string[];
+  inheritanceChain: string[];
+  must: string[];
+  may: string[];
+  type: "STRUCTURAL" | "ABSTRACT" | "AUXILIARY";
+  icon?: string;
+  note?: string;
+}
+
+export interface LdapSchemaConfig {
+  objectClasses: LdapObjectClass[];
+  attributesEditor: Record<string, string>;
+}
+
+export async function getLdapConfig(): Promise<LdapSchemaConfig> {
+  return invokeBackend("ldap_get_config", {});
+}
+
 // LDAP login is web-only (the desktop app does not gate itself behind a
 // password). These stubs satisfy the `api.ts` forward type so the desktop
 // build compiles; they are never reached in practice.

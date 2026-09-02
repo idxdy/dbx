@@ -39,6 +39,10 @@ import {
   X,
   CircleX,
   RefreshCw,
+  User,
+  Monitor,
+  Smartphone,
+  Globe,
 } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
@@ -218,6 +222,27 @@ function currentDriverProfile(): string | undefined {
   return activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId)?.driver_profile : undefined;
 }
 
+const ldapIconMap: Record<string, any> = {
+  User,
+  FolderOpen,
+  UsersRound,
+  ShieldCheck,
+  Server,
+  Database,
+  Monitor,
+  Smartphone,
+  Globe,
+  Key,
+  Lock,
+};
+
+function resolveLdapIcon(iconName: string | undefined): { icon: any; colorClass: string } {
+  if (iconName && ldapIconMap[iconName]) {
+    return { icon: ldapIconMap[iconName], colorClass: "text-sky-400" };
+  }
+  return { icon: Database, colorClass: "text-sky-400" };
+}
+
 function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   switch (node.type) {
     case "connection":
@@ -377,6 +402,10 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Package, colorClass: "text-violet-400" };
     case "load-more":
       return { icon: Plus, colorClass: "text-primary" };
+    case "ldap-root":
+      return { icon: Server, colorClass: "text-blue-500" };
+    case "ldap-entry":
+      return resolveLdapIcon(node.ldapIcon);
     default:
       return { icon: Database, colorClass: "text-muted-foreground" };
   }

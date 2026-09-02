@@ -8,6 +8,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
+import { getOrFetchLdapConfig } from "@/lib/ldap/ldapSchema";
+import { getLdapEditor } from "@/lib/ldap/ldapEditors";
+import type { LdapSchemaConfig } from "@/lib/backend/http";
 
 interface LdapModification {
   op: "add" | "replace" | "delete";
@@ -32,18 +35,32 @@ const emit = defineEmits<{
 interface AttributeRow {
   name: string;
   values: string[];
+  /** Original serialized values for diffing. */
+  originalSerialized: string[];
 }
 
 const rows = ref<AttributeRow[]>([]);
 const saving = ref(false);
+const ldapConfig = ref<LdapSchemaConfig | null>(null);
 
-watch(open, (value) => {
+watch(open, async (value) => {
   if (value) {
-    rows.value = Object.entries(props.entry?.attributes ?? {}).map(([name, attrValue]) => ({
-      name,
-      values: Array.isArray(attrValue) ? [...attrValue] : [String(attrValue)],
-    }));
     saving.value = false;
+    try {
+      ldapConfig.value = await getOrFetchLdapConfig();
+    } catch {
+      ldapConfig.value = null;
+    }
+    rows.value = Object.entries(props.entry?.attributes ?? {}).map(([name, attrValue]) => {
+      const rawValues = Array.isArray(attrValue) ? [...attrValue] : [String(attrValue)];
+      const editor = ldapConfig.value ? getLdapEditor(name, ldapConfig.value) : undefined;
+      const displayValues = editor ? rawValues.map((v) => editor.deserialize(v)) : rawValues;
+      return {
+        name,
+        values: displayValues,
+        originalSerialized: rawValues,
+      };
+    });
   }
 });
 
@@ -60,7 +77,7 @@ function removeRow(rowIndex: number) {
 }
 
 function addRow() {
-  rows.value.push({ name: "", values: [""] });
+  rows.value.push({ name: "", values: [""], originalSerialized: [] });
 }
 
 const currentNames = computed(() => new Set(rows.value.map((r) => r.name.trim()).filter(Boolean)));
@@ -73,15 +90,15 @@ function buildModifications(): LdapModification[] {
   for (const row of rows.value) {
     const name = row.name.trim();
     if (!name) continue;
-    const values = row.values.filter((v) => v.length > 0);
-    const before = original[name];
-    const beforeList = before === undefined ? [] : Array.isArray(before) ? before : [String(before)];
+    const editor = ldapConfig.value ? getLdapEditor(name, ldapConfig.value) : undefined;
+    const serializedValues = row.values.filter((v) => v.length > 0).map((v) => (editor ? editor.serialize(v) : v));
+    const beforeList = row.originalSerialized;
 
-    if (before === undefined) {
-      if (values.length > 0) modifications.push({ op: "add", attribute: name, values });
+    if (beforeList.length === 0) {
+      if (serializedValues.length > 0) modifications.push({ op: "add", attribute: name, values: serializedValues });
     } else {
-      const changed = values.length !== beforeList.length || values.some((v, i) => v !== beforeList[i]);
-      if (changed) modifications.push({ op: "replace", attribute: name, values });
+      const changed = serializedValues.length !== beforeList.length || serializedValues.some((v, i) => v !== beforeList[i]);
+      if (changed) modifications.push({ op: "replace", attribute: name, values: serializedValues });
     }
   }
 

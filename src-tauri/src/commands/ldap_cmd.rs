@@ -86,3 +86,10 @@ pub async fn ldap_rename(
     ldap_rename_core(&state, &connection_id, &dn, &new_rdn, delete_old_rdn.unwrap_or(true), new_parent_dn.as_deref())
         .await
 }
+
+#[tauri::command]
+pub async fn ldap_get_config() -> Result<Value, String> {
+    let config: Value = serde_json::from_str(include_str!("../../../../crates/dbx-core/assets/ldap.json"))
+        .map_err(|e| e.to_string())?;
+    Ok(config)
+}
