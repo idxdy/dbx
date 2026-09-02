@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
-import { getOrFetchLdapConfig } from "@/lib/ldap/ldapSchema";
+import { getOrFetchLdapConfig, getOptionalAttributes, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
 import { getLdapEditor } from "@/lib/ldap/ldapEditors";
 import type { LdapSchemaConfig } from "@/lib/backend/http";
 
@@ -91,6 +91,40 @@ function isLockedAttribute(name: string): boolean {
   return name.trim().toLowerCase() === "objectclass";
 }
 
+const entryObjectClasses = computed<string[]>(() => {
+  const raw = props.entry?.attributes["objectClass"];
+  if (!raw) return [];
+  return Array.isArray(raw) ? raw : [String(raw)];
+});
+
+/** Attributes allowed by the entry's objectClass chain (MUST + MAY), or null when the schema is unavailable. */
+const allowedAttributeNames = computed<Set<string> | null>(() => {
+  if (!ldapConfig.value || entryObjectClasses.value.length === 0) return null;
+  const set = new Set<string>(["objectclass"]);
+  for (const attr of getRequiredAttributes(ldapConfig.value, entryObjectClasses.value)) set.add(attr.toLowerCase());
+  for (const attr of getOptionalAttributes(ldapConfig.value, entryObjectClasses.value)) set.add(attr.toLowerCase());
+  return set;
+});
+
+/** Optional (MAY) attributes offered as suggestions for user-added rows. */
+const optionalAttributeNames = computed<string[]>(() => {
+  const allowed = allowedAttributeNames.value;
+  if (!allowed) return [];
+  const required = new Set(getRequiredAttributes(ldapConfig.value!, entryObjectClasses.value).map((attr) => attr.toLowerCase()));
+  return [...allowed].filter((attr) => !required.has(attr) && attr !== "objectclass").sort();
+});
+
+function isRowInvalid(row: { name: string }): boolean {
+  const name = row.name.trim();
+  if (!name || !allowedAttributeNames.value) return false;
+  // Attributes already on the entry were accepted by the server; only
+  // validate names that would introduce a new attribute.
+  if (props.entry?.attributes[name] !== undefined) return false;
+  return !allowedAttributeNames.value.has(name.toLowerCase());
+}
+
+const invalidAttributeNames = computed<string[]>(() => [...new Set(rows.value.filter(isRowInvalid).map((r) => r.name.trim()))]);
+
 /** Diff the edited rows against the original attributes into Modify operations. */
 function buildModifications(): LdapModification[] {
   const modifications: LdapModification[] = [];
@@ -130,6 +164,12 @@ function splitDnRdn(dn: string): { attribute: string; value: string } | null {
 
 async function save() {
   if (!props.entry) return;
+  // The server rejects attributes outside the objectClass's MUST/MAY sets
+  // with objectClassViolation (rc=65); surface that before submitting.
+  if (invalidAttributeNames.value.length > 0) {
+    toast(t("ldap.attributeNotAllowed", { attribute: invalidAttributeNames.value.join(", ") }), 5000);
+    return;
+  }
   let modifications = buildModifications();
 
   // The naming attribute's value cannot be changed or removed via Modify —
@@ -202,7 +242,14 @@ async function save() {
         <div class="space-y-1.5 max-h-[45vh] overflow-auto pr-1">
           <div v-for="(row, rowIndex) in rows" :key="rowIndex" class="rounded border border-border/60 px-2 py-1.5 space-y-1">
             <div class="flex items-center gap-2">
-              <Input v-model="row.name" class="h-6 w-40 text-xs font-mono" :class="{ 'text-muted-foreground': entry.attributes[row.name.trim()] !== undefined }" :disabled="isLockedAttribute(row.name)" :title="isLockedAttribute(row.name) ? t('ldap.objectClassLocked') : undefined" />
+              <Input
+                v-model="row.name"
+                class="h-6 w-40 text-xs font-mono"
+                :class="{ 'text-muted-foreground': entry.attributes[row.name.trim()] !== undefined, 'border-destructive': isRowInvalid(row) }"
+                list="ldap-edit-optional-attrs"
+                :disabled="isLockedAttribute(row.name)"
+                :title="isLockedAttribute(row.name) ? t('ldap.objectClassLocked') : isRowInvalid(row) ? t('ldap.attributeNotAllowed', { attribute: row.name.trim() }) : undefined"
+              />
               <Lock v-if="isLockedAttribute(row.name)" class="size-3 shrink-0 text-muted-foreground" />
               <Button v-else variant="ghost" size="icon-sm" class="shrink-0 text-muted-foreground" :title="t('ldap.removeAttribute')" @click="removeRow(rowIndex)">
                 <X class="size-3.5" />
@@ -219,11 +266,14 @@ async function save() {
         </div>
 
         <Button variant="outline" size="sm" class="h-7 px-2 text-xs" @click="addRow"> <Plus class="size-3 mr-1" />{{ t("ldap.addAttribute") }} </Button>
+        <datalist id="ldap-edit-optional-attrs">
+          <option v-for="attr in optionalAttributeNames" :key="attr" :value="attr" />
+        </datalist>
       </div>
 
       <DialogFooter>
         <Button variant="outline" :disabled="saving" @click="open = false">{{ t("ldap.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("ldap.save") }}</Button>
+        <Button :disabled="saving || invalidAttributeNames.length > 0" @click="save">{{ t("ldap.save") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
