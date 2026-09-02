@@ -5090,6 +5090,7 @@ export default withEnglishFallback({
     invalidRdn: "RDN 需形如 attribute=value",
     attributesRequired: "至少需要一个属性",
     rdnAttributeLocked: "命名属性 “{attribute}” 至少需保留一个值;如需修改请使用重命名",
+    objectClassLocked: "objectClass 创建后不允许修改;如需更换条目类型请删除后重建",
     writeSuccess: "LDAP 目录已更新",
     save: "保存",
     create: "创建",

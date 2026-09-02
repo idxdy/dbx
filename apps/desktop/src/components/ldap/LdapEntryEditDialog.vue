@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Plus, X } from "@lucide/vue";
+import { Lock, Plus, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -82,6 +82,15 @@ function addRow() {
 
 const currentNames = computed(() => new Set(rows.value.map((r) => r.name.trim()).filter(Boolean)));
 
+/**
+ * The structural objectClass cannot be changed after creation — the server
+ * rejects structural-class modifications, so the row is rendered read-only
+ * and never produces a modification.
+ */
+function isLockedAttribute(name: string): boolean {
+  return name.trim().toLowerCase() === "objectclass";
+}
+
 /** Diff the edited rows against the original attributes into Modify operations. */
 function buildModifications(): LdapModification[] {
   const modifications: LdapModification[] = [];
@@ -89,7 +98,7 @@ function buildModifications(): LdapModification[] {
 
   for (const row of rows.value) {
     const name = row.name.trim();
-    if (!name) continue;
+    if (!name || isLockedAttribute(name)) continue;
     const editor = ldapConfig.value ? getLdapEditor(name, ldapConfig.value) : undefined;
     const serializedValues = row.values.filter((v) => v.length > 0).map((v) => (editor ? editor.serialize(v) : v));
     const beforeList = row.originalSerialized;
@@ -103,6 +112,7 @@ function buildModifications(): LdapModification[] {
   }
 
   for (const name of Object.keys(original)) {
+    if (isLockedAttribute(name)) continue;
     if (!currentNames.value.has(name)) {
       modifications.push({ op: "delete", attribute: name, values: [] });
     }
@@ -192,18 +202,19 @@ async function save() {
         <div class="space-y-1.5 max-h-[45vh] overflow-auto pr-1">
           <div v-for="(row, rowIndex) in rows" :key="rowIndex" class="rounded border border-border/60 px-2 py-1.5 space-y-1">
             <div class="flex items-center gap-2">
-              <Input v-model="row.name" class="h-6 w-40 text-xs font-mono" :class="{ 'text-muted-foreground': entry.attributes[row.name.trim()] !== undefined }" />
-              <Button variant="ghost" size="icon-sm" class="shrink-0 text-muted-foreground" :title="t('ldap.removeAttribute')" @click="removeRow(rowIndex)">
+              <Input v-model="row.name" class="h-6 w-40 text-xs font-mono" :class="{ 'text-muted-foreground': entry.attributes[row.name.trim()] !== undefined }" :disabled="isLockedAttribute(row.name)" :title="isLockedAttribute(row.name) ? t('ldap.objectClassLocked') : undefined" />
+              <Lock v-if="isLockedAttribute(row.name)" class="size-3 shrink-0 text-muted-foreground" />
+              <Button v-else variant="ghost" size="icon-sm" class="shrink-0 text-muted-foreground" :title="t('ldap.removeAttribute')" @click="removeRow(rowIndex)">
                 <X class="size-3.5" />
               </Button>
             </div>
             <div v-for="(_, valueIndex) in row.values" :key="valueIndex" class="flex items-center gap-1.5">
-              <Input v-model="row.values[valueIndex]" class="h-6 flex-1 min-w-0 text-xs" />
-              <Button variant="ghost" size="icon-xs" class="shrink-0 text-muted-foreground" :title="t('ldap.removeValue')" @click="removeValue(rowIndex, valueIndex)">
+              <Input v-model="row.values[valueIndex]" class="h-6 flex-1 min-w-0 text-xs" :disabled="isLockedAttribute(row.name)" :title="isLockedAttribute(row.name) ? t('ldap.objectClassLocked') : undefined" />
+              <Button v-if="!isLockedAttribute(row.name)" variant="ghost" size="icon-xs" class="shrink-0 text-muted-foreground" :title="t('ldap.removeValue')" @click="removeValue(rowIndex, valueIndex)">
                 <X class="size-3" />
               </Button>
             </div>
-            <Button variant="ghost" size="sm" class="h-5 px-1.5 text-xs text-muted-foreground" @click="addValue(rowIndex)"> <Plus class="size-3 mr-1" />{{ t("ldap.addValue") }} </Button>
+            <Button v-if="!isLockedAttribute(row.name)" variant="ghost" size="sm" class="h-5 px-1.5 text-xs text-muted-foreground" @click="addValue(rowIndex)"> <Plus class="size-3 mr-1" />{{ t("ldap.addValue") }} </Button>
           </div>
         </div>
 

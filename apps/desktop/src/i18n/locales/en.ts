@@ -5105,6 +5105,7 @@ export default {
     invalidRdn: "The RDN must look like attribute=value",
     attributesRequired: "At least one attribute is required",
     rdnAttributeLocked: "The naming attribute '{attribute}' must keep at least one value; rename the entry to change it",
+    objectClassLocked: "objectClass cannot be modified after creation; delete and recreate the entry to change its type",
     writeSuccess: "LDAP directory updated",
     save: "Save",
     create: "Create",

@@ -4252,6 +4252,7 @@ export default withEnglishFallback({
     invalidRdn: "RDN 需形如 attribute=value",
     attributesRequired: "至少需要一個屬性",
     rdnAttributeLocked: "命名屬性「{attribute}」至少需保留一個值;如需修改請使用重新命名",
+    objectClassLocked: "objectClass 建立後不允許修改;如需更換條目類型請刪除後重建",
     writeSuccess: "LDAP 目錄已更新",
     save: "儲存",
     create: "建立",

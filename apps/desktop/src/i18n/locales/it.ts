@@ -4926,6 +4926,7 @@ export default withEnglishFallback({
     invalidRdn: "Il RDN deve avere il formato attributo=valore",
     attributesRequired: "È richiesto almeno un attributo",
     rdnAttributeLocked: "L'attributo di denominazione '{attribute}' deve conservare almeno un valore; rinomina la voce per modificarlo",
+    objectClassLocked: "objectClass non può essere modificato dopo la creazione; elimina e ricrea la voce per cambiarne il tipo",
     writeSuccess: "Directory LDAP aggiornata",
     save: "Salva",
     create: "Crea",
