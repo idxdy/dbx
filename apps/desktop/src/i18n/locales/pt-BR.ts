@@ -4931,6 +4931,7 @@ export default withEnglishFallback({
     attributesRequired: "É necessário pelo menos um atributo",
     rdnAttributeLocked: "O atributo de nomenclatura '{attribute}' deve manter pelo menos um valor; renomeie a entrada para alterá-lo",
     objectClassLocked: "objectClass não pode ser modificado após a criação; exclua e recrie a entrada para alterar seu tipo",
+    attributeNotAllowed: "Atributos não permitidos pelo objectClass selecionado: {attribute}",
     writeSuccess: "Diretório LDAP atualizado",
     save: "Salvar",
     create: "Criar",

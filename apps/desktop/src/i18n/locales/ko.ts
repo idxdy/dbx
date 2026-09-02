@@ -4484,6 +4484,7 @@ export default withEnglishFallback({
     attributesRequired: "최소 한 개의 속성이 필요합니다",
     rdnAttributeLocked: "이름 지정 속성 '{attribute}'는 최소한 하나의 값을 유지해야 합니다. 변경하려면 이름 바꾸기를 사용하세요",
     objectClassLocked: "objectClass는 생성 후 수정할 수 없습니다. 유형을 변경하려면 항목을 삭제 후 다시 만드세요",
+    attributeNotAllowed: "선택한 objectClass에서 허용되지 않는 속성: {attribute}",
     writeSuccess: "LDAP 디렉터리가 업데이트되었습니다",
     save: "저장",
     create: "만들기",

@@ -4958,6 +4958,7 @@ export default withEnglishFallback({
     attributesRequired: "少なくとも 1 つの属性が必要です",
     rdnAttributeLocked: "命名属性「{attribute}」は少なくとも 1 つの値を保持する必要があります。変更には名前の変更を使用してください",
     objectClassLocked: "objectClass は作成後に変更できません。種類を変更するにはエントリを削除して再作成してください",
+    attributeNotAllowed: "選択した objectClass では許可されていない属性: {attribute}",
     writeSuccess: "LDAP ディレクトリを更新しました",
     save: "保存",
     create: "作成",
