@@ -65,9 +65,14 @@ watch(open, async (value) => {
 function rebuildRequiredRows() {
   if (!ldapConfig.value || !selectedObjectClass.value) return;
   const rdnAttrLower = rdnAttr.value.trim().toLowerCase();
+  const rdnVal = rdnValue.value.trim();
+  if (!rdnAttrLower || !rdnVal) {
+    rows.value = [];
+    return;
+  }
   const required = getRequiredAttributes(ldapConfig.value, selectedObjectClass.value);
   // Keep user-added rows that are not required or not the RDN attr
-  const userRows = rows.value.filter((r) => !r.required || (rdnAttrLower && r.name.toLowerCase() === rdnAttrLower));
+  const userRows = rows.value.filter((r) => !r.required);
   const requiredRows: AttributeRow[] = required
     .filter((a) => a.toLowerCase() !== rdnAttrLower && a.toLowerCase() !== "objectclass")
     .map((a) => ({
@@ -164,9 +169,9 @@ async function save() {
         <div class="grid grid-cols-4 items-center gap-2">
           <Label class="text-right text-xs">{{ t("ldap.rdn") }}</Label>
           <div class="col-span-3 flex items-center gap-1.5">
-            <Input v-model="rdnAttr" class="h-7 w-28 text-xs font-mono" placeholder="cn" />
+            <Input v-model="rdnAttr" class="h-7 w-28 text-xs font-mono" :class="{ 'border-destructive': !rdnAttr.trim() }" placeholder="cn" />
             <span class="text-muted-foreground">=</span>
-            <Input v-model="rdnValue" class="h-7 flex-1 min-w-0 text-xs font-mono" placeholder="new-user" />
+            <Input v-model="rdnValue" class="h-7 flex-1 min-w-0 text-xs font-mono" :class="{ 'border-destructive': !rdnValue.trim() }" placeholder="new-user" />
           </div>
         </div>
         <div class="grid grid-cols-4 items-center gap-2">
@@ -199,7 +204,7 @@ async function save() {
 
       <DialogFooter>
         <Button variant="outline" :disabled="saving" @click="open = false">{{ t("ldap.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("ldap.create") }}</Button>
+        <Button :disabled="saving || hasMissingRequired" @click="save">{{ t("ldap.create") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
