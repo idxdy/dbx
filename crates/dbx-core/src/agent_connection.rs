@@ -1,4 +1,5 @@
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use serde_json::Value;
 
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::path_utils::expand_tilde;
@@ -142,6 +143,17 @@ pub fn agent_connect_params_with_role(
         params["keytab_path"] = serde_json::Value::String(config.ldap_keytab_path.clone());
         params["krb5_conf"] = serde_json::Value::String(config.ldap_krb5_conf.clone());
         params["base_dn"] = serde_json::Value::String(config.ldap_base_dn.clone());
+        // The Java agent accepts self-signed certificates when the
+        // tls_skip_verify external option is enabled (mirrors the native
+        // driver's LdapConnSettings::set_no_tls_verify).
+        if let Some(external) = config.external_config.as_ref().and_then(Value::as_object) {
+            let skip = ["tlsSkipVerify", "tls_skip_verify"]
+                .iter()
+                .any(|key| external.get(*key).and_then(Value::as_bool).unwrap_or(false));
+            if skip {
+                params["tls_skip_verify"] = serde_json::Value::Bool(true);
+            }
+        }
     }
     Ok(params)
 }

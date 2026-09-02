@@ -8,7 +8,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ldap3::{Ldap, LdapConnAsync, Mod, Scope, SearchEntry};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -335,7 +335,11 @@ pub async fn connect(
 
     let url = build_url(config, host, port);
 
-    let (conn, ldap) = tokio::time::timeout(timeout, LdapConnAsync::new(&url))
+    // Self-signed server certificates (common for in-house OpenLDAP/AD
+    // deployments) fail rustls verification with `UnknownIssuer`; the
+    // tls_skip_verify external option opts out of certificate validation.
+    let settings = LdapConnSettings::new().set_no_tls_verify(tls_skip_verify_from_config(config));
+    let (conn, ldap) = tokio::time::timeout(timeout, LdapConnAsync::with_settings(settings, &url))
         .await
         .map_err(|_| format!("LDAP connection timed out after {}s", timeout.as_secs()))?
         .map_err(|e| format!("LDAP connection failed: {e}"))?;
@@ -548,6 +552,19 @@ fn build_url(config: &ConnectionConfig, host: &str, port: u16) -> String {
         port
     };
     format!("{scheme}://{host}:{port}")
+}
+
+/// Read the `tls_skip_verify` opt-out from the connection's external config.
+/// Both camelCase (as written by the desktop UI) and snake_case aliases are
+/// accepted; the option is off unless explicitly enabled.
+fn tls_skip_verify_from_config(config: &ConnectionConfig) -> bool {
+    let Some(external) = config.external_config.as_ref() else {
+        return false;
+    };
+    let Some(object) = external.as_object() else {
+        return false;
+    };
+    ["tlsSkipVerify", "tls_skip_verify"].iter().any(|key| object.get(*key).and_then(Value::as_bool).unwrap_or(false))
 }
 
 /// Convert a `LdapSearchOutput` into the JSON payload the web / desktop API
@@ -831,6 +848,27 @@ mod tests {
         );
         // A bare RDN without a parent and without a new parent stays a bare RDN.
         assert_eq!(compose_renamed_dn("dc=com", "dc=org", None), "dc=org");
+    }
+
+    #[test]
+    fn tls_skip_verify_reads_external_config_aliases() {
+        let mut cfg = config_with_defaults();
+        assert!(!tls_skip_verify_from_config(&cfg));
+
+        cfg.external_config = Some(json!({ "tlsSkipVerify": true }));
+        assert!(tls_skip_verify_from_config(&cfg));
+
+        cfg.external_config = Some(json!({ "tls_skip_verify": true }));
+        assert!(tls_skip_verify_from_config(&cfg));
+
+        cfg.external_config = Some(json!({ "tlsSkipVerify": false }));
+        assert!(!tls_skip_verify_from_config(&cfg));
+
+        cfg.external_config = Some(json!({ "other": true }));
+        assert!(!tls_skip_verify_from_config(&cfg));
+
+        cfg.external_config = Some(json!("not-an-object"));
+        assert!(!tls_skip_verify_from_config(&cfg));
     }
 
     // -----------------------------------------------------------------------

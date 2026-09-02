@@ -923,6 +923,7 @@ const consulNamespace = ref("");
 const consulPartition = ref("");
 const consulConsistency = ref<ConsulConsistency>("default");
 const consulTlsSkipVerify = ref(false);
+const ldapTlsSkipVerify = ref(false);
 const consulAgentTargetNode = ref("");
 const consulAgentTargetAddress = ref("");
 const consulMeshVisible = ref(false);
@@ -2533,6 +2534,12 @@ watch(
       } else {
         resetConsulFields();
       }
+      if (config.db_type === "ldap") {
+        const ldapExternal = config.external_config as Record<string, unknown> | undefined;
+        ldapTlsSkipVerify.value = Boolean(ldapExternal?.tlsSkipVerify || ldapExternal?.tls_skip_verify);
+      } else {
+        ldapTlsSkipVerify.value = false;
+      }
       if (config.db_type === "mqtt") {
         hydrateMqttFields(config.external_config);
       } else {
@@ -3816,6 +3823,8 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.database = undefined;
   } else if (config.db_type === "sqlserver") {
     config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
+  } else if (config.db_type === "ldap") {
+    config.external_config = ldapTlsSkipVerify.value ? { tlsSkipVerify: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
     const style = gaussdbIdentifierQuoteStyle(config);
     const targetServerType = gaussdbTargetServerType(config);
@@ -6739,6 +6748,14 @@ function openExternalUrl(url: string) {
                       <input type="checkbox" v-model="form.ssl" />
                       <span>{{ t("connection.sslEnable") }}</span>
                     </label>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex items-center gap-2 text-sm" :class="{ 'opacity-60': !form.ssl }">
+                      <input type="checkbox" v-model="ldapTlsSkipVerify" :disabled="!form.ssl" class="mr-0" />
+                      <span>{{ t("connection.ldapTlsSkipVerify") }}</span>
+                    </label>
+                    <span class="col-start-2 col-span-3 -mt-2 text-xs text-muted-foreground">{{ t("connection.ldapTlsSkipVerifyHint") }}</span>
                   </div>
 
                   <!-- Auth method selector -->

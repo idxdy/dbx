@@ -670,6 +670,8 @@ export default withEnglishFallback({
     consulConsistencyConsistent: "強一致讀取",
     consulTlsSkipVerify: "略過憑證驗證",
     consulTlsSkipVerifyHint: "僅用於可信任的自簽章 Consul 端點。",
+    ldapTlsSkipVerify: "跳過憑證驗證",
+    ldapTlsSkipVerifyHint: "LDAPS 連線時接受自簽章憑證(如使用內部 CA 的 OpenLDAP/AD)。僅建議在可信任網路中使用。",
     zookeeperConnectString: "連線字串",
     zookeeperConnectStringHint: "以逗號或換行分隔的 host:port 項目。留空則使用上方的主機和連接埠。",
     zookeeperCreateModePersistent: "持久",

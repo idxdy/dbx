@@ -619,6 +619,8 @@ export default withEnglishFallback({
     consulConsistencyConsistent: "强一致读取",
     consulTlsSkipVerify: "跳过证书校验",
     consulTlsSkipVerifyHint: "仅用于可信的自签名 Consul 服务端。",
+    ldapTlsSkipVerify: "跳过证书校验",
+    ldapTlsSkipVerifyHint: "LDAPS 连接时接受自签名证书(如使用内部 CA 的 OpenLDAP/AD)。仅建议在可信网络中使用。",
     zookeeperConnectString: "Connect String",
     zookeeperConnectStringHint: "可用逗号或换行分隔 host:port，并可在末尾填写整个集群共用的 /chroot；留空时使用上面的 host 和端口。",
     zookeeperClusterInputHint: "ZooKeeper 集群可在上方 URL 中填写全部节点（例如 zookeeper://zk-1:2181,zk-2:2181/app），也可在下方 Connect String 中填写。",

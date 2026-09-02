@@ -694,6 +694,8 @@ export default {
     consulConsistencyConsistent: "Consistent",
     consulTlsSkipVerify: "Skip certificate verification",
     consulTlsSkipVerifyHint: "Use only for trusted self-signed Consul endpoints.",
+    ldapTlsSkipVerify: "Skip certificate verification",
+    ldapTlsSkipVerifyHint: "Accept self-signed certificates when connecting over LDAPS (e.g. OpenLDAP/AD with an internal CA). Use only for trusted networks.",
     zookeeperConnectString: "Connect String",
     zookeeperConnectStringHint: "Comma or line separated host:port entries, with an optional shared /chroot. Leave blank to use the host and port above.",
     zookeeperClusterInputHint: "For a ZooKeeper ensemble, enter all nodes either in the URL (for example zookeeper://zk-1:2181,zk-2:2181/app) or in Connect String below.",

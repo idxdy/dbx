@@ -950,6 +950,8 @@ export default withEnglishFallback({
     consulConsistencyConsistent: "Consistent",
     consulTlsSkipVerify: "Skip certificate verification",
     consulTlsSkipVerifyHint: "Use only for trusted self-signed Consul endpoints.",
+    ldapTlsSkipVerify: "Skip certificate verification",
+    ldapTlsSkipVerifyHint: "Accept self-signed certificates when connecting over LDAPS (e.g. OpenLDAP/AD with an internal CA). Use only for trusted networks.",
     zookeeperConnectString: "接続文字列",
     zookeeperConnectStringHint: "カンマまたは改行区切りの host:port エントリ。空欄の場合は上のホストとポートを使用します。",
     zookeeperCreateModePersistent: "永続",
