@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2, Lock, Plus, ShieldCheck, X } from "@lucide/vue";
+import { Loader2, Lock, Pencil, Plus, ShieldCheck, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +10,7 @@ import * as api from "@/lib/backend/api";
 import { dateTimeLocalToGeneralizedTime, generalizedTimeToDateTimeLocal, getLdapEditor, isPasswordAttribute } from "@/lib/ldap/ldapEditors";
 import { getLdapAttributeType, getOptionalAttributes, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
 import type { LdapSchemaConfig } from "@/lib/backend/http";
+import LdapObjectClassEditorDialog from "@/components/ldap/LdapObjectClassEditorDialog.vue";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -23,7 +24,11 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   updated: [dn: string];
+  /** Structural change (e.g. objectClass set) — parent should refetch the entry. */
+  entryChanged: [dn: string];
 }>();
+
+const objectClassEditorOpen = ref(false);
 
 interface ValueCell {
   /** Local editing value (deserialized display form). */
@@ -69,6 +74,12 @@ function attributeKind(name: string): string {
   return props.schema ? (getLdapAttributeType(props.schema, name)?.syntax ?? "string") : "string";
 }
 
+/** Operational/system-maintained attributes render read-only. */
+function isSystemAttribute(name: string): boolean {
+  const attr = props.schema ? getLdapAttributeType(props.schema, name) : undefined;
+  return Boolean(attr && (attr.noUserModification || attr.operational));
+}
+
 function serializeValue(name: string, text: string): string {
   if (!text) return "";
   if (attributeKind(name) === "generalizedTime") return dateTimeLocalToGeneralizedTime(text);
@@ -110,7 +121,7 @@ function buildRows() {
   const mustNames = new Set(getRequiredAttributes(props.schema ?? { objectClasses: [], attributesEditor: {} }, entryObjectClasses()).map((name) => name.toLowerCase()));
   const built: AttributeRow[] = [];
   for (const [name, raw] of Object.entries(entry.attributes)) {
-    const locked = name.toLowerCase() === "objectclass";
+    const locked = name.toLowerCase() === "objectclass" || isSystemAttribute(name);
     const attr = props.schema ? getLdapAttributeType(props.schema, name) : undefined;
     const kind: AttributeRow["kind"] = mustNames.has(name.toLowerCase()) ? "must" : "may";
     const values = Array.isArray(raw) ? raw.map(String) : [String(raw)];
@@ -289,6 +300,13 @@ async function verifyRowPassword(row: AttributeRow) {
     row.verifyText = "";
   }
 }
+
+function onObjectClassesSaved(newValues: string[]) {
+  currentAttributes.value["objectClass"] = [...newValues];
+  // Refetching rebuilds the rows, surfacing MUST attributes required by a
+  // newly added auxiliary class.
+  emit("entryChanged", props.entry?.dn ?? "");
+}
 </script>
 
 <template>
@@ -298,7 +316,12 @@ async function verifyRowPassword(row: AttributeRow) {
         <span class="w-44 shrink-0 text-xs font-mono" :class="{ 'text-muted-foreground': row.kind !== 'must' }" :title="row.description || row.name"> <span v-if="row.kind === 'must'" class="text-destructive mr-0.5">*</span>{{ row.name }} </span>
         <Badge v-if="row.kind === 'must'" variant="secondary" class="text-[10px] px-1 py-0">MUST</Badge>
         <Loader2 v-if="row.pending" class="size-3 animate-spin text-muted-foreground" />
-        <Lock v-else-if="row.locked" class="size-3 text-muted-foreground" :title="t('ldap.objectClassLocked')" />
+        <template v-else-if="row.locked">
+          <Button v-if="row.name.toLowerCase() === 'objectclass' && !props.readOnly" variant="ghost" size="icon-sm" class="text-muted-foreground" :title="t('ldap.objectClassEditorTitle')" @click="objectClassEditorOpen = true">
+            <Pencil class="size-3.5" />
+          </Button>
+          <Lock v-else class="size-3 text-muted-foreground" :title="t('ldap.objectClassLocked')" />
+        </template>
         <span class="flex-1" />
         <Button v-if="rowEditable(row) && !row.missing" variant="ghost" size="icon-sm" class="text-muted-foreground" :title="t('ldap.removeAttribute')" @click="removeRow(row)">
           <X class="size-3.5" />
@@ -353,5 +376,7 @@ async function verifyRowPassword(row: AttributeRow) {
         </Button>
       </template>
     </div>
+
+    <LdapObjectClassEditorDialog v-model:open="objectClassEditorOpen" :connection-id="connectionId" :dn="entry?.dn ?? ''" :object-classes="entryObjectClasses()" :schema="schema" :read-only="readOnly" @saved="onObjectClassesSaved" />
   </div>
 </template>

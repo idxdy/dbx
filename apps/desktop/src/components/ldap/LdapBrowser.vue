@@ -13,6 +13,9 @@
         <Loader2 v-if="entryDetailLoading" class="size-3.5 animate-spin" />
         <RefreshCw v-else class="size-3.5" />
       </Button>
+      <Button size="sm" :variant="showOperational ? 'default' : 'secondary'" class="h-7 px-2" :title="t('ldap.showOperational')" @click="toggleOperational">
+        <Eye class="size-3.5" />
+      </Button>
       <span class="text-xs text-muted-foreground shrink-0">Copy as:</span>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyLdapsearchTooltip')" @click="copyAsLdapSearch"> <Copy class="size-3 mr-1" />ldapsearch </Button>
       <Button v-if="baseDn" variant="outline" size="sm" class="h-6 px-2 text-xs font-mono" :title="t('ldap.copyGetAdObjectTooltip')" @click="copyAsPowershellGetAdObject"> <Copy class="size-3 mr-1" />Get-ADObject </Button>
@@ -35,7 +38,7 @@
         </div>
         <div>
           <h3 class="text-sm font-semibold mb-2">Attributes</h3>
-          <LdapEntryEditorTable :connection-id="connectionId" :entry="entryDetail" :read-only="readOnly" :schema="ldapConfig" />
+          <LdapEntryEditorTable :connection-id="connectionId" :entry="entryDetail" :read-only="readOnly || !entryDetail.dn" :schema="ldapConfig" @entry-changed="reloadEntryDetail" />
         </div>
       </div>
     </div>
@@ -49,7 +52,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Loader2, FileSearch, Copy, Plus, Trash2, Replace, RefreshCw } from "@lucide/vue";
+import { Loader2, FileSearch, Copy, Plus, Trash2, Replace, RefreshCw, Eye } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useI18n } from "vue-i18n";
@@ -121,7 +124,11 @@ async function reloadEntryDetail() {
   // hidden for it).
   entryDetailLoading.value = true;
   try {
-    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn || "", "(objectClass=*)", "base"), getOrFetchLdapConfig(props.connectionId)]);
+    // Operational attributes must be requested explicitly; `+` covers
+    // servers implementing RFC 4512, the explicit names cover JNDI-based
+    // agents that do not understand the extension.
+    const attributes = showOperational.value ? ["*", "+", "createTimestamp", "modifyTimestamp", "creatorsName", "modifiersName", "entryUUID", "entryDN"] : undefined;
+    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn || "", "(objectClass=*)", "base", attributes), getOrFetchLdapConfig(props.connectionId)]);
     entryDetail.value = result.entries.length > 0 ? result.entries[0] : null;
     ldapConfig.value = config;
   } catch (_e: unknown) {
@@ -129,6 +136,15 @@ async function reloadEntryDetail() {
   } finally {
     entryDetailLoading.value = false;
   }
+}
+
+const OPERATIONAL_TOGGLE_KEY = "ldap.showOperational";
+const showOperational = ref(localStorage.getItem(OPERATIONAL_TOGGLE_KEY) === "1");
+
+function toggleOperational() {
+  showOperational.value = !showOperational.value;
+  localStorage.setItem(OPERATIONAL_TOGGLE_KEY, showOperational.value ? "1" : "0");
+  reloadEntryDetail();
 }
 
 function followTabDn(newDn: string) {
