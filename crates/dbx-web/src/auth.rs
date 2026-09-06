@@ -233,7 +233,7 @@ pub async fn ldap_login(
 pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Json<AuthCheckResponse> {
     let ldap_enabled = ldap_login_enabled(&state).await;
     let password_disabled = state.password_disabled;
-    if state.password_disabled && !ldap_enabled {
+    if state.password_disabled && !ldap_enabled && !state.ldap_login_broken {
         return Json(AuthCheckResponse {
             authenticated: true,
             required: false,
@@ -342,10 +342,11 @@ pub async fn auth_middleware(
     }
 
     // Auth is only fully open when the password is disabled AND no LDAP login
-    // is configured. When LDAP is enabled it becomes the required auth method,
-    // so the middleware must not let unauthenticated requests through.
+    // is configured (or the stored config is healthy). When LDAP is enabled
+    // it becomes the required auth method, and a *broken* enabled config
+    // must fail closed instead of silently opening anonymous access.
     let ldap_enabled = ldap_login_enabled(&state).await;
-    if state.password_disabled && !ldap_enabled {
+    if state.password_disabled && !ldap_enabled && !state.ldap_login_broken {
         return next.run(req).await;
     }
 
@@ -375,7 +376,16 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{api_path_suffix, middleware_api_path_suffix};
+    use super::{api_path_suffix, auth_middleware, middleware_api_path_suffix};
+    use crate::state::WebState;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware::Next;
+    use axum::response::{IntoResponse, Response};
+    use dbx_core::connection::AppState;
+    use dbx_core::storage::Storage;
+    use std::sync::Arc;
 
     #[test]
     fn api_path_suffix_handles_root_api_paths() {
@@ -398,5 +408,39 @@ mod tests {
         assert_eq!(middleware_api_path_suffix("/api/connection/list", "/"), Some("connection/list"));
         assert_eq!(middleware_api_path_suffix("/dbx/api/connection/list", "/dbx"), Some("connection/list"));
         assert_eq!(middleware_api_path_suffix("/dbx/login", "/dbx"), None);
+    }
+
+    async fn test_web_state(ldap_login_broken: bool) -> (Arc<WebState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dbx-auth-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let app = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
+        let state =
+            Arc::new(WebState { password_disabled: true, ldap_login_broken, ..WebState::for_tests(app, dir.clone()) });
+        (state, dir)
+    }
+
+    async fn middleware_response(state: Arc<WebState>) -> Response {
+        let app = axum::Router::new()
+            .route("/api/connections", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let request = Request::builder().uri("/api/connections").body(Body::empty()).unwrap();
+        use tower::ServiceExt as _;
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn middleware_fails_closed_when_ldap_login_is_broken() {
+        // DBX_DISABLE_PASSWORD=1 with a healthy/absent LDAP config opens anonymous access...
+        let (healthy_state, healthy_dir) = test_web_state(false).await;
+        let response = middleware_response(healthy_state.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(healthy_dir);
+
+        // ...but a broken enabled LDAP config must fail closed instead.
+        let (broken_state, broken_dir) = test_web_state(true).await;
+        let response = middleware_response(broken_state.clone()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(broken_dir);
     }
 }

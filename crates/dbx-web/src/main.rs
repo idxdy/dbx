@@ -149,22 +149,24 @@ fn mount_public_base_path(mut app: Router, public_base_path: &str, static_dir: O
 
 /// Load the app-level LDAP login configuration from the app settings and
 /// turn it into the single `LdapLoginBackend` used by the auth handler.
-/// Configuration errors are logged and result in LDAP login being disabled
-/// (a broken config must not take the whole web server down).
-async fn load_ldap_login_backend(app: &AppState) -> Option<state::LdapLoginBackend> {
+/// Returns `(backend, broken)`: `broken` is true when the stored config is
+/// enabled but invalid — the auth layer then fails closed instead of opening
+/// anonymous access (a broken config must not take the whole web server
+/// down, but it must not fail open either).
+async fn load_ldap_login_backend(app: &AppState) -> (Option<state::LdapLoginBackend>, bool) {
     let settings = match app.storage.load_ldap_login_settings().await {
         Ok(Some(settings)) if settings.enabled => settings,
         Ok(Some(_)) => {
             tracing::info!("LDAP login disabled (not enabled in app settings)");
-            return None;
+            return (None, false);
         }
         Ok(None) => {
             tracing::info!("LDAP login disabled (no LDAP login configuration found)");
-            return None;
+            return (None, false);
         }
         Err(err) => {
             tracing::error!("Failed to load LDAP login configuration: {err}");
-            return None;
+            return (None, false);
         }
     };
     match settings.build_login() {
@@ -172,11 +174,11 @@ async fn load_ldap_login_backend(app: &AppState) -> Option<state::LdapLoginBacke
             let name =
                 if settings.name.trim().is_empty() { "LDAP".to_string() } else { settings.name.trim().to_string() };
             tracing::info!("LDAP login enabled via `{name}` ({mode:?})");
-            Some(state::LdapLoginBackend { name, mode, config: Arc::new(login) })
+            (Some(state::LdapLoginBackend { name, mode, config: Arc::new(login) }), false)
         }
         Err(err) => {
-            tracing::warn!("LDAP login disabled ({err})");
-            None
+            tracing::error!("LDAP login configuration is enabled but broken ({err}); refusing fail-open access");
+            (None, true)
         }
     }
 }
@@ -334,7 +336,7 @@ async fn main() {
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
     // LDAP login: load the app-level configuration from the app settings.
-    let ldap_login_backend = load_ldap_login_backend(&app_state).await;
+    let (ldap_login_backend, ldap_login_broken) = load_ldap_login_backend(&app_state).await;
 
     let web_state = Arc::new(WebState {
         app: app_state,
@@ -352,6 +354,7 @@ async fn main() {
         export_files: RwLock::new(HashMap::new()),
         ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
         ldap_login: RwLock::new(ldap_login_backend),
+        ldap_login_broken,
     });
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());

@@ -58,6 +58,11 @@ pub struct WebState {
     /// at startup and reloaded whenever the settings page saves a new config.
     /// `None` when LDAP login is disabled or the config is invalid.
     pub ldap_login: RwLock<Option<LdapLoginBackend>>,
+    /// True when the stored LDAP login config is enabled but could not be
+    /// built at startup (e.g. missing host). Fail-closed: with
+    /// `DBX_DISABLE_PASSWORD=1` a broken LDAP config must block anonymous
+    /// access instead of silently opening it.
+    pub ldap_login_broken: bool,
 }
 
 impl WebState {
@@ -84,6 +89,7 @@ impl WebState {
             export_files: RwLock::new(HashMap::new()),
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
             ldap_login: RwLock::new(None),
+            ldap_login_broken: false,
         }
     }
 }

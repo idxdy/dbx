@@ -167,8 +167,11 @@ async fn merge_stored_service_account_password(state: &WebState, body: &mut Ldap
 }
 
 /// Persist the LDAP login configuration from the settings page and reload
-/// the runtime backend. When the client leaves the service-account password
-/// blank and one is already stored, the existing password is preserved.
+/// the runtime backend. Validation happens BEFORE anything is written: an
+/// enabled-but-invalid config is rejected with 400 and must never reach the
+/// database, otherwise a restart would load a broken fail-open login config.
+/// When the client leaves the service-account password blank and one is
+/// already stored, the existing password is preserved.
 pub async fn save_ldap_login_config(
     State(state): State<Arc<WebState>>,
     Json(mut body): Json<LdapLoginSettings>,
@@ -177,14 +180,8 @@ pub async fn save_ldap_login_config(
     // Keep the name trimmed so the login page never renders a blank label.
     body.name = body.name.trim().to_string();
 
-    state.app.storage.save_ldap_login_settings(&body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Rebuild the runtime backend so the new config takes effect immediately.
-    // When LDAP login is enabled but the config is invalid, reject the save
-    // so the settings page can show the problem instead of silently
-    // disabling login.
-    if body.enabled {
-        let backend = match body.build_login() {
+    let backend = if body.enabled {
+        match body.build_login() {
             Ok((mode, login)) => {
                 let name = if body.name.is_empty() { "LDAP".to_string() } else { body.name.clone() };
                 Some(LdapLoginBackend { name, mode, config: Arc::new(login) })
@@ -194,11 +191,13 @@ pub async fn save_ldap_login_config(
                     (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": err}))).into_response()
                 );
             }
-        };
-        *state.ldap_login.write().await = backend;
+        }
     } else {
-        *state.ldap_login.write().await = None;
-    }
+        None
+    };
+
+    state.app.storage.save_ldap_login_settings(&body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    *state.ldap_login.write().await = backend;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }
@@ -219,7 +218,33 @@ pub async fn test_ldap_login_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_config_payload, EncryptedConfigPayload};
+    use super::{decrypt_config_payload, save_ldap_login_config, EncryptedConfigPayload};
+    use crate::state::WebState;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::Json;
+    use dbx_core::ldap_login::LdapLoginSettings;
+    use dbx_core::storage::Storage;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn save_ldap_login_config_rejects_invalid_enabled_config_without_persisting() {
+        let dir = std::env::temp_dir().join(format!("dbx-app-settings-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let app = Arc::new(dbx_core::connection::AppState::new_with_plugin_dir(storage, dir.join("plugins")));
+        let state = Arc::new(WebState::for_tests(app, dir.clone()));
+
+        // Enabled but invalid (no host): must be rejected with 400 and never
+        // reach the database or the runtime backend.
+        let body = LdapLoginSettings { enabled: true, ..Default::default() };
+        let response = save_ldap_login_config(State(state.clone()), Json(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.app.storage.load_ldap_login_settings().await.unwrap().is_none());
+        assert!(state.ldap_login.read().await.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn exported_browser_payload() -> EncryptedConfigPayload {
         EncryptedConfigPayload {

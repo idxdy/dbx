@@ -1572,6 +1572,7 @@ mod tests {
             export_files: RwLock::new(HashMap::new()),
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
             ldap_login: RwLock::new(None),
+            ldap_login_broken: false,
         });
         (state, dir)
     }
