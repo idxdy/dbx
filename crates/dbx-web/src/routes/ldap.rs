@@ -1,4 +1,7 @@
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use dbx_core::db::ldap_driver::LdapAttributeModification;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -169,9 +172,23 @@ pub async fn rename(
     Ok(Json(result))
 }
 
-/// Serve the static LDAP schema configuration (objectClasses, editors, etc.).
-pub async fn get_config() -> Json<serde_json::Value> {
-    let config: serde_json::Value =
-        serde_json::from_str(include_str!("../../../dbx-core/assets/ldap.json")).expect("invalid ldap.json in assets");
-    Json(config)
+/// Serve the LDAP schema configuration. Without a connection (or when the
+/// server's schema cannot be read) the bundled static asset is served;
+/// with a connection the schema comes from the server's own subschema entry.
+pub async fn get_config(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<LdapConfigQuery>,
+) -> Json<serde_json::Value> {
+    let schema = match query.connection_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(connection_id) => dbx_core::ldap_schema::ldap_schema_core(&state.app, connection_id)
+            .await
+            .unwrap_or_else(|_| dbx_core::ldap_schema::static_schema()),
+        None => dbx_core::ldap_schema::static_schema(),
+    };
+    Json(schema)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LdapConfigQuery {
+    pub connection_id: Option<String>,
 }

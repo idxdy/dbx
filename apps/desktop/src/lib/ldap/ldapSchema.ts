@@ -1,17 +1,49 @@
-import { getLdapConfig } from "@/lib/backend/api";
-import type { LdapObjectClass, LdapSchemaConfig } from "@/lib/backend/http";
+import { getLdapConfig, getLdapConfigForConnection } from "@/lib/backend/api";
+import type { LdapAttributeType, LdapObjectClass, LdapSchemaConfig } from "@/lib/backend/http";
 
-let cachedConfig: LdapSchemaConfig | null = null;
+// Cache is keyed per connection (the schema comes from each server's own
+// subschema entry); the empty key serves the bundled static schema.
+const cache = new Map<string, LdapSchemaConfig>();
 
-export async function getOrFetchLdapConfig(): Promise<LdapSchemaConfig> {
-  if (!cachedConfig) {
-    cachedConfig = await getLdapConfig();
+export async function getOrFetchLdapConfig(connectionId?: string): Promise<LdapSchemaConfig> {
+  const key = connectionId ?? "";
+  const cached = cache.get(key);
+  if (cached) return cached;
+  let config: LdapSchemaConfig;
+  if (connectionId) {
+    try {
+      config = await getLdapConfigForConnection(connectionId);
+    } catch {
+      // Server schema unavailable (offline, unsupported server) — static fallback.
+      config = await getLdapConfig();
+    }
+  } else {
+    config = await getLdapConfig();
   }
-  return cachedConfig;
+  cache.set(key, config);
+  return config;
+}
+
+export function getLdapAttributeType(config: LdapSchemaConfig, attributeName: string): LdapAttributeType | undefined {
+  const key = attributeName.toLowerCase();
+  return config.attributeTypes?.find((attr) => attr.name.toLowerCase() === key || attr.aliases.some((alias) => alias.toLowerCase() === key));
+}
+
+/** Resolve an attribute name to its schema name (alias-aware), lowercased for comparisons. */
+export function resolveAttributeName(config: LdapSchemaConfig, attributeName: string): string | undefined {
+  const attr = getLdapAttributeType(config, attributeName);
+  if (attr) return attr.name.toLowerCase();
+  const lower = attributeName.toLowerCase();
+  return config.attributeTypes?.some((attr) => attr.name.toLowerCase() === lower) ? lower : undefined;
 }
 
 export function getStructuralObjectClasses(config: LdapSchemaConfig): LdapObjectClass[] {
   return config.objectClasses.filter((oc) => oc.type === "STRUCTURAL");
+}
+
+/** AUXILIARY classes are the only ones an existing entry may gain or drop. */
+export function getAuxiliaryObjectClasses(config: LdapSchemaConfig): LdapObjectClass[] {
+  return config.objectClasses.filter((oc) => oc.type === "AUXILIARY");
 }
 
 export function getObjectClassByName(config: LdapSchemaConfig, name: string): LdapObjectClass | undefined {

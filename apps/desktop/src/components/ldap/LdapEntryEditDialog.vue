@@ -47,7 +47,7 @@ watch(open, async (value) => {
   if (value) {
     saving.value = false;
     try {
-      ldapConfig.value = await getOrFetchLdapConfig();
+      ldapConfig.value = await getOrFetchLdapConfig(props.connectionId);
     } catch {
       ldapConfig.value = null;
     }

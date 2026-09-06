@@ -50,7 +50,7 @@ watch(open, async (value) => {
     rows.value = [];
     saving.value = false;
     try {
-      ldapConfig.value = await getOrFetchLdapConfig();
+      ldapConfig.value = await getOrFetchLdapConfig(props.connectionId);
       structuralClasses.value = getStructuralObjectClasses(ldapConfig.value);
       if (structuralClasses.value.length > 0) {
         selectedObjectClass.value = structuralClasses.value[0].name;

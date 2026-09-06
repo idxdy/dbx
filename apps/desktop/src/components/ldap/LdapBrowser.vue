@@ -197,7 +197,7 @@ async function reloadEntryDetail() {
   // hidden for it).
   entryDetailLoading.value = true;
   try {
-    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn || "", "(objectClass=*)", "base"), getOrFetchLdapConfig()]);
+    const [result, config] = await Promise.all([api.ldapSearch(props.connectionId, props.baseDn || "", "(objectClass=*)", "base"), getOrFetchLdapConfig(props.connectionId)]);
     entryDetail.value = result.entries.length > 0 ? result.entries[0] : null;
     ldapConfig.value = config;
   } catch (_e: unknown) {

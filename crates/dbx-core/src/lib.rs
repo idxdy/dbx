@@ -52,6 +52,7 @@ pub mod history;
 pub mod jdbc;
 pub mod ldap_login;
 pub mod ldap_ops;
+pub mod ldap_schema;
 pub mod models;
 pub mod mongo_oidc;
 pub mod mongo_ops;

@@ -2658,13 +2658,31 @@ export interface LdapObjectClass {
   note?: string;
 }
 
+export interface LdapAttributeType {
+  name: string;
+  aliases: string[];
+  description: string;
+  syntaxOid: string;
+  syntax: "string" | "integer" | "boolean" | "generalizedTime" | "dn" | "binary" | "jpeg";
+  singleValue: boolean;
+  noUserModification: boolean;
+  operational: boolean;
+  equality: string;
+}
+
 export interface LdapSchemaConfig {
   objectClasses: LdapObjectClass[];
+  attributeTypes?: LdapAttributeType[];
   attributesEditor: Record<string, string>;
+  source?: "server" | "static";
 }
 
 export async function getLdapConfig(): Promise<LdapSchemaConfig> {
   return get("/api/ldap/config");
+}
+
+export async function getLdapConfigForConnection(connectionId: string): Promise<LdapSchemaConfig> {
+  return get(`/api/ldap/config?connection_id=${encodeURIComponent(connectionId)}`);
 }
 
 export interface LdapLoginSettings {

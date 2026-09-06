@@ -459,6 +459,7 @@ export const ldapModify = forward("ldapModify");
 export const ldapDelete = forward("ldapDelete");
 export const ldapRename = forward("ldapRename");
 export const getLdapConfig = forward("getLdapConfig");
+export const getLdapConfigForConnection = forward("getLdapConfigForConnection");
 export const ldapAuthLogin = forward("ldapAuthLogin");
 export const loadLdapLoginConfig = forward("loadLdapLoginConfig");
 export const saveLdapLoginConfig = forward("saveLdapLoginConfig");

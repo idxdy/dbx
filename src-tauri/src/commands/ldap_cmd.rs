@@ -89,7 +89,17 @@ pub async fn ldap_rename(
 
 #[tauri::command]
 pub async fn ldap_get_config() -> Result<Value, String> {
-    let config: Value = serde_json::from_str(include_str!("../../../../crates/dbx-core/assets/ldap.json"))
-        .map_err(|e| e.to_string())?;
+    let config: Value =
+        serde_json::from_str(include_str!("../../../crates/dbx-core/assets/ldap.json")).map_err(|e| e.to_string())?;
     Ok(config)
+}
+
+/// Schema from the connection's own server (subschemaSubentry), falling back
+/// to the bundled static asset when the server does not cooperate.
+#[tauri::command]
+pub async fn ldap_get_config_for_connection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<Value, String> {
+    dbx_core::ldap_schema::ldap_schema_core(&state, &connection_id).await
 }

@@ -2522,11 +2522,29 @@ export interface LdapObjectClass {
 
 export interface LdapSchemaConfig {
   objectClasses: LdapObjectClass[];
+  attributeTypes?: LdapAttributeType[];
   attributesEditor: Record<string, string>;
+  source?: "server" | "static";
+}
+
+export interface LdapAttributeType {
+  name: string;
+  aliases: string[];
+  description: string;
+  syntaxOid: string;
+  syntax: "string" | "integer" | "boolean" | "generalizedTime" | "dn" | "binary" | "jpeg";
+  singleValue: boolean;
+  noUserModification: boolean;
+  operational: boolean;
+  equality: string;
 }
 
 export async function getLdapConfig(): Promise<LdapSchemaConfig> {
   return invokeBackend("ldap_get_config", {});
+}
+
+export async function getLdapConfigForConnection(connectionId: string): Promise<LdapSchemaConfig> {
+  return invokeBackend("ldap_get_config_for_connection", { connectionId });
 }
 
 // LDAP login is web-only (the desktop app does not gate itself behind a
