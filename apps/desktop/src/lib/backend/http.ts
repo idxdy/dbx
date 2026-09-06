@@ -2709,6 +2709,7 @@ export interface LdapLoginSettings {
   serviceAccountDn: string;
   serviceAccountPassword: string;
   searchFilter: string;
+  allowedGroups: string;
   connectTimeoutSecs: number;
 }
 

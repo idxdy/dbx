@@ -376,6 +376,8 @@ pub struct LdapLogin {
     pub search_filter: Option<String>,
     /// Subtree the SV search starts at. Defaults to `base_dn` when missing.
     pub search_base: Option<String>,
+    /// Parsed authorization gate. Empty → no group restriction.
+    pub allowed_groups: Vec<String>,
     pub connect_timeout: Duration,
 }
 
@@ -540,6 +542,10 @@ pub struct LdapLoginSettings {
     /// `base_dn` when empty.
     #[serde(default)]
     pub search_base: String,
+    /// Comma-separated group DNs or bare group names. When non-empty, only
+    /// members of at least one listed group may log in (default-deny).
+    #[serde(default)]
+    pub allowed_groups: String,
     /// Search filter used to resolve the user DN in `SV` mode — and in `NOSV`
     /// mode when the directory refuses every non-DN bind identity. The
     /// substring `{user}` is replaced with the RFC 4515-escaped user-supplied
@@ -599,6 +605,7 @@ impl LdapLoginSettings {
             service_account_password: empty_string_is_none(self.service_account_password.clone()),
             search_filter: empty_string_is_none(self.search_filter.clone()),
             search_base: empty_string_is_none(self.search_base.clone()),
+            allowed_groups: parse_allowed_groups(&self.allowed_groups),
             connect_timeout: Duration::from_secs(self.connect_timeout_secs.max(1)),
         };
         login.validate(mode)?;
@@ -619,6 +626,7 @@ impl Default for LdapLoginSettings {
             service_account_dn: String::new(),
             service_account_password: String::new(),
             search_base: String::new(),
+            allowed_groups: String::new(),
             search_filter: String::new(),
             connect_timeout_secs: default_ldap_connect_timeout_secs(),
         }
@@ -693,13 +701,100 @@ pub async fn authenticate(
     }
     match mode {
         LdapSupportMode::Sv => {
-            let bind_dn = resolve_via_service_account(login, username).await?;
+            // Resolve the DN + group membership via the service account, then
+            // verify the user's password first — a wrong password must be
+            // reported as such and must not leak group information.
+            let (bind_dn, member_of) = resolve_via_service_account(login, username).await?;
             bind_first_candidate(login, std::slice::from_ref(&bind_dn), password)
                 .await
-                .map_err(|failure| failure.message)
+                .map_err(|failure| failure.message)?;
+            if !group_membership_allowed(&login.allowed_groups, &member_of) {
+                return Err(authorization_rejected_message(username));
+            }
+            Ok(bind_dn)
         }
-        LdapSupportMode::NoSv => bind_raw(login, username, password).await,
+        LdapSupportMode::NoSv => {
+            let bind_dn = bind_raw(login, username, password).await?;
+            if !login.allowed_groups.iter().any(|group| !group.trim().is_empty()) {
+                return Ok(bind_dn);
+            }
+            // Re-read the user's own membership on a connection bound as the
+            // user (NOSV has no service account to search with).
+            let (_, member_of) = search_as_bound_user(login, username, password).await?;
+            if !group_membership_allowed(&login.allowed_groups, &member_of) {
+                return Err(authorization_rejected_message(username));
+            }
+            Ok(bind_dn)
+        }
     }
+}
+
+fn authorization_rejected_message(username: &str) -> String {
+    format!("LDAP authorization failed: '{username}' is not a member of any allowed group")
+}
+
+/// Parse the comma-separated allowed-groups setting into the runtime list.
+/// Entries are group DNs or bare group names; `\,` escapes a literal comma.
+pub fn parse_allowed_groups(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            ',' => {
+                let entry = current.trim().to_string();
+                if !entry.is_empty() {
+                    out.push(entry);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let entry = current.trim().to_string();
+    if !entry.is_empty() {
+        out.push(entry);
+    }
+    out
+}
+
+/// First RDN value of a DN: `CN=admins,OU=Groups,DC=x` → `admins`.
+pub fn first_rdn_value(dn: &str) -> Option<String> {
+    let first = dn.split(',').next()?.trim();
+    let (_, value) = first.split_once('=')?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Default-deny group gate. An empty (or blank-only) `allowed` list permits
+/// everyone; otherwise at least one `member_of` DN must either equal an
+/// allowed entry in full (case-insensitive) or carry a first-RDN value that
+/// equals an allowed bare group name.
+pub fn group_membership_allowed(allowed: &[String], member_of: &[String]) -> bool {
+    if allowed.iter().all(|entry| entry.trim().is_empty()) {
+        return true;
+    }
+    for dn in member_of {
+        let dn = dn.trim();
+        if dn.is_empty() {
+            continue;
+        }
+        if allowed.iter().any(|entry| entry.trim().eq_ignore_ascii_case(dn)) {
+            return true;
+        }
+        if let Some(rdn) = first_rdn_value(dn) {
+            if allowed.iter().any(|entry| entry.trim().eq_ignore_ascii_case(&rdn)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn bind_raw(login: &LdapLogin, username: &str, password: &str) -> Result<String, String> {
@@ -800,15 +895,18 @@ fn clean_username_for_search(username: &str) -> &str {
     account.split('@').next().unwrap_or(account).trim()
 }
 
-/// Run the user-DN search on an already-bound connection.
-async fn search_user_dn(ldap: &mut Ldap, login: &LdapLogin, username: &str) -> Result<String, String> {
+/// Run the user search on an already-bound connection, returning the user's
+/// DN together with their `memberOf` values (empty when the directory does
+/// not expose the attribute to this identity).
+async fn search_user(ldap: &mut Ldap, login: &LdapLogin, username: &str) -> Result<(String, Vec<String>), String> {
     let filter = login.user_search_filter(clean_username_for_search(username))?;
     let base_dn = login.user_search_base();
     if base_dn.is_empty() {
         return Err("LDAP base DN is not configured".to_string());
     }
     let search =
-        tokio::time::timeout(login.connect_timeout, ldap.search(&base_dn, Scope::Subtree, &filter, vec!["dn"])).await;
+        tokio::time::timeout(login.connect_timeout, ldap.search(&base_dn, Scope::Subtree, &filter, vec!["memberOf"]))
+            .await;
     match search {
         Err(_) => Err(format!("LDAP search timed out (base={base_dn}, filter={filter})")),
         Ok(Err(e)) => Err(format!("LDAP search failed: {e} (base={base_dn}, filter={filter})")),
@@ -823,14 +921,18 @@ async fn search_user_dn(ldap: &mut Ldap, login: &LdapLogin, username: &str) -> R
             // back without a DN (referrals) are skipped.
             entries
                 .iter()
-                .map(|entry| ldap3::SearchEntry::construct(entry.clone()).dn)
-                .find(|dn| !dn.trim().is_empty())
+                .map(|entry| ldap3::SearchEntry::construct(entry.clone()))
+                .find(|entry| !entry.dn.trim().is_empty())
+                .map(|entry| {
+                    let member_of = entry.attrs.get("memberOf").cloned().unwrap_or_default();
+                    (entry.dn, member_of)
+                })
                 .ok_or_else(|| format!("LDAP search returned entries without a DN (base={base_dn}, filter={filter})"))
         }
     }
 }
 
-async fn resolve_via_service_account(login: &LdapLogin, username: &str) -> Result<String, String> {
+async fn resolve_via_service_account(login: &LdapLogin, username: &str) -> Result<(String, Vec<String>), String> {
     let (candidates, service_pw) = login.service_bind_candidates()?;
     let (mut ldap, driver) = open_connection(login, "service connection").await?;
 
@@ -845,7 +947,31 @@ async fn resolve_via_service_account(login: &LdapLogin, username: &str) -> Resul
         });
     let resolved = match bind_outcome {
         Err(err) => Err(err),
-        Ok(_) => search_user_dn(&mut ldap, login, username).await,
+        Ok(_) => search_user(&mut ldap, login, username).await,
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), ldap.unbind()).await;
+    driver.abort();
+    resolved
+}
+
+/// NOSV group lookup: open a fresh connection bound as the user (mirroring
+/// [`bind_raw`]) and run the user search on it. Requires that the bound
+/// identity may read the directory — the default for AD and OpenLDAP users.
+async fn search_as_bound_user(
+    login: &LdapLogin,
+    username: &str,
+    password: &str,
+) -> Result<(String, Vec<String>), String> {
+    let (mut ldap, driver) = open_connection(login, "membership connection").await?;
+    let attempt = tokio::time::timeout(login.connect_timeout, ldap.simple_bind(username, password)).await;
+    let bind_outcome = match attempt {
+        Err(_) => Err(format!("LDAP bind timed out ({}s)", login.connect_timeout.as_secs())),
+        Ok(Err(e)) => Err(format!("LDAP bind failed: {e}")),
+        Ok(Ok(result)) => result.success().map(|_| ()).map_err(|e| format!("LDAP bind rejected: {e}")),
+    };
+    let resolved = match bind_outcome {
+        Err(err) => Err(err),
+        Ok(()) => search_user(&mut ldap, login, username).await,
     };
     let _ = tokio::time::timeout(Duration::from_secs(2), ldap.unbind()).await;
     driver.abort();
@@ -868,6 +994,62 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_allowed_groups_splits_and_trims() {
+        assert_eq!(parse_allowed_groups(""), Vec::<String>::new());
+        assert_eq!(parse_allowed_groups("  "), Vec::<String>::new());
+        // A comma inside a group DN must be escaped; bare names are plain.
+        assert_eq!(
+            parse_allowed_groups(r"CN=DBA\,OU=Groups\,DC=corp\,DC=com , dba-admins ,, readers"),
+            vec!["CN=DBA,OU=Groups,DC=corp,DC=com", "dba-admins", "readers"]
+        );
+        assert_eq!(parse_allowed_groups(r"CN=Sales\, East"), vec!["CN=Sales, East"]);
+    }
+
+    #[test]
+    fn first_rdn_value_extracts_naming_value() {
+        assert_eq!(first_rdn_value("CN=admins,OU=Groups,DC=corp,DC=com").as_deref(), Some("admins"));
+        assert_eq!(first_rdn_value("cn = lowercase ").as_deref(), Some("lowercase"));
+        assert_eq!(first_rdn_value("no-equals"), None);
+        assert_eq!(first_rdn_value("cn=,"), None);
+    }
+
+    #[test]
+    fn group_membership_allowed_matrix() {
+        let allowed = vec!["CN=DBA,OU=Groups,DC=corp,DC=com".to_string(), "dba-admins".to_string()];
+        // Empty allowed list = unrestricted.
+        assert!(group_membership_allowed(&[], &[]));
+        assert!(group_membership_allowed(&[String::new()], &[]));
+        // Full-DN match (case-insensitive).
+        assert!(group_membership_allowed(&allowed, &["cn=dba,ou=groups,dc=corp,dc=com".to_string()]));
+        // Bare-name match via first RDN value.
+        assert!(group_membership_allowed(&allowed, &["CN=DBA-Admins,OU=Groups,DC=corp,DC=com".to_string()]));
+        // Default deny.
+        assert!(!group_membership_allowed(&allowed, &["CN=Everyone,DC=corp,DC=com".to_string()]));
+        assert!(!group_membership_allowed(&allowed, &[]));
+    }
+
+    #[test]
+    fn settings_round_trip_camel_case_allowed_groups() {
+        let settings = sv_settings();
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["allowedGroups"], "");
+        let mut with_groups = settings.clone();
+        with_groups.allowed_groups = "CN=DBA,OU=Groups,DC=corp,DC=com".into();
+        let json = serde_json::to_value(&with_groups).unwrap();
+        assert_eq!(json["allowedGroups"], "CN=DBA,OU=Groups,DC=corp,DC=com");
+        let parsed: LdapLoginSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.allowed_groups, "CN=DBA,OU=Groups,DC=corp,DC=com");
+    }
+
+    #[test]
+    fn build_login_parses_allowed_groups_into_runtime() {
+        let mut settings = sv_settings();
+        settings.allowed_groups = r"CN=DBA\,OU=Groups\,DC=corp\,DC=com, dba-admins".into();
+        let (_, login) = settings.build_login().unwrap();
+        assert_eq!(login.allowed_groups, vec!["CN=DBA,OU=Groups,DC=corp,DC=com", "dba-admins"]);
+    }
+
     fn no_sv_login() -> LdapLogin {
         LdapLogin {
             host: "ldap.example.com".into(),
@@ -878,6 +1060,7 @@ mod tests {
             service_account_password: None,
             search_filter: None,
             search_base: None,
+            allowed_groups: Vec::new(),
             connect_timeout: Duration::from_secs(5),
         }
     }
@@ -892,6 +1075,7 @@ mod tests {
             service_account_password: Some("s3cret".into()),
             search_filter: Some("(sAMAccountName={user})".into()),
             search_base: Some("OU=Users,DC=corp,DC=example,DC=com".into()),
+            allowed_groups: Vec::new(),
             connect_timeout: Duration::from_secs(5),
         }
     }
@@ -908,6 +1092,7 @@ mod tests {
             service_account_dn: String::new(),
             service_account_password: String::new(),
             search_base: String::new(),
+            allowed_groups: String::new(),
             search_filter: String::new(),
             connect_timeout_secs: 5,
         }
@@ -925,7 +1110,8 @@ mod tests {
             service_account_dn: "CN=svc,OU=Service,DC=corp,DC=example,DC=com".into(),
             service_account_password: "s3cret".into(),
             search_base: "OU=Users,DC=corp,DC=example,DC=com".into(),
-            search_filter: "(sAMAccountName={user})".into(),
+            allowed_groups: String::new(),
+            search_filter: String::new(),
             connect_timeout_secs: 5,
         }
     }
@@ -1254,6 +1440,7 @@ mod tests {
             service_account_password: None,
             search_filter: None,
             search_base: None,
+            allowed_groups: Vec::new(),
             connect_timeout: Duration::from_secs(15),
         }
     }
@@ -1268,6 +1455,7 @@ mod tests {
             service_account_password: Some(svc_pw.to_string()),
             search_filter: Some("(sAMAccountName={user})".into()),
             search_base: Some("OU=CLIENTS,DC=CORP,DC=INT,DC=KN".into()),
+            allowed_groups: Vec::new(),
             connect_timeout: Duration::from_secs(15),
         }
     }

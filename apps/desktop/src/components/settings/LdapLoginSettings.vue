@@ -22,6 +22,7 @@ interface LdapSettingsDraft {
   serviceAccountDn: string;
   serviceAccountPassword: string;
   searchFilter: string;
+  allowedGroups: string;
   connectTimeoutSecs: number;
 }
 
@@ -36,6 +37,7 @@ const DEFAULT_DRAFT: LdapSettingsDraft = {
   serviceAccountDn: "",
   serviceAccountPassword: "",
   searchFilter: "",
+  allowedGroups: "",
   connectTimeoutSecs: 10,
 };
 
@@ -64,6 +66,7 @@ async function load() {
       serviceAccountDn: config.serviceAccountDn,
       serviceAccountPassword: "",
       searchFilter: config.searchFilter,
+      allowedGroups: config.allowedGroups || "",
       connectTimeoutSecs: config.connectTimeoutSecs || 10,
     };
     serviceAccountPasswordSet.value = config.serviceAccountPasswordSet;
@@ -196,6 +199,12 @@ onMounted(() => {
           </div>
         </div>
       </template>
+
+      <div class="space-y-1.5">
+        <Label for="ldap-allowed-groups">{{ t("auth.ldapAllowedGroups") }}</Label>
+        <Input id="ldap-allowed-groups" v-model="form.allowedGroups" :placeholder="t('auth.ldapAllowedGroupsPlaceholder')" />
+        <p class="text-xs text-muted-foreground">{{ t("auth.ldapAllowedGroupsHint") }}</p>
+      </div>
     </div>
 
     <div class="flex flex-wrap items-center gap-2">

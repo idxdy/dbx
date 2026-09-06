@@ -6139,6 +6139,7 @@ mod tests {
             service_account_dn: "CN=svc,OU=Service,DC=corp,DC=example,DC=com".into(),
             service_account_password: "s3cret".into(),
             search_base: "OU=Users,DC=corp,DC=example,DC=com".into(),
+            allowed_groups: String::new(),
             search_filter: "(sAMAccountName={user})".into(),
             connect_timeout_secs: 12,
         };
@@ -6163,6 +6164,7 @@ mod tests {
             service_account_dn: "CN=svc,OU=Service,DC=corp,DC=example,DC=com".into(),
             service_account_password: "s3cret".into(),
             search_base: "OU=Users,DC=corp,DC=example,DC=com".into(),
+            allowed_groups: String::new(),
             search_filter: "(sAMAccountName={user})".into(),
             connect_timeout_secs: 12,
         }
