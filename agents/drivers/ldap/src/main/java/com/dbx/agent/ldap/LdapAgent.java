@@ -4,6 +4,7 @@ import com.google.gson.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.naming.AuthenticationException;
 import javax.naming.Context;
 import javax.naming.NamingEnumeration;
 import javax.naming.NamingException;
@@ -41,7 +42,7 @@ public final class LdapAgent {
 
     private static final List<String> CAPABILITIES = Collections.unmodifiableList(Arrays.asList(
         "ldap_connect", "ldap_test_connection", "ldap_search",
-        "ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"
+        "ldap_add", "ldap_modify", "ldap_delete", "ldap_rename", "ldap_verify_password"
     ));
 
     private static LdapContext ldapContext;
@@ -125,6 +126,7 @@ public final class LdapAgent {
             case "ldap_modify" -> modify(params);
             case "ldap_delete" -> delete(params);
             case "ldap_rename" -> rename(params);
+            case "ldap_verify_password" -> verifyPassword(params);
             case "list_databases" -> listDatabases(params);
             default -> throw new IllegalArgumentException("Unknown method: " + method);
         };
@@ -748,6 +750,54 @@ public final class LdapAgent {
     // -----------------------------------------------------------------------
     // LDAP write operations
     // -----------------------------------------------------------------------
+
+    /**
+     * One-off simple bind with the supplied DN/password to verify a password
+     * (the LDAP way to check credentials). Uses the active connection's host
+     * parameters; wrong credentials return {@code verified=false} instead of
+     * an error so the UI can distinguish "bad password" from transport
+     * failures.
+     */
+    private static Object verifyPassword(JsonObject params) throws Exception {
+        if (ldapContext == null || activeConnection == null) {
+            throw new IllegalStateException("Not connected. Call connect first.");
+        }
+        String dn = requiredDn(params);
+        JsonObject conn = activeConnection.deepCopy();
+        conn.addProperty("username", dn);
+        conn.addProperty("password", stringOrEmpty(params, "password"));
+        conn.addProperty("security_protocol", "simple");
+
+        LdapContext probe = null;
+        Path probeTempJaas = null;
+        LoginContext probeLogin = null;
+        try {
+            ContextResult result = createContext(conn, probeTempJaas, probeLogin);
+            probe = result.context;
+            probeTempJaas = result.tempConfig;
+            probeLogin = result.loginContext;
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("verified", true);
+            response.put("dn", dn);
+            return response;
+        } catch (AuthenticationException e) {
+            logger().debug("LDAP verify password rejected for {}", dn);
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("verified", false);
+            response.put("dn", dn);
+            return response;
+        } finally {
+            if (probe != null) {
+                probe.close();
+            }
+            if (probeLogin != null) {
+                try { probeLogin.logout(); } catch (Exception ignored) {}
+            }
+            if (probeTempJaas != null) {
+                try { Files.deleteIfExists(probeTempJaas); } catch (Exception ignored) {}
+            }
+        }
+    }
 
     private static LdapContext requireContext() {
         if (ldapContext == null) {

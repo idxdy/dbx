@@ -2109,6 +2109,7 @@ pub fn run() {
             commands::ldap_cmd::ldap_modify,
             commands::ldap_cmd::ldap_delete,
             commands::ldap_cmd::ldap_rename,
+            commands::ldap_cmd::ldap_verify_password,
             commands::ldap_cmd::ldap_get_config,
             commands::ldap_cmd::ldap_get_config_for_connection,
             commands::consul_cmd::consul_capabilities,

@@ -87,6 +87,17 @@ pub async fn ldap_rename(
         .await
 }
 
+/// One-off bind with the given DN/password — the LDAP way to verify a password.
+#[tauri::command]
+pub async fn ldap_verify_password(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    dn: String,
+    password: String,
+) -> Result<Value, String> {
+    dbx_core::ldap_ops::ldap_verify_password_core(&state, &connection_id, &dn, &password).await
+}
+
 #[tauri::command]
 pub async fn ldap_get_config() -> Result<Value, String> {
     let config: Value =

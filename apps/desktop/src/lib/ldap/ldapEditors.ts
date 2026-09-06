@@ -105,3 +105,39 @@ export function getLdapEditor(attributeName: string, config: LdapSchemaConfig): 
   editorCache.set(key, StringEditor);
   return StringEditor;
 }
+
+/** Attributes whose values are passwords (masked + verifiable via one-off bind). */
+export function isPasswordAttribute(attributeName: string): boolean {
+  const key = attributeName.toLowerCase();
+  return key === "userpassword" || key === "unicodepwd" || key === "clearpassword";
+}
+
+const GENERALIZED_TIME_RE = /^(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?(?:[.,](\d+))?(Z|[+-]\d{4})?$/;
+
+/** Generalized Time (`199412161032Z`) → `datetime-local` string in local time. */
+export function generalizedTimeToDateTimeLocal(value: string): string {
+  const match = GENERALIZED_TIME_RE.exec(value.trim());
+  if (!match) return value;
+  const [, year, month, day, hour = "00", minute = "00", second = "00", , timezone] = match;
+  let offsetMs = 0;
+  if (timezone && timezone !== "Z") {
+    const sign = timezone[0] === "-" ? -1 : 1;
+    offsetMs = sign * (Number(timezone.slice(1, 3)) * 60 + Number(timezone.slice(3, 5))) * 60000;
+  }
+  // Fractional seconds are truncated; datetime-local has second resolution.
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) - offsetMs);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/** `datetime-local` string → Generalized Time in UTC (`199412161032Z`). */
+export function dateTimeLocalToGeneralizedTime(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value.trim());
+  if (!match) return value;
+  const [, year, month, day, hour, minute, second = "00"] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
+}

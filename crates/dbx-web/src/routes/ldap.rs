@@ -172,6 +172,29 @@ pub async fn rename(
     Ok(Json(result))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LdapVerifyPasswordRequest {
+    pub connection_id: String,
+    pub dn: String,
+    pub password: String,
+}
+
+/// One-off bind with the given DN/password — the LDAP way to verify a password.
+pub async fn verify_password(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<LdapVerifyPasswordRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::ldap_ops::ldap_verify_password_core(
+        &state.app,
+        &request.connection_id,
+        &request.dn,
+        &request.password,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 /// Serve the LDAP schema configuration. Without a connection (or when the
 /// server's schema cannot be read) the bundled static asset is served;
 /// with a connection the schema comes from the server's own subschema entry.

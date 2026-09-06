@@ -131,6 +131,54 @@ pub async fn ldap_delete_core(state: &AppState, connection_id: &str, dn: &str) -
     }
 }
 
+/// Verify a password for `dn` by performing a one-off bind with those
+/// credentials (the LDAP way to check a password; nothing is persisted).
+pub async fn ldap_verify_password_core(
+    state: &AppState,
+    connection_id: &str,
+    dn: &str,
+    password: &str,
+) -> Result<Value, String> {
+    let config = {
+        let configs = state.configs.read().await;
+        configs.get(connection_id).cloned().ok_or_else(|| "Unknown connection".to_string())?
+    };
+    if config.db_type != crate::models::connection::DatabaseType::Ldap {
+        return Err("Not an LDAP connection".to_string());
+    }
+    match resolve_ldap_backend(state, connection_id).await? {
+        LdapBackend::Native(_) => {
+            // A fresh short connection: simple bind with the entry's own DN.
+            let mut bind_config = config.clone();
+            bind_config.username = dn.to_string();
+            bind_config.password = password.to_string();
+            bind_config.read_only = false;
+            bind_config.is_production = false;
+            let connect_timeout = Duration::from_secs(10);
+            let client =
+                crate::db::ldap_driver::connect(&bind_config, &config.host, config.port, connect_timeout).await;
+            match client {
+                Ok(client) => {
+                    crate::db::ldap_driver::close(client).await;
+                    Ok(serde_json::json!({ "verified": true, "dn": dn }))
+                }
+                Err(err) => {
+                    if err.to_lowercase().contains("bind rejected") || err.to_lowercase().contains("invalid") {
+                        Ok(serde_json::json!({ "verified": false, "dn": dn }))
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
+        LdapBackend::Agent(client) => {
+            let mut agent = client.lock().await;
+            let params = serde_json::json!({ "dn": dn, "password": password });
+            agent.call_with_timeout("ldap_verify_password", params, Some(Duration::from_secs(30))).await
+        }
+    }
+}
+
 /// Rename (and optionally move) an entry on either backend.
 pub async fn ldap_rename_core(
     state: &AppState,

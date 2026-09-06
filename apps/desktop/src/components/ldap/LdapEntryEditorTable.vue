@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2, Lock, Plus, X } from "@lucide/vue";
+import { Loader2, Lock, Plus, ShieldCheck, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
-import { getLdapEditor } from "@/lib/ldap/ldapEditors";
+import { dateTimeLocalToGeneralizedTime, generalizedTimeToDateTimeLocal, getLdapEditor, isPasswordAttribute } from "@/lib/ldap/ldapEditors";
 import { getLdapAttributeType, getOptionalAttributes, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
 import type { LdapSchemaConfig } from "@/lib/backend/http";
 
@@ -44,6 +44,10 @@ interface AttributeRow {
   /** True for a synthesized MUST row that the entry does not have yet. */
   missing: boolean;
   cells: ValueCell[];
+  /** Password attributes: inline verify-password state. */
+  verifyOpen?: boolean;
+  verifyText?: string;
+  verifying?: boolean;
 }
 
 const rows = ref<AttributeRow[]>([]);
@@ -59,13 +63,21 @@ function entryObjectClasses(): string[] {
   return Array.isArray(raw) ? raw.map(String) : [String(raw)];
 }
 
+/** Editor kind for an attribute: schema syntax, with password name overrides. */
+function attributeKind(name: string): string {
+  if (isPasswordAttribute(name)) return "password";
+  return props.schema ? (getLdapAttributeType(props.schema, name)?.syntax ?? "string") : "string";
+}
+
 function serializeValue(name: string, text: string): string {
   if (!text) return "";
+  if (attributeKind(name) === "generalizedTime") return dateTimeLocalToGeneralizedTime(text);
   const editor = props.schema ? getLdapEditor(name, props.schema) : undefined;
   return editor ? editor.serialize(text) : text;
 }
 
 function deserializeValue(name: string, value: string): string {
+  if (attributeKind(name) === "generalizedTime") return generalizedTimeToDateTimeLocal(value);
   const editor = props.schema ? getLdapEditor(name, props.schema) : undefined;
   return editor ? editor.deserialize(value) : value;
 }
@@ -257,6 +269,26 @@ function addAttributeRow(name: string) {
     cells: [{ text: "", committedText: "", original: "", isNew: true }],
   });
 }
+
+async function verifyRowPassword(row: AttributeRow) {
+  const dn = props.entry?.dn ?? "";
+  if (!dn || !row.verifyText || row.verifying) return;
+  row.verifying = true;
+  try {
+    const result = await api.ldapVerifyPassword(props.connectionId, dn, row.verifyText);
+    if (result.verified) {
+      toast(t("ldap.passwordVerified"), 2500);
+    } else {
+      toast(t("ldap.passwordNotVerified"), 4000);
+    }
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  } finally {
+    row.verifying = false;
+    row.verifyOpen = false;
+    row.verifyText = "";
+  }
+}
 </script>
 
 <template>
@@ -273,7 +305,17 @@ function addAttributeRow(name: string) {
         </Button>
       </div>
       <div v-for="(cell, cellIndex) in row.cells" :key="cellIndex" class="flex items-center gap-1.5">
+        <select v-if="attributeKind(row.name) === 'boolean'" v-model="cell.text" class="h-6 flex-1 min-w-0 text-xs font-mono rounded-md border border-input bg-background px-2" :disabled="!rowEditable(row)" @change="commitAttribute(row, cell)" @blur="onCellBlur(row, cell)">
+          <option v-if="!cell.text" value=""></option>
+          <option value="TRUE">TRUE</option>
+          <option value="FALSE">FALSE</option>
+        </select>
+        <Input v-else-if="attributeKind(row.name) === 'generalizedTime'" v-model="cell.text" type="datetime-local" class="h-6 flex-1 min-w-0 text-xs" :disabled="!rowEditable(row)" @keydown="onCellKeydown($event, row, cell)" @blur="onCellBlur(row, cell)" />
+        <Input v-else-if="attributeKind(row.name) === 'integer'" v-model="cell.text" type="number" step="1" class="h-6 flex-1 min-w-0 text-xs font-mono" :disabled="!rowEditable(row)" @keydown="onCellKeydown($event, row, cell)" @blur="onCellBlur(row, cell)" />
+        <Input v-else-if="attributeKind(row.name) === 'password'" v-model="cell.text" type="password" class="h-6 flex-1 min-w-0 text-xs font-mono" autocomplete="new-password" :disabled="!rowEditable(row)" @keydown="onCellKeydown($event, row, cell)" @blur="onCellBlur(row, cell)" />
+        <Input v-else-if="attributeKind(row.name) === 'binary' || attributeKind(row.name) === 'jpeg'" :model-value="cell.text" class="h-6 flex-1 min-w-0 text-xs font-mono" disabled :title="t('ldap.binaryReadonlyHint')" />
         <Input
+          v-else
           v-model="cell.text"
           class="h-6 flex-1 min-w-0 text-xs"
           :class="{ 'border-destructive': row.kind === 'must' && row.missing && !cell.text }"
@@ -282,8 +324,18 @@ function addAttributeRow(name: string) {
           @keydown="onCellKeydown($event, row, cell)"
           @blur="onCellBlur(row, cell)"
         />
+        <Button v-if="attributeKind(row.name) === 'password' && rowEditable(row) && !cell.isNew && !row.missing" variant="ghost" size="icon-xs" class="text-muted-foreground" :title="t('ldap.verifyPasswordTooltip')" @click="row.verifyOpen = !row.verifyOpen">
+          <ShieldCheck class="size-3" />
+        </Button>
         <Button v-if="rowEditable(row) && !cell.isNew" variant="ghost" size="icon-xs" class="text-muted-foreground" :title="t('ldap.removeValue')" @click="removeCell(row, cell)">
           <X class="size-3" />
+        </Button>
+      </div>
+      <div v-if="row.verifyOpen" class="flex items-center gap-1.5 pl-1">
+        <Input v-model="row.verifyText" type="password" class="h-6 flex-1 min-w-0 text-xs font-mono" autocomplete="off" :placeholder="t('ldap.verifyPasswordPlaceholder')" @keydown.enter="verifyRowPassword(row)" />
+        <Button variant="ghost" size="icon-xs" class="text-muted-foreground" :disabled="row.verifying" :title="t('ldap.verifyPasswordTooltip')" @click="verifyRowPassword(row)">
+          <Loader2 v-if="row.verifying" class="size-3 animate-spin" />
+          <ShieldCheck v-else class="size-3" />
         </Button>
       </div>
       <Button v-if="rowEditable(row)" variant="ghost" size="sm" class="h-5 px-1.5 text-xs text-muted-foreground" @click="addValueCell(row)"> <Plus class="size-3 mr-1" />{{ t("ldap.addValue") }} </Button>

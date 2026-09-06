@@ -126,7 +126,7 @@ class LdapAgentTest {
 
     @Test
     void writeOpsWithoutConnectionReturnError() {
-        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"}) {
+        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename", "ldap_verify_password"}) {
             JsonObject params = new JsonObject();
             params.addProperty("dn", "cn=test," + BASE_DN);
             String response = writeOpErrorResponse(method, params);
@@ -142,7 +142,7 @@ class LdapAgentTest {
         // Parameter validation runs after the connection check, so without a
         // live context every write op reports "Not connected". What matters
         // here is that the request is not rejected as an unknown method.
-        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"}) {
+        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename", "ldap_verify_password"}) {
             String response = writeOpErrorResponse(method, new JsonObject());
             var payload = JsonParser.parseString(response).getAsJsonObject();
             assertTrue(payload.has("error"), method + " should fail without connection");

@@ -2645,6 +2645,19 @@ export async function ldapRename(connectionId: string, dn: string, newRdn: strin
   });
 }
 
+export interface LdapVerifyPasswordResult {
+  verified: boolean;
+  dn: string;
+}
+
+export async function ldapVerifyPassword(connectionId: string, dn: string, password: string): Promise<LdapVerifyPasswordResult> {
+  return post("/api/ldap/verify-password", {
+    connection_id: connectionId,
+    dn,
+    password,
+  });
+}
+
 export interface LdapObjectClass {
   name: string;
   system: string[];
