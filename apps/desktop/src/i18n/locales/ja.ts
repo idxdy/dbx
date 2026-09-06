@@ -4933,6 +4933,8 @@ export default withEnglishFallback({
     copyLdapsearchTooltip: "ldapsearch コマンドとしてコピー",
     copyGetAdObjectTooltip: "PowerShell Get-ADObject コマンドとしてコピー",
     addEntry: "エントリを追加",
+    openInBrowser: "ブラウザで開く",
+    missingMustHint: "必須属性がありません。値を入力すると追加されます",
     editEntry: "編集",
     renameEntry: "名前を変更",
     deleteEntry: "削除",

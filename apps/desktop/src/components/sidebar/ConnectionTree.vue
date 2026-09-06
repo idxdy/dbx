@@ -58,7 +58,6 @@ import TreeItem from "./TreeItem.vue";
 import SidebarTreeRuntimeHost from "./SidebarTreeRuntimeHost.vue";
 import SidebarTreeItemDialogs from "./SidebarTreeItemDialogs.vue";
 import LdapEntryCreateDialog from "@/components/ldap/LdapEntryCreateDialog.vue";
-import LdapEntryEditDialog from "@/components/ldap/LdapEntryEditDialog.vue";
 import LdapEntryRenameDialog from "@/components/ldap/LdapEntryRenameDialog.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import { ldapEntryDialogState } from "@/lib/ldap/ldapEntryDialogState";
@@ -112,22 +111,6 @@ async function refreshLdapChildren(connectionId: string, dn: string) {
 async function onLdapEntryCreated() {
   try {
     await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.createParentDn);
-  } catch (e: unknown) {
-    toast(e instanceof Error ? e.message : String(e), 5000);
-  }
-}
-
-async function onLdapEntryEdited(newDn: string) {
-  const oldDn = ldapEntryDialogState.editEntry?.dn;
-  if (!oldDn) return;
-  try {
-    // An edit that changed the RDN value renamed the entry; refresh the
-    // parent so the tree shows the new label.
-    if (newDn && newDn !== oldDn) {
-      await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapParentDn(oldDn));
-    } else {
-      await refreshLdapChildren(ldapEntryDialogState.connectionId, oldDn);
-    }
   } catch (e: unknown) {
     toast(e instanceof Error ? e.message : String(e), 5000);
   }
@@ -2803,7 +2786,6 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
     </SidebarDangerConfirmDialog>
     <SidebarTreeItemDialogs v-if="sidebarTreeItemDialogController" :key="sidebarTreeItemDialogController.node?.id" :controller="sidebarTreeItemDialogController" @closed="sidebarTreeItemDialogController = null" />
     <LdapEntryCreateDialog v-model:open="ldapEntryDialogState.createOpen" :connection-id="ldapEntryDialogState.connectionId" :parent-dn="ldapEntryDialogState.createParentDn" @created="onLdapEntryCreated" />
-    <LdapEntryEditDialog v-model:open="ldapEntryDialogState.editOpen" :connection-id="ldapEntryDialogState.connectionId" :entry="ldapEntryDialogState.editEntry" @saved="onLdapEntryEdited" />
     <LdapEntryRenameDialog v-model:open="ldapEntryDialogState.renameOpen" :connection-id="ldapEntryDialogState.connectionId" :dn="ldapEntryDialogState.renameDn" @renamed="onLdapEntryRenamed" />
     <DangerConfirmDialog v-model:open="ldapEntryDialogState.deleteOpen" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="ldapEntryDialogState.deleteDn" :confirm-label="t('ldap.deleteEntry')" :loading="ldapDeleting" @confirm="confirmLdapDelete" />
     <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" @changed="refreshSidebarActionTarget" />

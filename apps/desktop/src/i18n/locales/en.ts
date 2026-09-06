@@ -5083,6 +5083,8 @@ export default {
     copyLdapsearchTooltip: "Copy as ldapsearch command",
     copyGetAdObjectTooltip: "Copy as PowerShell Get-ADObject command",
     addEntry: "Add Entry",
+    openInBrowser: "Open in Browser",
+    missingMustHint: "Required attribute missing — type a value to add it",
     editEntry: "Edit",
     renameEntry: "Rename",
     deleteEntry: "Delete",

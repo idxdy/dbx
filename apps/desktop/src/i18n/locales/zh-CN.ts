@@ -5068,6 +5068,8 @@ export default withEnglishFallback({
     copyLdapsearchTooltip: "复制为 ldapsearch 命令",
     copyGetAdObjectTooltip: "复制为 PowerShell Get-ADObject 命令",
     addEntry: "新增条目",
+    openInBrowser: "在浏览器中打开",
+    missingMustHint: "必填属性缺失,填写后自动提交",
     editEntry: "编辑",
     renameEntry: "重命名",
     deleteEntry: "删除",

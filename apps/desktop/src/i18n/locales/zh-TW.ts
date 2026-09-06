@@ -4230,6 +4230,8 @@ export default withEnglishFallback({
     copyLdapsearchTooltip: "複製為 ldapsearch 命令",
     copyGetAdObjectTooltip: "複製為 PowerShell Get-ADObject 命令",
     addEntry: "新增條目",
+    openInBrowser: "在瀏覽器中開啟",
+    missingMustHint: "必填屬性缺失,填寫後自動提交",
     editEntry: "編輯",
     renameEntry: "重新命名",
     deleteEntry: "刪除",

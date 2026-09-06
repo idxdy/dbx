@@ -4906,6 +4906,8 @@ export default withEnglishFallback({
     copyLdapsearchTooltip: "Copiar como comando ldapsearch",
     copyGetAdObjectTooltip: "Copiar como comando PowerShell Get-ADObject",
     addEntry: "Adicionar entrada",
+    openInBrowser: "Abrir no navegador",
+    missingMustHint: "Atributo obrigatório ausente; digite um valor para adicioná-lo",
     editEntry: "Editar",
     renameEntry: "Renomear",
     deleteEntry: "Excluir",

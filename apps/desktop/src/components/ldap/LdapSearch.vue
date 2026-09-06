@@ -66,7 +66,7 @@
             <div class="flex items-center justify-between gap-2 mb-1">
               <h3 class="text-sm font-semibold">DN</h3>
               <div class="flex items-center gap-1.5">
-                <Button variant="outline" size="sm" class="h-6 px-2 text-xs" :disabled="readOnly" @click="showEditDialog = true"> <Pencil class="size-3 mr-1" />{{ t("ldap.editEntry") }} </Button>
+                <Button variant="outline" size="sm" class="h-6 px-2 text-xs" @click="openSelectedInBrowser"> <ExternalLink class="size-3 mr-1" />{{ t("ldap.openInBrowser") }} </Button>
                 <Button variant="outline" size="sm" class="h-6 px-2 text-xs text-destructive hover:text-destructive" :disabled="readOnly" @click="showDeleteDialog = true"> <Trash2 class="size-3 mr-1" />{{ t("ldap.deleteEntry") }} </Button>
               </div>
             </div>
@@ -122,24 +122,23 @@
       </div>
     </div>
     <!-- Write dialogs -->
-    <LdapEntryEditDialog v-model:open="showEditDialog" :connection-id="connectionId" :entry="selectedResult" @saved="executeSearch" />
     <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="selectedResult?.dn" :confirm-label="t('ldap.deleteEntry')" :loading="deleting" @confirm="deleteSelected" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import { Search, Loader2, FileText, FileSearch, X, Copy, Pencil, Trash2, RefreshCw } from "@lucide/vue";
+import { Search, Loader2, FileText, FileSearch, X, Copy, ExternalLink, Trash2, RefreshCw } from "@lucide/vue";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "vue-i18n";
 import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildGetAdObjectCommand, buildGetAdObjectIdentityCommand, buildLdapSearchByDnCommand, buildLdapSearchCommand, parseScope } from "@/lib/ldap/ldapSearchSyntax";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
-import LdapEntryEditDialog from "@/components/ldap/LdapEntryEditDialog.vue";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -149,12 +148,24 @@ const props = defineProps<{
 }>();
 
 const connectionStore = useConnectionStore();
+const queryStore = useQueryStore();
 const config = computed(() => connectionStore.getConfig(props.connectionId));
 const readOnly = computed(() => Boolean((config.value as any)?.read_only));
 
-const showEditDialog = ref(false);
 const showDeleteDialog = ref(false);
 const deleting = ref(false);
+
+/** Open the selected entry in the LDAP browser tab, where the inline editor lives. */
+function openSelectedInBrowser() {
+  const dn = selectedResult.value?.dn;
+  if (!dn) return;
+  const existingTab = queryStore.tabs.find((tab) => tab.connectionId === props.connectionId && tab.mode === "ldap" && tab.database === dn);
+  if (existingTab) {
+    queryStore.switchTab(existingTab.id);
+  } else {
+    queryStore.createTab(props.connectionId, dn, `${dn.split(",")[0] ?? dn} - ${config.value?.name || "LDAP"}`, "ldap");
+  }
+}
 
 async function deleteSelected() {
   const dn = selectedResult.value?.dn;

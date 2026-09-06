@@ -179,7 +179,7 @@ import { sidebarStructureExportTargets } from "@/lib/sidebar/sidebarExportRuntim
 import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseBackup";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { openLdapCreateEntryDialog, openLdapDeleteEntryDialog, openLdapEditEntryDialog, openLdapRenameEntryDialog } from "@/lib/ldap/ldapEntryDialogState";
+import { openLdapCreateEntryDialog, openLdapDeleteEntryDialog, openLdapRenameEntryDialog } from "@/lib/ldap/ldapEntryDialogState";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
@@ -5360,9 +5360,7 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({
         label: t("ldap.editEntry"),
         action: () => {
-          openLdapEditEntryDialog(node.connectionId!, node.database!).catch((e: unknown) => {
-            toast(e instanceof Error ? e.message : String(e), 5000);
-          });
+          void openLdapEntryDetail();
         },
         icon: Pencil,
         disabled: ldapReadOnly,

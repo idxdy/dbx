@@ -4459,6 +4459,8 @@ export default withEnglishFallback({
     copyLdapsearchTooltip: "ldapsearch 명령으로 복사",
     copyGetAdObjectTooltip: "PowerShell Get-ADObject 명령으로 복사",
     addEntry: "항목 추가",
+    openInBrowser: "브라우저에서 열기",
+    missingMustHint: "필수 속성이 없습니다. 값을 입력하면 추가됩니다",
     editEntry: "편집",
     renameEntry: "이름 바꾸기",
     deleteEntry: "삭제",
