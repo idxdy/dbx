@@ -81,6 +81,7 @@ export const DATABASE_TYPES = [
   "jdbc",
   "spark",
   "ldap",
+  "plugin",
 ] as const;
 
 export type DatabaseType = (typeof DATABASE_TYPES)[number];

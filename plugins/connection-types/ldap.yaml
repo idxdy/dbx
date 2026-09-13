@@ -1,5 +1,5 @@
 schemaVersion: 1
-order: 790
+order: 785
 dbType: ldap
 rustVariant: Ldap
 label: LDAP
