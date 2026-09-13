@@ -5541,6 +5541,7 @@ export default withEnglishFallback({
     objectClassLocked: "objectClass no se puede modificar después de crear la entrada; elimínela y vuelva a crearla para cambiar su tipo",
     attributeNotAllowed: "Atributos no permitidos por el objectClass seleccionado: {attribute}",
     writeSuccess: "Directorio LDAP actualizado",
+    readOnly: "Esta conexión es de solo lectura y no puede realizar operaciones de escritura.",
     save: "Guardar",
     create: "Crear",
     rename: "Renombrar",
