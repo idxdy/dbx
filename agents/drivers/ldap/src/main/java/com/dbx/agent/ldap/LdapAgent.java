@@ -806,8 +806,28 @@ public final class LdapAgent {
         return ldapContext;
     }
 
-    private static Object add(JsonObject params) throws Exception {
+    /**
+     * Returns the active context for a directory write (add/modify/delete/rename).
+     * The connection's {@code read_only} flag (supplied by the Rust bridge at
+     * connect time and mirrored by the desktop UI) is enforced here as
+     * defense-in-depth, so writes stay blocked even if a caller bypasses the
+     * Rust-side guard.
+     */
+    private static LdapContext requireWritable() {
         LdapContext context = requireContext();
+        if (isReadOnlyConnection(activeConnection)) {
+            throw new IllegalStateException(
+                "LDAP connection is read-only: directory write operations (add/modify/delete/rename) are disabled");
+        }
+        return context;
+    }
+
+    static boolean isReadOnlyConnection(JsonObject connection) {
+        return connection != null && boolOrDefault(connection, "read_only", false);
+    }
+
+    private static Object add(JsonObject params) throws Exception {
+        LdapContext context = requireWritable();
         String dn = requiredDn(params);
         Map<String, Object> attributes = attributesFromParams(params);
         if (attributes.isEmpty()) {
@@ -831,7 +851,7 @@ public final class LdapAgent {
     }
 
     private static Object modify(JsonObject params) throws Exception {
-        LdapContext context = requireContext();
+        LdapContext context = requireWritable();
         String dn = requiredDn(params);
         JsonElement modsEl = params.get("modifications");
         if (modsEl == null || !modsEl.isJsonArray() || modsEl.getAsJsonArray().isEmpty()) {
@@ -873,14 +893,14 @@ public final class LdapAgent {
     }
 
     private static Object delete(JsonObject params) throws Exception {
-        LdapContext context = requireContext();
+        LdapContext context = requireWritable();
         String dn = requiredDn(params);
         context.destroySubcontext(dn);
         return writeResult(dn);
     }
 
     private static Object rename(JsonObject params) throws Exception {
-        LdapContext context = requireContext();
+        LdapContext context = requireWritable();
         String dn = requiredDn(params);
         String newRdn = stringOrEmpty(params, "new_rdn");
         if (newRdn.isBlank()) newRdn = stringOrEmpty(params, "newRdn");

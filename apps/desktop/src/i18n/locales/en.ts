@@ -5125,6 +5125,7 @@ export default {
     objectClassLocked: "objectClass cannot be modified after creation; delete and recreate the entry to change its type",
     attributeNotAllowed: "Attributes not allowed by the selected objectClass: {attribute}",
     writeSuccess: "LDAP directory updated",
+    readOnly: "This connection is read-only and cannot perform write operations.",
     save: "Save",
     create: "Create",
     rename: "Rename",

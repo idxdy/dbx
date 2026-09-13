@@ -143,6 +143,10 @@ pub fn agent_connect_params_with_role(
         params["keytab_path"] = serde_json::Value::String(config.ldap_keytab_path.clone());
         params["krb5_conf"] = serde_json::Value::String(config.ldap_krb5_conf.clone());
         params["base_dn"] = serde_json::Value::String(config.ldap_base_dn.clone());
+        // The Java agent refuses directory writes (ldap_add/modify/delete/
+        // rename) when the connection was established read-only, mirroring the
+        // guard_ldap_writes check in ldap_ops as defense-in-depth.
+        params["read_only"] = serde_json::Value::Bool(config.read_only);
         // The Java agent accepts self-signed certificates when the
         // tls_skip_verify external option is enabled (mirrors the native
         // driver's LdapConnSettings::set_no_tls_verify).
@@ -824,6 +828,18 @@ mod tests {
         let params = agent_connect_params(&cfg, "127.0.0.1", 27017, "").unwrap();
 
         assert_eq!(params["database"], "app_db");
+    }
+
+    #[test]
+    fn ldap_agent_connect_params_carry_read_only_flag() {
+        let cfg = config(DatabaseType::Ldap, None);
+        let params = agent_connect_params(&cfg, "ldap.example.com", 389, "").unwrap();
+        assert_eq!(params["read_only"], serde_json::Value::Bool(false));
+
+        let mut read_only_cfg = config(DatabaseType::Ldap, None);
+        read_only_cfg.read_only = true;
+        let params = agent_connect_params(&read_only_cfg, "ldap.example.com", 389, "").unwrap();
+        assert_eq!(params["read_only"], serde_json::Value::Bool(true));
     }
 
     #[test]

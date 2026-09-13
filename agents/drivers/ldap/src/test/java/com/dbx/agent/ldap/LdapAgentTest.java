@@ -152,6 +152,19 @@ class LdapAgentTest {
     }
 
     @Test
+    void isReadOnlyConnectionReflectsConnectFlag() {
+        assertFalse(LdapAgent.isReadOnlyConnection(null), "no connection cannot be read-only");
+        JsonObject plain = new JsonObject();
+        assertFalse(LdapAgent.isReadOnlyConnection(plain));
+        JsonObject flagged = new JsonObject();
+        flagged.addProperty("read_only", true);
+        assertTrue(LdapAgent.isReadOnlyConnection(flagged));
+        JsonObject explicitOff = new JsonObject();
+        explicitOff.addProperty("read_only", false);
+        assertFalse(LdapAgent.isReadOnlyConnection(explicitOff));
+    }
+
+    @Test
     void addWithoutAttributesReturnsError() {
         JsonObject params = new JsonObject();
         params.addProperty("dn", "cn=test," + BASE_DN);
@@ -783,6 +796,57 @@ class LdapAgentTest {
         if (gonePayload.has("result")) {
             assertEquals(0, gonePayload.getAsJsonObject("result").getAsJsonArray("entries").size(),
                 "entry should be deleted");
+        }
+    }
+
+    @Test
+    void integrationReadOnlyConnectionBlocksWrites() {
+        Assumptions.assumeTrue(serverReachable(), "LDAP server not reachable at " + LDAP_HOST + ":" + LDAP_PORT);
+
+        // Connect with the read_only flag the Rust bridge sends for
+        // read-only connections: searches must keep working.
+        JsonObject conn = new JsonObject();
+        conn.addProperty("hostname", LDAP_HOST);
+        conn.addProperty("port", LDAP_PORT);
+        conn.addProperty("security_protocol", "simple");
+        conn.addProperty("username", BIND_DN);
+        conn.addProperty("password", BIND_PASS);
+        conn.addProperty("read_only", true);
+        JsonObject connectParams = new JsonObject();
+        connectParams.add("connection", conn);
+        var connectPayload = JsonParser.parseString(
+            LdapAgent.handleRequest(writeOpRequest(300, "connect", connectParams))).getAsJsonObject();
+        assertTrue(connectPayload.has("result"), "Connect failed: " + connectPayload);
+
+        var searchPayload = JsonParser.parseString(
+            LdapAgent.handleRequest(searchRequest(301, USER_FILTER, 5))).getAsJsonObject();
+        assertTrue(searchPayload.has("result"), "Read-only connection must allow search: " + searchPayload);
+
+        // Every directory write is refused with a read-only error before it
+        // ever reaches the server.
+        for (String method : new String[]{"ldap_add", "ldap_modify", "ldap_delete", "ldap_rename"}) {
+            JsonObject params = new JsonObject();
+            params.addProperty("dn", USER_DN);
+            if (method.equals("ldap_add")) {
+                JsonObject attributes = new JsonObject();
+                attributes.addProperty("objectClass", "inetOrgPerson");
+                params.add("attributes", attributes);
+            } else if (method.equals("ldap_modify")) {
+                var mods = new com.google.gson.JsonArray();
+                JsonObject mod = new JsonObject();
+                mod.addProperty("op", "replace");
+                mod.addProperty("attribute", "cn");
+                mod.addProperty("values", "Should Not Apply");
+                mods.add(mod);
+                params.add("modifications", mods);
+            } else if (method.equals("ldap_rename")) {
+                params.addProperty("new_rdn", "uid=should-not-rename");
+            }
+            var payload = JsonParser.parseString(
+                LdapAgent.handleRequest(writeOpRequest(302, method, params))).getAsJsonObject();
+            assertTrue(payload.has("error"), method + " must be blocked on a read-only connection");
+            String message = payload.getAsJsonObject("error").get("message").getAsString();
+            assertTrue(message.contains("read-only"), method + " should report read-only, got: " + message);
         }
     }
 

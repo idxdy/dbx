@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/composables/useToast";
+import { useConnectionStore } from "@/stores/connectionStore";
 import * as api from "@/lib/backend/api";
 
 const { t } = useI18n();
@@ -17,6 +18,13 @@ const props = defineProps<{
   connectionId: string;
   dn: string;
 }>();
+
+const connectionStore = useConnectionStore();
+
+// Defense-in-depth: the toolbar buttons and sidebar menu items that open this
+// dialog are already disabled for read-only connections; guard here too so a
+// stale menu state or a future caller cannot bypass the flag.
+const readOnly = computed(() => Boolean((connectionStore.getConfig(props.connectionId) as any)?.read_only));
 
 const emit = defineEmits<{
   renamed: [newDn: string];
@@ -35,6 +43,10 @@ watch(open, (value) => {
 });
 
 async function save() {
+  if (readOnly.value) {
+    toast(t("ldap.readOnly"), 4000);
+    return;
+  }
   const rdn = newRdn.value.trim();
   if (!rdn || !rdn.includes("=")) {
     toast(t("ldap.invalidRdn"), 3000);
@@ -79,7 +91,7 @@ async function save() {
 
       <DialogFooter>
         <Button variant="outline" :disabled="saving" @click="open = false">{{ t("ldap.cancel") }}</Button>
-        <Button :disabled="saving" @click="save">{{ t("ldap.rename") }}</Button>
+        <Button :disabled="saving || readOnly" @click="save">{{ t("ldap.rename") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

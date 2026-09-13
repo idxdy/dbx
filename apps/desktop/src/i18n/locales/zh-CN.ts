@@ -5110,6 +5110,7 @@ export default withEnglishFallback({
     objectClassLocked: "objectClass 创建后不允许修改;如需更换条目类型请删除后重建",
     attributeNotAllowed: "所选 objectClass 不允许以下属性:{attribute}",
     writeSuccess: "LDAP 目录已更新",
+    readOnly: "当前连接为只读,无法执行写操作。",
     save: "保存",
     create: "创建",
     rename: "重命名",

@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/composables/useToast";
+import { useConnectionStore } from "@/stores/connectionStore";
 import * as api from "@/lib/backend/api";
 import { getOrFetchLdapConfig, getStructuralObjectClasses, getOptionalAttributes, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
 import { getLdapEditor } from "@/lib/ldap/ldapEditors";
@@ -22,6 +23,13 @@ const props = defineProps<{
   /** Parent DN under which the new entry is created. */
   parentDn: string;
 }>();
+
+const connectionStore = useConnectionStore();
+
+// Defense-in-depth: the toolbar buttons and sidebar menu items that open this
+// dialog are already disabled for read-only connections; guard here too so a
+// stale menu state or a future caller cannot bypass the flag.
+const readOnly = computed(() => Boolean((connectionStore.getConfig(props.connectionId) as any)?.read_only));
 
 const emit = defineEmits<{
   created: [dn: string];
@@ -170,6 +178,10 @@ function buildAttributes(): Record<string, string | string[]> | null {
 }
 
 async function save() {
+  if (readOnly.value) {
+    toast(t("ldap.readOnly"), 4000);
+    return;
+  }
   const rdnTrimmed = rdn.value;
   if (!rdnAttr.value.trim() || !rdnValue.value.trim()) {
     toast(t("ldap.invalidRdn"), 3000);
@@ -254,7 +266,7 @@ async function save() {
 
       <DialogFooter>
         <Button variant="outline" :disabled="saving" @click="open = false">{{ t("ldap.cancel") }}</Button>
-        <Button :disabled="saving || hasMissingRequired || hasInvalidAttributes" @click="save">{{ t("ldap.create") }}</Button>
+        <Button :disabled="saving || readOnly || hasMissingRequired || hasInvalidAttributes" @click="save">{{ t("ldap.create") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

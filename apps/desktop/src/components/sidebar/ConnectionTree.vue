@@ -137,6 +137,14 @@ const ldapDeleting = ref(false);
 
 async function confirmLdapDelete() {
   if (ldapDeleting.value) return;
+  // Defense-in-depth: the sidebar menu item is disabled for read-only
+  // connections; refuse here too in case the flag changed after the
+  // dialog was opened.
+  if (Boolean((store.getConfig(ldapEntryDialogState.connectionId) as any)?.read_only)) {
+    toast(t("ldap.readOnly"), 4000);
+    ldapEntryDialogState.deleteOpen = false;
+    return;
+  }
   ldapDeleting.value = true;
   try {
     const dn = ldapEntryDialogState.deleteDn;
