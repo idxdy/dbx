@@ -7711,6 +7711,7 @@ export default withEnglishFallback({
     mcpToolRemoveConnection: "Əlaqəni çıxar",
     mcpToolOpenTable: "Cədvəli DBX-də aç",
     mcpToolExecuteAndShow: "İcra et və DBX-də göstər",
+    mcpToolExecuteLdapSearch: "LDAP axtarışını icra et",
     supportInfoTitle: "Dəstək məlumatları",
     supportInfoDescription: "Problem bildirərkən və ya kömək istəyərkən bu mühit təfərrüatlarını kopyalayın.",
     supportInfoCopy: "Dəstək məlumatlarını kopyala",

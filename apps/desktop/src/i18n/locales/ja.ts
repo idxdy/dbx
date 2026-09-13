@@ -7503,6 +7503,7 @@ export default withEnglishFallback({
     mcpToolRemoveConnection: "接続を削除",
     mcpToolOpenTable: "DBX でテーブルを開く",
     mcpToolExecuteAndShow: "DBX で実行して表示",
+    mcpToolExecuteLdapSearch: "LDAP 検索を実行",
     updateDownloadSource: "アップデートのダウンロード元",
     updateDownloadSourceDescription: "アプリ内アップデートのインストーラーのダウンロード元を選択します。公式ソース推奨。中国本土ではCNBの方が高速な場合があります。",
     updateDownloadSourceOfficial: "公式ソース（推奨）",

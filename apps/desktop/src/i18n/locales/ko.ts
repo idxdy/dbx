@@ -7204,6 +7204,7 @@ export default withEnglishFallback({
     mcpToolRemoveConnection: "연결 삭제",
     mcpToolOpenTable: "DBX에서 테이블 열기",
     mcpToolExecuteAndShow: "DBX에서 실행 및 표시",
+    mcpToolExecuteLdapSearch: "LDAP 검색 실행",
     supportInfoTitle: "지원 정보",
     supportInfoDescription: "이슈를 등록하거나 도움을 요청할 때 이 환경 세부 정보를 복사하세요.",
     supportInfoCopy: "지원 정보 복사",

@@ -42,6 +42,7 @@ import {
   Monitor,
   Smartphone,
   Globe,
+  Lock,
 } from "@lucide/vue";
 import OracleDatabaseLinksDialog from "@/components/objects/OracleDatabaseLinksDialog.vue";
 const showDatabaseLinks = ref(false);

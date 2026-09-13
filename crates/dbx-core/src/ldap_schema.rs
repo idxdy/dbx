@@ -9,7 +9,6 @@
 use crate::connection::AppState;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Static fallback served when the server's schema cannot be retrieved.
 pub const STATIC_SCHEMA_JSON: &str = include_str!("../assets/ldap.json");

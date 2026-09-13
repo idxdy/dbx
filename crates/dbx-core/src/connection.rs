@@ -5695,6 +5695,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::InfluxDb(client) => PoolKind::InfluxDb(client.clone()),
         PoolKind::InfluxDb3(client) => PoolKind::InfluxDb3(client.clone()),
         PoolKind::VictoriaMetrics(client) => PoolKind::VictoriaMetrics(client.clone()),
+        PoolKind::Ldap(client) => PoolKind::Ldap(client.clone()),
         PoolKind::Agent(client) => PoolKind::Agent(client.clone()),
         PoolKind::ExternalDriver { driver_id, config, session } => {
             PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }

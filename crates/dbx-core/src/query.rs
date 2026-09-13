@@ -4472,6 +4472,7 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
         | PoolKind::InfluxDb(_)
         | PoolKind::InfluxDb3(_)
         | PoolKind::VictoriaMetrics(_)
+        | PoolKind::Ldap(_)
         | PoolKind::ExternalDriver { .. }
         | PoolKind::PluginConnection(_) => BatchTransactionPath::Unsupported,
     }

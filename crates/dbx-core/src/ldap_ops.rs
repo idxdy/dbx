@@ -218,8 +218,7 @@ enum LdapBackend {
 /// lookup in `dispatch_ldap_search`.
 async fn resolve_ldap_backend(state: &AppState, connection_id: &str) -> Result<LdapBackend, String> {
     state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    match connections.get(connection_id) {
+    match state.pool_handle(connection_id).await {
         Some(PoolKind::Ldap(client)) => Ok(LdapBackend::Native(client.clone())),
         Some(PoolKind::Agent(client)) => Ok(LdapBackend::Agent(client.clone())),
         _ => Err("Not an LDAP connection".to_string()),

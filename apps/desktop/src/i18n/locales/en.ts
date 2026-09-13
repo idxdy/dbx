@@ -7992,6 +7992,7 @@ export default {
     mcpToolRemoveConnection: "Remove connection",
     mcpToolOpenTable: "Open table in DBX",
     mcpToolExecuteAndShow: "Execute and show in DBX",
+    mcpToolExecuteLdapSearch: "Execute LDAP search",
     supportInfoTitle: "Support information",
     supportInfoDescription: "Copy these environment details when filing issues or asking for help.",
     supportInfoCopy: "Copy support info",

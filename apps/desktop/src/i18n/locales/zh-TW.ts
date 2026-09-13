@@ -6859,6 +6859,7 @@ export default withEnglishFallback({
     mcpToolRemoveConnection: "刪除連線",
     mcpToolOpenTable: "在 DBX 中開啟資料表",
     mcpToolExecuteAndShow: "在 DBX 中執行並顯示",
+    mcpToolExecuteLdapSearch: "執行 LDAP 搜尋",
     updateDownloadSource: "更新下載來源",
     updateDownloadSourceDescription: "選擇應用程式內更新安裝程式的下載來源。建議使用官方來源；CNB 在中國大陸網路環境下可能更快。",
     updateDownloadSourceOfficial: "官方來源（建議）",
