@@ -379,10 +379,8 @@ mod tests {
     use super::{api_path_suffix, auth_middleware, middleware_api_path_suffix};
     use crate::state::WebState;
     use axum::body::Body;
-    use axum::extract::State;
     use axum::http::{Request, StatusCode};
-    use axum::middleware::Next;
-    use axum::response::{IntoResponse, Response};
+    use axum::response::Response;
     use dbx_core::connection::AppState;
     use dbx_core::storage::Storage;
     use std::sync::Arc;

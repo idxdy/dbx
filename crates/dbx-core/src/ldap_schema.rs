@@ -336,7 +336,7 @@ pub fn parsed_object_classes_to_json(definitions: &[String]) -> Value {
 
     let inheritance_chain = |definition: &SchemaDefinition| -> Vec<String> {
         let mut chain: Vec<String> = definition.names.first().cloned().into_iter().collect();
-        let mut seen: Vec<String> = chain.iter().cloned().collect();
+        let mut seen: Vec<String> = chain.clone();
         let mut cursor = Some(definition);
         while let Some(current) = cursor {
             let superior = current.superior.first().map(|s| s.to_ascii_lowercase());
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn static_schema_is_valid_and_has_source_shape() {
         let schema = static_schema();
-        assert!(schema["objectClasses"].as_array().unwrap().len() > 0);
+        assert!(!schema["objectClasses"].as_array().unwrap().is_empty());
         assert!(schema["attributesEditor"].is_object());
     }
 

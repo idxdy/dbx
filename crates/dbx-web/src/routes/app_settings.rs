@@ -286,7 +286,6 @@ mod tests {
     fn preserves_four_gib_sql_file_upload_limit() {
         assert_eq!(sql_file_upload_max_bytes_from_mb(4096), 4096_u64 * 1024 * 1024);
     }
-    use super::{decrypt_config_payload, save_ldap_login_config, EncryptedConfigPayload};
     use crate::state::WebState;
     use axum::extract::State;
     use axum::http::StatusCode;
