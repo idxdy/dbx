@@ -304,14 +304,13 @@ async fn initializes_lists_tools_and_calls_a_tool() {
     let tools = client.peer().list_tools(None).await.expect("list tools");
     let names = tools.tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
     #[cfg(feature = "mq-admin")]
-    assert_eq!(names.len(), 19);
+    assert_eq!(names.len(), 20);
     #[cfg(not(feature = "mq-admin"))]
-    assert_eq!(names.len(), 17);
+    assert_eq!(names.len(), 18);
     #[cfg(feature = "mq-admin")]
     assert!(names.contains(&"dbx_peek_messages"));
     #[cfg(not(feature = "mq-admin"))]
     assert!(!names.contains(&"dbx_peek_messages"));
-    assert_eq!(names.len(), 14);
     assert!(names.contains(&"dbx_list_connections"));
     assert!(names.contains(&"dbx_list_databases"));
     assert!(names.contains(&"dbx_duplicate_connection"));

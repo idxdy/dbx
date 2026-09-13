@@ -2870,14 +2870,13 @@ mod tests {
         let tools = server.tool_router.list_all();
         let names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         #[cfg(feature = "mq-admin")]
         assert!(names.contains(&"dbx_peek_messages"));
         #[cfg(not(feature = "mq-admin"))]
         assert!(!names.contains(&"dbx_peek_messages"));
-        assert_eq!(tools.len(), 14);
         assert!(names.contains(&"dbx_list_connections"));
         assert!(names.contains(&"dbx_list_databases"));
         assert!(names.contains(&"dbx_list_tables"));
@@ -3124,10 +3123,9 @@ mod tests {
         );
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(names.len(), 12);
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 13);
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_duplicate_connection"));
         assert!(!names.iter().any(|name| name == "dbx_remove_connection"));
