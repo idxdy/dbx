@@ -12,11 +12,13 @@ import { expandToSqlStatementWindow } from "@/lib/sql/insertValueHints";
 import type { SqlSemanticBuildOptions, SqlSemanticSpan } from "@/lib/sql/semantic/types";
 import { isEditorStatePlausibleFor, resolveLexicalLeafFromSyntaxTree, resolveSqlStatementWindow } from "@/lib/sql/sqlSyntaxTreeWindow";
 import { DEFAULT_SQL_SNIPPETS, MANTICORESEARCH_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
+import { BACKSLASH_ESCAPE_STRING_DIALECTS } from "@/lib/sql/sqlStatementRanges";
 import { requiresMysqlIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { identifierMatchScore, matchesIdentifierSearch } from "@/lib/sql/identifierSearch";
 import { containsHan, orderedSubsequenceSpan, pinyinFirstLetters } from "@/lib/common/pinyin";
 import { quoteTableIdentifier } from "@/lib/table/tableSelectSql";
 import { driverProfileCompletionObjects, driverProfileCompletionTableMetadata, driverProfileCompletionTables, driverProfileRoutineSignatures } from "@/lib/database/driverProfileExtensions";
+import { DORIS_FUNCTION_DOCS, DORIS_FUNCTION_SIGNATURES } from "@/lib/sql/doris/functions";
 
 export { DEFAULT_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
 
@@ -381,6 +383,7 @@ const COMMON_SQL_KEYWORDS = [
 ];
 
 const POSTGRES_SQL_KEYWORDS = [
+  "COMMENT",
   "BIGSERIAL",
   "JSON",
   "JSONB",
@@ -409,11 +412,16 @@ const POSTGRES_SQL_KEYWORDS = [
   "JSONB_BUILD_OBJECT",
   "JSONB_AGG",
   "TO_JSONB",
+  "CURRENT_DATE",
+  "CURRENT_TIME",
   "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+  "LOCALTIMESTAMP",
 ];
 
 const MYSQL_SQL_KEYWORDS = [
   "AUTO_INCREMENT",
+  "COMMENT",
   "UNSIGNED",
   "ZEROFILL",
   "ENGINE",
@@ -576,6 +584,15 @@ const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   oracle: ORACLE_SQL_KEYWORDS,
   "oceanbase-oracle": ORACLE_SQL_KEYWORDS,
   manticoresearch: MANTICORESEARCH_SQL_KEYWORDS,
+  duckdb: ["COMMENT"],
+  clickhouse: ["COMMENT"],
+  doris: ["COMMENT", "MATERIALIZED", "MATERIALIZED VIEW", "DISTRIBUTED BY HASH", "DUPLICATE KEY", "AGGREGATE KEY", "UNIQUE KEY", "PRIMARY KEY", "PROPERTIES", "PARTITION BY", "BUCKETS", "LATERAL VIEW", "EXPLODE", "ARRAY", "MAP", "STRUCT", "BITMAP", "HLL"],
+  starrocks: ["COMMENT", "MATERIALIZED", "MATERIALIZED VIEW", "DISTRIBUTED BY HASH", "DUPLICATE KEY", "PROPERTIES", "PARTITION BY", "BUCKETS", "LATERAL VIEW"],
+  dameng: ["COMMENT"],
+  kingbase: ["COMMENT"],
+  vastbase: ["COMMENT"],
+  spark: ["COMMENT"],
+  iotdb: ["COMMENT"],
 };
 
 // Keywords that appear in nearly every SQL query — boosted so frequency beats length tie-breaking.
@@ -629,9 +646,11 @@ const JOIN_MODIFIERS = new Set(["left", "right", "inner", "outer", "cross", "ful
 const JOIN_MODIFIER_KEYWORD_PHRASES = ["LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "FULL JOIN", "CROSS JOIN", "NATURAL JOIN", "LEFT OUTER JOIN", "RIGHT OUTER JOIN", "FULL OUTER JOIN"];
 const MAX_TABLE_COMPLETION_ITEMS = 200;
 const EXACT_LABEL_MATCH_BOOST = 10000;
+const EXACT_CUSTOM_SNIPPET_TRIGGER_BOOST = 40000;
 
 function isTableTriggerKeyword(keyword: string, options: SqlSemanticBuildOptions): boolean {
-  return TABLE_TRIGGER_KEYWORDS.has(keyword) || (keyword === "desc" && resolveSqlDialectId(options) === "mysql");
+  const dialectId = resolveSqlDialectId(options);
+  return TABLE_TRIGGER_KEYWORDS.has(keyword) || (keyword === "desc" && (dialectId === "mysql" || dialectId === "doris"));
 }
 
 // Keywords that only make sense in DDL / statement-start contexts (not inside SELECT/INSERT/UPDATE/DELETE)
@@ -639,6 +658,7 @@ const DDL_ONLY_KEYWORDS = new Set([
   "CREATE",
   "ALTER",
   "DROP",
+  "COMMENT",
   "TABLE",
   "VIEW",
   "INDEX",
@@ -1067,6 +1087,9 @@ const SQLSERVER_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["ISNULL", ["expression", "replacement"]],
 ]);
 
+const SQLSERVER_DATEPART_FUNCTIONS = new Set(["DATEADD", "DATEDIFF", "DATEPART", "DATENAME"]);
+const SQLSERVER_DATEPART_VALUES = ["year", "quarter", "month", "dayofyear", "day", "week", "weekday", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond", "tzoffset", "iso_week"];
+
 const MANTICORESEARCH_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["MATCH", ["query"]],
   ["BM25F", ["field=weight", "...fields"]],
@@ -1110,6 +1133,8 @@ const DATABASE_FUNCTION_SIGNATURES: Partial<Record<DatabaseType, Map<string, str
   "cloudflare-d1": CLOUDFLARE_D1_FUNCTION_SIGNATURES,
   sqlserver: SQLSERVER_FUNCTION_SIGNATURES,
   manticoresearch: MANTICORESEARCH_FUNCTION_SIGNATURES,
+  doris: DORIS_FUNCTION_SIGNATURES,
+  starrocks: DORIS_FUNCTION_SIGNATURES,
 };
 
 const MYSQL_FUNCTION_APPLY_TEMPLATES = new Map<string, string>([
@@ -1288,6 +1313,10 @@ export interface SqlCompletionItem {
   boost: number;
   exactMatch?: boolean;
   dedupeKey?: string;
+  /** Enables the query editor's checkbox-based batch insertion for this column. */
+  batchSelectionMode?: "select" | "insert";
+  /** Qualifier to prepend to every batch-selected column after the first one. */
+  batchSelectionQualifier?: string;
 }
 
 export function shouldChainSqlCompletionAfterAccept(item: { type?: string; apply?: string }): boolean {
@@ -1301,7 +1330,7 @@ type SqlCompletionApplyDialect = "mysql" | "postgres" | "sqlserver" | "oracle" |
 // QueryEditor may use another dialect as a CodeMirror syntax fallback.
 // Completion apply text must still follow the connected database's identifier
 // folding and quoting rules.
-const MYSQL_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["mysql", "clickhouse", "hive", "kyuubi", "impala", "spark", "databend", "tdengine", "access", "doris", "starrocks"]);
+const MYSQL_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["mysql", "clickhouse", "hive", "argo", "kyuubi", "impala", "spark", "databend", "tdengine", "access", "doris", "starrocks"]);
 const POSTGRES_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kingbase", "highgo", "uxdb", "vastbase", "kwdb", "opengauss"]);
 const ORACLE_COMPAT_IDENTIFIER_DATABASES = new Set<DatabaseType>(["oracle", "oceanbase-oracle", "yashandb", "oscar", "xugu"]);
 const UPPER_FOLDING_IDENTIFIER_DATABASES = new Set<DatabaseType>(["dameng", "db2"]);
@@ -1335,6 +1364,7 @@ export type SqlCompletionContextKind = "table" | "schema" | "catalog" | "routine
 export interface SqlCompletionContext {
   prefix: string;
   replacementRange?: { start: number; end: number };
+  preferredValueKeywords?: string[];
   qualifier?: string;
   qualifierParts?: string[];
   suggestTables: boolean;
@@ -1515,11 +1545,22 @@ class SqlCompletionProvider {
       return dedupeAndSort(buildMongoCompletionItemsFromContext({ mode: "root", prefix: context.prefix, from: 0 }).map(mongoCompletionItemToSqlCompletionItem));
     }
 
+    const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
+    const customSnippetItems = buildSnippetItems(
+      context.prefix,
+      snippets.filter((snippet) => !shouldFormatBuiltinSnippet(snippet)),
+      this.input.keywordCase,
+      this.databaseType,
+    );
+    if (context.preferredValueKeywords?.length) {
+      return dedupeAndSort([...customSnippetItems, ...buildPreferredKeywordItems(context.prefix, context.preferredValueKeywords, this.input.keywordCase)]);
+    }
+
     const preferReferencedColumns = hasMatchingReferencedColumnPrefix(context, this.input.columnsByTable);
+    this.items.push(...customSnippetItems);
     if (!pendingJoinKeyword && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
-      const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
       if (!preferReferencedColumns) {
-        this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase, this.databaseType));
+        this.items.push(...buildSnippetItems(context.prefix, snippets.filter(shouldFormatBuiltinSnippet), this.input.keywordCase, this.databaseType));
       }
       if (!preferReferencedColumns || context.suggestRoutines) {
         const functionItems = context.dataTypeContext ? [] : buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType, context.openingParenAfterCursor, this.input.keywordCase, this.input.functionCase);
@@ -1635,26 +1676,26 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
   const previousChar = sql[cursor - 1];
   if (!previousChar) return false;
   if (/\bon\s+$/i.test(sql.slice(0, cursor))) return true;
-  if (isAfterJoinModifierContext(sql.slice(0, cursor))) return true;
+  if (isAfterJoinModifierContext(sql.slice(0, cursor), options.databaseType)) return true;
   if (/\bcall\s+(?:[A-Za-z_][\w$]*\.)?$/i.test(sql.slice(0, cursor))) return true;
   const context = getSqlCompletionContext(sql, cursor, options);
-  if (previousChar === "(" && context.insertTable) return true;
+  if (previousChar === "(" && (context.insertTable || context.preferredValueKeywords?.length)) return true;
   if (/[,;()[\]]/.test(previousChar)) return false;
   if (context.exclusiveTableSuggestions || context.exclusiveRoutineSuggestions || context.suggestTables) {
     return true;
   }
-  if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, sql, cursor)) return true;
+  if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, sql, cursor, options.databaseType)) return true;
   return /[A-Za-z_$@.]/.test(previousChar);
 }
 
-function shouldAutoOpenColumnCompletion(context: SqlCompletionContext, sql: string, cursor: number): boolean {
+function shouldAutoOpenColumnCompletion(context: SqlCompletionContext, sql: string, cursor: number, databaseType: DatabaseType | undefined): boolean {
   if (!context.suggestColumns || context.referencedTables.length === 0) return false;
   if (context.prefix.length > 0) return true;
-  return isColumnCompletionExpressionStart(sql.slice(0, cursor));
+  return isColumnCompletionExpressionStart(sql.slice(0, cursor), databaseType);
 }
 
-function isColumnCompletionExpressionStart(beforeCursor: string): boolean {
-  const cleaned = stripSqlLiterals(beforeCursor).trimEnd();
+function isColumnCompletionExpressionStart(beforeCursor: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeCursor, databaseType).trimEnd();
   if (!cleaned) return false;
   return /(?:\b(?:where|on|having|and|or|not|is|like|in|between|by)\b|[,(])$/i.test(cleaned);
 }
@@ -2202,7 +2243,9 @@ function skipSqlWhitespaceAndComments(sql: string, pos: number): number {
 export function getSqlCompletionContext(sql: string, cursor: number, options: SqlSemanticBuildOptions = {}): SqlCompletionContext {
   const statementSpan = sqlCompletionStatementSpan(sql, cursor, options);
   // Extract the full statement at cursor position for referenced tables
-  const fullStatement = sql.slice(statementSpan.start, statementSpan.end).trim();
+  const rawStatement = sql.slice(statementSpan.start, statementSpan.end);
+  const fullStatement = rawStatement.trim();
+  const cursorInStatement = cursor - statementSpan.start - (rawStatement.length - rawStatement.trimStart().length);
 
   // Content before cursor within the current statement
   const beforeCursor = sql.slice(statementSpan.start, cursor);
@@ -2215,10 +2258,10 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const beforeToken = beforeCursor.slice(0, Math.max(0, bareStart)).trimEnd();
   const lastWord = /([A-Za-z_][\w$]*)$/.exec(beforeToken)?.[1]?.toLowerCase() ?? "";
 
-  let referencedTables = extractReferencedTables(fullStatement, options.databaseType);
-
-  // Merge CTE definitions into referenced tables
-  const cteDefs = extractCteDefinitions(fullStatement);
+  // CTE bodies are their own scope: resolve them first so the outer query's
+  // referenced tables are read from a statement with those bodies blanked out.
+  const cteDefs = scanCteDefinitions(fullStatement);
+  let referencedTables = extractReferencedTables(maskResolvedCteBodies(fullStatement, cursorInStatement, cteDefs), options.databaseType);
   for (const cte of cteDefs) {
     if (!referencedTables.some((rt) => rt.name.toLowerCase() === cte.name.toLowerCase())) {
       referencedTables.push({ name: cte.name, columns: cte.columns });
@@ -2242,12 +2285,16 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const insertInfo = detectInsertColumnListContext(beforeCursor);
   const updateInfo = detectUpdateCompletionContext(beforeCursor);
   const deleteInfo = detectDeleteCompletionContext(beforeCursor);
-  const oracleTableFunctionContext = detectOracleTableFunctionContext(beforeCursor);
+  const oracleTableFunctionContext = detectOracleTableFunctionContext(beforeCursor, options.databaseType);
 
-  const afterTableTrigger = isTableTriggerKeyword(lastWord, options) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken);
-  const exclusiveTableSuggestions = EXCLUSIVE_TABLE_TRIGGER_KEYWORDS.has(lastWord) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken);
+  // Hoisted out of the three checks below: they previously called isInTableListContext with
+  // identical arguments three times, which was cheap when it was regex-based but now runs a full
+  // tokenizeSqlSemantic pass, so the duplicate work is worth avoiding.
+  const inTableListContext = isInTableListContext(beforeToken, options.databaseType);
+  const afterTableTrigger = isTableTriggerKeyword(lastWord, options) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || inTableListContext;
+  const exclusiveTableSuggestions = EXCLUSIVE_TABLE_TRIGGER_KEYWORDS.has(lastWord) || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || inTableListContext;
   const tableAliasAfterCursor = hasTableAliasAfterCursor(sql, cursor);
-  const autoAliasTableCompletions = (lastWord === "from" || lastWord === "join" || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || isInTableListContext(beforeToken)) && !tableAliasAfterCursor;
+  const autoAliasTableCompletions = (lastWord === "from" || lastWord === "join" || (JOIN_MODIFIERS.has(lastWord) && isFollowedByJoin(beforeToken)) || inTableListContext) && !tableAliasAfterCursor;
   const exclusiveColumnSuggestions = !!qualifier && !exclusiveTableSuggestions && !insertInfo;
   const activePrefixIsCte = cteDefs.some((cte) => normalizeIdentifierPart(cte.name) === normalizeIdentifierPart(prefix));
   if (exclusiveTableSuggestions && prefix && !activePrefixIsCte && referencedTables.length > 1) {
@@ -2265,8 +2312,9 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !updateInfo?.inSetClause && prefix.length >= 2);
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
-  const dataTypeContext = isCreateTableColumnTypeContext(beforeToken);
-  const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo);
+  const dataTypeContext = isCreateTableColumnTypeContext(beforeToken, options.databaseType);
+  const preferredValueKeywords = sqlServerDatepartCompletionValues(beforeCursor, options.databaseType);
+  const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo, options.databaseType);
   const contextKind = detectCompletionContextKind({
     qualifier,
     exclusiveTableSuggestions,
@@ -2284,6 +2332,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
 
   return {
     prefix,
+    preferredValueKeywords,
     qualifier: insertInfo ? undefined : qualifier,
     qualifierParts: insertInfo ? undefined : qualifierParts,
     suggestTables: insertInfo ? false : afterTableTrigger,
@@ -2320,8 +2369,15 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   };
 }
 
-function isCreateTableColumnTypeContext(beforeToken: string): boolean {
-  const cleaned = stripSqlLiterals(beforeToken);
+function sqlServerDatepartCompletionValues(beforeCursor: string, databaseType?: DatabaseType): string[] | undefined {
+  if (databaseType !== "sqlserver") return undefined;
+  const call = findActiveFunctionCall(beforeCursor);
+  if (!call || call.activeGroup !== 0 || !SQLSERVER_DATEPART_FUNCTIONS.has(call.name.toUpperCase())) return undefined;
+  return countTopLevelCommas(call.groupText) === 0 ? SQLSERVER_DATEPART_VALUES : undefined;
+}
+
+function isCreateTableColumnTypeContext(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeToken, databaseType);
   if (!/^\s*create\s+table\b/i.test(cleaned)) return false;
 
   const bodyStart = cleaned.indexOf("(");
@@ -2596,11 +2652,14 @@ function isInOrderOrGroupByContext(beforeCursor: string): boolean {
     .toLowerCase();
   const lastOrderBy = cleaned.lastIndexOf("order by");
   const lastGroupBy = cleaned.lastIndexOf("group by");
-  const lastContext = Math.max(lastOrderBy, lastGroupBy);
+  // MySQL (and DuckDB-like engines) also resolve SELECT aliases inside HAVING,
+  // so aliases stay visible there just like in ORDER BY/GROUP BY.
+  const lastHaving = cleaned.lastIndexOf("having");
+  const lastContext = Math.max(lastOrderBy, lastGroupBy, lastHaving);
   if (lastContext < 0) return false;
 
   const segment = cleaned.slice(lastContext);
-  return !/\b(?:where|having|limit|offset|union|intersect|except|join|from)\b/.test(segment);
+  return !/\b(?:where|limit|offset|union|intersect|except|join|from)\b/.test(segment);
 }
 
 function isInGroupByContext(beforeCursor: string): boolean {
@@ -2710,33 +2769,41 @@ function detectDeleteCompletionContext(beforeCursor: string): { target?: { table
   return { target, afterTarget: !afterTargetText || /^[A-Za-z_][\w$]*$/i.test(afterTargetText) };
 }
 
-function detectOracleTableFunctionContext(beforeCursor: string): boolean {
-  const cleaned = beforeCursor.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+function detectOracleTableFunctionContext(beforeCursor: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeCursor, databaseType);
   return /\b(?:from|join)\s+table\s*\(\s*(?:(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*)\.){0,2}[A-Za-z_][\w$]*$/i.test(cleaned);
 }
 
-function preferredKeywordsForCompletion(beforeCursor: string, beforeToken: string, selectListColumnContext: boolean, exclusiveTableSuggestions: boolean, updateInfo: ReturnType<typeof detectUpdateCompletionContext>, deleteInfo: ReturnType<typeof detectDeleteCompletionContext>): string[] {
+function preferredKeywordsForCompletion(
+  beforeCursor: string,
+  beforeToken: string,
+  selectListColumnContext: boolean,
+  exclusiveTableSuggestions: boolean,
+  updateInfo: ReturnType<typeof detectUpdateCompletionContext>,
+  deleteInfo: ReturnType<typeof detectDeleteCompletionContext>,
+  databaseType: DatabaseType | undefined,
+): string[] {
   const keywords: string[] = [];
-  if (selectListColumnContext && hasSelectListExpression(beforeCursor)) keywords.push("FROM");
-  if (isAfterJoinModifierContext(beforeCursor)) keywords.push("JOIN");
-  if (!exclusiveTableSuggestions && isAfterSelectBodyExpression(beforeToken)) keywords.push("LIMIT");
-  if (isAfterConditionExpression(beforeToken)) keywords.push("AND", "OR");
+  if (selectListColumnContext && hasSelectListExpression(beforeCursor, databaseType)) keywords.push("FROM");
+  if (isAfterJoinModifierContext(beforeCursor, databaseType)) keywords.push("JOIN");
+  if (!exclusiveTableSuggestions && isAfterSelectBodyExpression(beforeToken, databaseType)) keywords.push("LIMIT");
+  if (isAfterConditionExpression(beforeToken, databaseType)) keywords.push("AND", "OR");
   if (updateInfo?.afterTarget) keywords.push("SET");
   if (updateInfo?.afterSetAssignments) keywords.push("WHERE");
   if (deleteInfo?.afterTarget) keywords.push("WHERE");
   return keywords;
 }
 
-function hasSelectListExpression(beforeCursor: string): boolean {
-  const cleaned = stripSqlLiterals(beforeCursor).trimEnd();
+function hasSelectListExpression(beforeCursor: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeCursor, databaseType).trimEnd();
   const selectIndex = lastTopLevelKeywordIndex(cleaned, "select");
   if (selectIndex < 0) return false;
   const afterSelect = cleaned.slice(selectIndex + "select".length).trim();
   return !!afterSelect && !/^distinct\s*$/i.test(afterSelect);
 }
 
-function isAfterSelectBodyExpression(beforeToken: string): boolean {
-  const cleaned = stripSqlLiterals(beforeToken).trimEnd();
+function isAfterSelectBodyExpression(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeToken, databaseType).trimEnd();
   if (!/^\s*(?:with\b[\s\S]*\bselect\b|select\b)/i.test(cleaned)) return false;
   if (!/\bfrom\b/i.test(cleaned)) return false;
   if (/\b(?:limit|offset|union|intersect|except)\b/i.test(cleaned)) return false;
@@ -2749,16 +2816,16 @@ function isAfterSelectBodyExpression(beforeToken: string): boolean {
 const SELECT_BODY_INCOMPLETE_TAIL_KEYWORDS = new Set(["where", "and", "or", "not", "having", "group", "order", "by", "on", "is", "in", "like", "between", ...JOIN_MODIFIERS]);
 const CONDITION_INCOMPLETE_TAIL_KEYWORDS = new Set(["where", "and", "or", "not", "having", "on", "is", "in", "like", "between", "exists"]);
 
-function isAfterConditionExpression(beforeToken: string): boolean {
-  const cleaned = stripSqlLiterals(beforeToken).trimEnd();
+function isAfterConditionExpression(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeToken, databaseType).trimEnd();
   if (!hasActiveConditionClause(cleaned)) return false;
   const lastKeyword = /\b([A-Za-z_][\w$]*)\s*$/.exec(cleaned)?.[1]?.toLowerCase();
   if (lastKeyword && CONDITION_INCOMPLETE_TAIL_KEYWORDS.has(lastKeyword)) return false;
   return isExpressionTailComplete(cleaned);
 }
 
-function isAfterJoinModifierContext(beforeCursor: string): boolean {
-  const cleaned = stripSqlLiterals(beforeCursor).trimEnd();
+function isAfterJoinModifierContext(beforeCursor: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeCursor, databaseType).trimEnd();
   const modifier = /\b([A-Za-z_][\w$]*)\s*$/.exec(cleaned)?.[1]?.toLowerCase();
   if (!modifier || !JOIN_MODIFIERS.has(modifier)) return false;
 
@@ -2805,10 +2872,6 @@ function isExpressionTailComplete(sql: string): boolean {
   return /(?:\)|\]|\b(?:true|false|null)\b|`[^`]+`|"[^"]*"|''|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][\w$]*\b)$/i.test(trimmed);
 }
 
-function stripSqlLiterals(sql: string): string {
-  return sql.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-}
-
 function lastTopLevelKeywordIndex(sql: string, keyword: string): number {
   const lower = sql.toLowerCase();
   const target = keyword.toLowerCase();
@@ -2830,6 +2893,165 @@ function lastTopLevelKeywordIndex(sql: string, keyword: string): number {
     }
   }
   return lastIndex;
+}
+
+// Dialects whose unquoted identifiers are ANSI/ASCII-only in practice; matching a Unicode
+// unquoted token as a table reference there is a false-positive risk. Everything else defaults
+// to Unicode support (MySQL/Postgres/SQL Server/SQLite/DuckDB and the many Chinese-vendor
+// engines this product supports legitimately use non-ASCII unquoted identifiers).
+const ASCII_ONLY_UNQUOTED_IDENTIFIER_DATABASES = new Set<DatabaseType>(["clickhouse", "snowflake", "bigquery", "hive", "argo", "spark", "trino", "prestosql", "impala", "db2", "teradata"]);
+
+// Dialects where a bare "--" needs trailing whitespace/EOL to start a comment, since MySQL
+// reserves unspaced "--" for double-negation (e.g. `SELECT 1--1`). Scoped to mysql itself plus
+// its wire-protocol-compatible clones confirmed to share this exact parser quirk; other
+// MySQL-family members (hive, impala, spark, access, databend, tdengine, kyuubi) are left out
+// since their grammars aren't confirmed to share it, and the safe default (unchanged behavior,
+// bare "--" always starts a comment) is correct there.
+const MYSQL_DASH_COMMENT_DIALECTS = new Set<DatabaseType>(["mysql", "doris", "starrocks"]);
+
+// Dialects that use MySQL-style backslash escaping (`\'`) inside '...' strings by convention.
+// Deliberately a *different, wider* set than MYSQL_DASH_COMMENT_DIALECTS above: that one is
+// narrowly scoped to a confirmed MySQL-only parser quirk (the "--" double-negation rule), while
+// backslash escaping is a much more widely shared trait across MySQL's wire-protocol/grammar
+// lineage -- confirmed by a real regression where Hive (not in MYSQL_DASH_COMMENT_DIALECTS) lost
+// a table reference because its backslash-escaped string wasn't recognized. Not applied
+// unconditionally to every dialect: see readQuotedString's doc comment in semantic/tokens.ts for
+// why that's unsafe (a trailing backslash before a closing quote in a dialect that doesn't escape
+// it, e.g. a Postgres Windows-path string literal, would misread the real closing quote as
+// escaped and swallow the rest of the query).
+// The authoritative set lives in sqlStatementRanges.ts (the statement splitter depends on it too);
+// import it here to keep a single source of truth.
+
+// Table/schema/db unquoted-identifier continue class needs @ and # in addition to what
+// SQL_IDENTIFIER_CONTINUE_CHAR covers, so splice its inner class body into a locally-built class
+// instead of retyping the same Unicode escapes by hand.
+const TABLE_REF_UNQUOTED_CONTINUE_SOURCE = `[@#${SQL_IDENTIFIER_CONTINUE_CHAR.source.slice(1, -1)}]`;
+// The start class intentionally excludes '@' (unlike SQL_IDENTIFIER_START_CHAR, which includes
+// it for a different purpose at its own call sites), so it's kept as its own small literal.
+const TABLE_REF_UNQUOTED_START_SOURCE = "[_\\p{ID_Start}]";
+const TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE = `${TABLE_REF_UNQUOTED_START_SOURCE}${TABLE_REF_UNQUOTED_CONTINUE_SOURCE}*`;
+const TABLE_REF_UNQUOTED_IDENTIFIER_ASCII = "[A-Za-z_][\\w$@#]*";
+// Alias-group continue class is character-for-character identical to SQL_IDENTIFIER_CONTINUE_CHAR.
+const TABLE_REF_ALIAS_UNICODE = `${TABLE_REF_UNQUOTED_START_SOURCE}${SQL_IDENTIFIER_CONTINUE_CHAR.source}*`;
+const TABLE_REF_ALIAS_ASCII = "[A-Za-z_][\\w$]*";
+
+const TABLE_REF_QUOTED_IDENTIFIER = `(?:"[^"]+"|\`[^\`]+\`|\\[[^\\]]+\\])`;
+
+// Keywords that introduce a table reference, deduplicated into one array so buildTableRefPattern's
+// regex has a single source of truth instead of an inline copy.
+const TABLE_REF_INTRODUCER_KEYWORDS = ["from", "join", "straight_join", "update", "apply"];
+
+function buildTableRefPattern(unquotedIdentifier: string, aliasIdentifier: string, allowSqlServerDoubleDot: boolean): RegExp {
+  const identifier = `(?:${TABLE_REF_QUOTED_IDENTIFIER}|${unquotedIdentifier})`;
+  const qualifiedSeparator = allowSqlServerDoubleDot ? `\\.(?:${identifier}|\\.${identifier})` : `\\.${identifier}`;
+  return new RegExp(`\\b(?:${TABLE_REF_INTRODUCER_KEYWORDS.join("|")})\\s+(${identifier}(?:${qualifiedSeparator}){0,3})(?:\\s+(?:as\\s+)?(${aliasIdentifier}))?`, "giu");
+}
+
+// Precompiled once at module load (not per extractReferencedTables call) since this runs on
+// effectively every keystroke through the SQL editor's completion pipeline.
+const TABLE_REF_PATTERN_ASCII = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_ASCII, TABLE_REF_ALIAS_ASCII, false);
+const TABLE_REF_PATTERN_UNICODE_DEFAULT = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, false);
+const TABLE_REF_PATTERN_UNICODE_SQLSERVER = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, true);
+
+/**
+ * Masks string literals and comments so keyword/table-reference scanning never mistakes text
+ * inside them for real SQL (e.g. `'from 测试表'` or `-- from 测试表`). Built on
+ * tokenizeSqlSemantic's own dialect-aware scan (the same one used for statement-span/lexical-
+ * context detection elsewhere in this file) rather than a hand-rolled lexer, so backtick- and
+ * bracket-quoted identifier spans are skipped correctly for free.
+ *
+ * `"..."` is dialect-ambiguous: Postgres/SQL Server/generic always treat it as identifier
+ * quoting, while MySQL's own dialect adapter (see semantic/dialect.ts) also lists '"' as a valid
+ * identifierQuotes entry -- but only because MySQL *can* be run with the ANSI_QUOTES sql_mode.
+ * Under MySQL's actual default sql_mode (ANSI_QUOTES disabled) it's a plain string literal instead,
+ * with the exact same rules as `'...'`, everywhere in a statement: inside function arguments
+ * (`CONCAT("from ghost_table", name)`), CASE branches (`WHEN x THEN "from ghost_case"`), nested
+ * expressions, anywhere. There's no way for this code to observe the connected server's *actual*
+ * runtime sql_mode, so rather than guessing a dialect-wide default (and being wrong for whichever
+ * sql_mode isn't guessed), this resolves the ambiguity by *position* instead, for dialects in
+ * MYSQL_DASH_COMMENT_DIALECTS (MySQL itself plus confirmed sql_mode-parity wire-protocol clones --
+ * the same scope already used above for MySQL's other sql_mode-governed lexical quirks): a `"..."`
+ * span immediately in table-reference position -- right after one of
+ * TABLE_REF_INTRODUCER_KEYWORDS (`from`/`join`/`straight_join`/`update`/`apply`, exactly what
+ * extractReferencedTables's own regex looks for below), or a `.`-qualified continuation of one
+ * (`"db"."orders"`) -- is left unmasked as a potential identifier, matching ANSI_QUOTES-enabled
+ * MySQL. Every other `"..."` position (function args, CASE branches, operator-adjacent values, and
+ * everywhere else) is masked as a value, matching MySQL's actual default sql_mode. This is correct
+ * under *both* sql_modes at once: a real ANSI_QUOTES table name in `FROM "orders"` still resolves,
+ * while the ghost-table false positives this function exists to fix (`CONCAT("from ghost_table",
+ * ...)`, `CASE ... THEN "from ghost_case"`) stay masked regardless of the connected sql_mode.
+ *
+ * For every other dialect, where `"..."` unconditionally means identifier (Postgres, SQL Server's
+ * ANSI mode, generic), a `"..."` span right after an operator token (`=`, `<`, `<>`, `!=`, ...) is
+ * still masked as if it were a value: that position is unambiguous regardless of dialect (`col =
+ * "literal"` is never a quoted identifier there), so leaving it unmasked would misdetect e.g.
+ * Postgres's `WHERE note = "from ghost"` as a table reference. Every other position (right after
+ * FROM/JOIN, a `.` qualifier, a function's `(`, etc.) is left unmasked as a potential identifier for
+ * these dialects, same as before.
+ *
+ * The masked replacement doesn't need to preserve length or map back to offsets in `sql` --
+ * callers only read captured regex groups (or do their own keyword search) off the masked copy.
+ * It DOES need to preserve a non-whitespace trailing marker for string/value tokens though: most
+ * callers of this helper trim trailing whitespace and then look at the last character to decide
+ * whether an expression is "complete" (e.g. `isAfterConditionExpression`'s
+ * `isExpressionTailComplete`). Collapsing a trailing value to a single space would get eaten by
+ * that trim, exposing whatever came before it (e.g. the `=` in `WHERE x = "value"`) as if it were
+ * the real tail, wrongly reporting an in-progress/incomplete expression -- confirmed to wrongly
+ * suppress the AND/OR keyword suggestion after a perfectly complete condition. So string/masked
+ * value tokens are replaced with their own quote character doubled (`''` / `""`), mirroring the
+ * pre-existing convention this helper's predecessor (the regex-based `stripSqlLiterals`) already
+ * used for exactly this reason. Comments don't represent a value and are still collapsed to a
+ * single space -- getting trimmed away and exposing the real preceding tail is the correct
+ * behavior there (already covered by existing tests).
+ */
+function maskSqlLiteralsAndComments(sql: string, databaseType?: DatabaseType): string {
+  const dialectId = resolveSqlDialectId({ databaseType });
+  const mysqlFamily = !!databaseType && MYSQL_DASH_COMMENT_DIALECTS.has(databaseType);
+  const mysqlBackslashEscape = !!databaseType && BACKSLASH_ESCAPE_STRING_DIALECTS.has(databaseType);
+  // "..." always tokenizes as quoted_identifier here (never forced to "string") -- MySQL-family
+  // string-vs-identifier ambiguity is resolved below by token position instead, so the underlying
+  // scan doesn't need to guess a dialect-wide default. See this function's doc comment above.
+  const tokens = tokenizeSqlSemantic(sql, dialectId, { mysqlDashCommentRequiresWhitespace: mysqlFamily, mysqlBackslashEscape });
+
+  let out = "";
+  let cursor = 0;
+  // Tracks "the previous non-comment token was an operator" for the unconditional-identifier
+  // dialects' operator-adjacency fallback below -- a comment sitting between an operator and its
+  // value (e.g. `= /* x */ "from ghost"`) must not reset this, or the value right after the
+  // comment escapes masking.
+  let afterValueOperator = false;
+  // Tracks whether the *next* token sits in table-reference position (right after
+  // TABLE_REF_INTRODUCER_KEYWORDS, or a `.`-qualified continuation of one) for the MySQL-family
+  // position-based rule below. Survives comment tokens the same way afterValueOperator does --
+  // `FROM /* c */ "orders"` must still resolve "orders" as a table.
+  let tableRefState: "none" | "expectSegment" | "afterSegment" = "none";
+  for (const t of tokens) {
+    out += sql.slice(cursor, t.span.start);
+    const isDoubleQuotedIdentifier = t.kind === "quoted_identifier" && t.quote === '"';
+    const isTableRefSegment = tableRefState === "expectSegment" && (t.kind === "quoted_identifier" || t.kind === "word");
+    const maskAsValue = t.kind === "string" || (isDoubleQuotedIdentifier && (afterValueOperator || (mysqlFamily && !isTableRefSegment)));
+    if (t.kind === "comment") {
+      out += " ";
+    } else if (maskAsValue) {
+      out += (t.quote ?? '"').repeat(2);
+    } else {
+      out += sql.slice(t.span.start, t.span.end);
+    }
+    cursor = t.span.end;
+    afterValueOperator = t.kind === "operator" || (t.kind === "comment" && afterValueOperator);
+    if (t.kind !== "comment") {
+      tableRefState =
+        tableRefState === "expectSegment" && (t.kind === "quoted_identifier" || t.kind === "word")
+          ? "afterSegment"
+          : tableRefState === "afterSegment" && t.kind === "punctuation" && t.text === "."
+            ? "expectSegment"
+            : t.kind === "word" && TABLE_REF_INTRODUCER_KEYWORDS.includes(t.normalized)
+              ? "expectSegment"
+              : "none";
+    }
+  }
+  out += sql.slice(cursor);
+  return out;
 }
 
 function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlCompletionReferencedTable[] {
@@ -2939,13 +3161,23 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
   ]);
 
   // STRAIGHT_JOIN is a standalone MySQL table introducer, not a modifier followed by JOIN.
-  const unquotedIdentifier = databaseType === "sqlserver" ? "[_\\p{ID_Start}][$@#_\\u200c\\u200d\\p{ID_Continue}]*" : "[A-Za-z_][\\w$@#]*";
-  const identifier = `(?:"[^"]+"|\`[^\`]+\`|\\[[^\\]]+\\]|${unquotedIdentifier})`;
-  const qualifiedSeparator = databaseType === "sqlserver" ? `\\.(?:${identifier}|\\.${identifier})` : `\\.${identifier}`;
-  const pattern = new RegExp(`\\b(?:from|join|straight_join|update|apply)\\s+(${identifier}(?:${qualifiedSeparator}){0,3})(?:\\s+(?:as\\s+)?([A-Za-z_][\\w$]*))?`, databaseType === "sqlserver" ? "giu" : "gi");
+  // Unquoted identifiers may contain non-ASCII letters (e.g. Chinese/Japanese/Korean database,
+  // schema and table names are valid unquoted MySQL/Postgres/etc. identifiers) for dialects that
+  // actually support it — ANSI-strict dialects (ClickHouse, Snowflake, BigQuery, Hive/Spark/
+  // Trino/Presto/Impala, Db2, Teradata) keep the ASCII-only shape to avoid false-positive matches.
+  // An unresolved databaseType (e.g. a scratch editor before a connection is picked) also defaults
+  // to ASCII-only, matching this function's behavior before dialect-aware Unicode matching existed.
+  const pattern = !databaseType || ASCII_ONLY_UNQUOTED_IDENTIFIER_DATABASES.has(databaseType) ? TABLE_REF_PATTERN_ASCII : databaseType === "sqlserver" ? TABLE_REF_PATTERN_UNICODE_SQLSERVER : TABLE_REF_PATTERN_UNICODE_DEFAULT;
+  // These are shared module-level RegExp objects (built once for performance), so reset
+  // lastIndex before each scan rather than relying on a fresh object per call.
+  pattern.lastIndex = 0;
+  // Scan a masked copy so string literals and comments can never be mistaken for a real
+  // FROM/JOIN table reference; double-quoted table names survive masking (see
+  // maskSqlLiteralsAndComments), so the returned table info built from `match` is unaffected.
+  const scanSql = maskSqlLiteralsAndComments(sql, databaseType);
   const referenced: SqlCompletionReferencedTable[] = [];
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(sql)) !== null) {
+  while ((match = pattern.exec(scanSql)) !== null) {
     const rawName = match[1];
     const alias = match[2];
     if (alias && ALIAS_BLACKLIST.has(alias.toLowerCase())) {
@@ -3094,8 +3326,21 @@ function extractSelectColumnNames(sql: string): string[] {
   return names;
 }
 
-export function extractCteDefinitions(sql: string): Array<{ name: string; columns: string[] }> {
-  const ctes: Array<{ name: string; columns: string[] }> = [];
+interface ScannedCteDefinition {
+  name: string;
+  columns: string[];
+  /** Index of the `(` opening the CTE body. */
+  bodyStart: number;
+  /** Index of the `)` closing the CTE body. */
+  bodyEnd: number;
+}
+
+/**
+ * Scans `WITH` definitions, keeping each body's span so callers can tell which
+ * part of the statement belongs to a CTE rather than to the outer query.
+ */
+function scanCteDefinitions(sql: string): ScannedCteDefinition[] {
+  const ctes: ScannedCteDefinition[] = [];
   let lower = sql.toLowerCase();
   const withMatch = /\bwith\b/.exec(lower);
   if (!withMatch) return ctes;
@@ -3154,11 +3399,39 @@ export function extractCteDefinitions(sql: string): Array<{ name: string; column
       columns = extractSelectColumnNames(body);
     }
 
-    ctes.push({ name: cteName, columns });
+    ctes.push({ name: cteName, columns, bodyStart: pos, bodyEnd });
     pos = bodyEnd + 1;
   }
 
   return ctes;
+}
+
+export function extractCteDefinitions(sql: string): Array<{ name: string; columns: string[] }> {
+  return scanCteDefinitions(sql).map(({ name, columns }) => ({ name, columns }));
+}
+
+/**
+ * Blanks out CTE bodies whose projected columns are already known, so the outer
+ * query's referenced tables stay scoped to its own row sources. Without this the
+ * tables read inside a CTE (`WITH cte AS (SELECT id, name FROM t) SELECT na|`)
+ * would count as extra outer row sources and force every column suggestion to be
+ * qualified, hiding the bare `name` candidate the CTE actually provides.
+ *
+ * The body holding the cursor is never blanked -- completion inside a CTE body
+ * still needs that body's own tables -- and neither is a body whose columns could
+ * not be resolved (e.g. `SELECT *`), where the underlying table remains the only
+ * source of column names.
+ */
+function maskResolvedCteBodies(statement: string, cursorOffset: number, ctes: readonly ScannedCteDefinition[]): string {
+  let masked = statement;
+  for (const cte of ctes) {
+    if (cte.columns.length === 0) continue;
+    if (cursorOffset > cte.bodyStart && cursorOffset <= cte.bodyEnd) continue;
+    const bodyLength = cte.bodyEnd - cte.bodyStart - 1;
+    if (bodyLength <= 0) continue;
+    masked = `${masked.slice(0, cte.bodyStart + 1)}${" ".repeat(bodyLength)}${masked.slice(cte.bodyEnd)}`;
+  }
+  return masked;
 }
 
 function extractSubqueryReferences(sql: string): SqlCompletionReferencedTable[] {
@@ -3256,7 +3529,15 @@ function splitQualifiedNameRawParts(input: string): string[] {
       continue;
     }
     if (ch === "[" && !inDoubleQuote && !inBacktick) inBracket = true;
-    if (ch === "]" && inBracket) inBracket = false;
+    if (ch === "]" && inBracket) {
+      current += ch;
+      if (input[i + 1] === "]") {
+        current += input[++i];
+      } else {
+        inBracket = false;
+      }
+      continue;
+    }
     if (ch === "." && !inDoubleQuote && !inBacktick && !inBracket) {
       parts.push(current.trim());
       current = "";
@@ -3295,6 +3576,8 @@ export function quoteSqlIdentifier(identifier: string, dialect?: SqlCompletionAp
 }
 
 const POSTGRES_IDENTIFIER_KEYWORDS = new Set(SQL_KEYWORDS.map((keyword) => keyword.toLowerCase()));
+const SQLSERVER_IDENTIFIER_KEYWORDS = new Set(sqlDialectCompletionWords(MSSQL.spec.keywords).map((keyword) => keyword.toLowerCase()));
+const SQLSERVER_REGULAR_IDENTIFIER = /^[\p{L}_][\p{L}\p{Nd}_@$#]*$/u;
 
 // Unlike quoteSqlIdentifier (also used by the data grid condition editor, which
 // intentionally leaves MySQL identifiers unquoted and applies backticks itself
@@ -3305,14 +3588,19 @@ function quoteCompletionApplyIdentifier(identifier: string, dialect?: SqlComplet
     if (!requiresMysqlIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
     return `\`${identifier.replaceAll("`", "``")}\``;
   }
+  if (dialect === "sqlserver") {
+    if (SQLSERVER_REGULAR_IDENTIFIER.test(identifier) && !requiresMysqlIdentifierQuote(identifier.toLowerCase(), SQLSERVER_IDENTIFIER_KEYWORDS)) return identifier;
+    const escaped = identifier.replaceAll("]", "]]");
+    return `[${escaped}]`;
+  }
   return quoteSqlIdentifier(identifier, dialect);
 }
 
 function quoteCompletionApplyName(applyName: string, dialect?: SqlCompletionApplyDialect): string {
-  if (dialect !== "mysql" && dialect !== "oracle") return applyName;
+  if (dialect !== "mysql" && dialect !== "oracle" && dialect !== "sqlserver") return applyName;
   const parts = splitQualifiedNameRawParts(applyName);
   if (parts.length === 0) return applyName;
-  return parts.map((part) => (isQuotedIdentifier(part) ? part : quoteCompletionApplyIdentifier(part, dialect))).join(".");
+  return parts.map((part) => ((dialect === "sqlserver" && !part) || isQuotedIdentifier(part) ? part : quoteCompletionApplyIdentifier(part, dialect))).join(".");
 }
 
 function quoteCompletionRoutineIdentifier(identifier: string, dialect?: SqlCompletionApplyDialect): string {
@@ -3398,7 +3686,8 @@ function buildTableItems(
     .map((table) => {
       const qualifiedByContext = !!qualifierSchema && !!table.schema && normalizeIdentifierPart(qualifierSchema) === normalizeIdentifierPart(table.schema);
       const { ambiguousTableName, defaultApplyName } = resolveTableSchemaQualification(table, dialect, databaseType, currentSchema, schemasByTableName);
-      const suppliedApplyName = table.applyName?.trim();
+      const rawSuppliedApplyName = table.applyName?.trim();
+      const suppliedApplyName = dialect === "sqlserver" && rawSuppliedApplyName ? quoteCompletionApplyName(rawSuppliedApplyName, dialect) : rawSuppliedApplyName;
       const suppliedApplyNameIsQualified = suppliedApplyName?.includes(".") === true;
       const applyName = qualifiedByContext ? quoteCompletionApplyIdentifier(table.name, dialect) : ambiguousTableName && !!table.schema && (!suppliedApplyName || !suppliedApplyNameIsQualified) ? defaultApplyName : (suppliedApplyName ?? defaultApplyName);
       const alias = autoAliasTables ? generateTableCompletionAlias(table.name, existingAliases) : "";
@@ -4075,9 +4364,9 @@ function isFollowedByJoin(beforeToken: string): boolean {
   return second === "join" || JOIN_MODIFIERS.has(second ?? "");
 }
 
-function isInTableListContext(beforeToken: string): boolean {
+function isInTableListContext(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
   if (isInOrderOrGroupByContext(beforeToken)) return false;
-  const cleaned = activeQueryBlockSql(stripSqlLiterals(beforeToken).trimEnd());
+  const cleaned = activeQueryBlockSql(maskSqlLiteralsAndComments(beforeToken, databaseType).trimEnd());
   if (!/,\s*$/.test(cleaned)) return false;
 
   // Only commas in the active top-level table segment should continue table completion.
@@ -4269,6 +4558,8 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
     .sort((left, right) => right.boost - left.boost || left.index - right.index)
     .slice(0, context.insertTable || !context.prefix ? 50 : context.qualifier ? 30 : 20);
 
+  const batchSelectionMode = context.insertTable ? "insert" : context.statementKind === "select" && context.selectListColumnContext ? "select" : undefined;
+
   return rankedColumns.map(({ column, boost }) => {
     return {
       label: column.displayLabel,
@@ -4278,6 +4569,11 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
       info: buildColumnInfo(column),
       apply: buildColumnApply(column, context, dialect),
       boost,
+      batchSelectionMode,
+      // The first selected column keeps the qualifier already present in the
+      // document. Subsequent columns must use that same user-typed qualifier,
+      // not a referenced-table alias which may be different from it.
+      batchSelectionQualifier: batchSelectionMode === "select" && context.qualifier ? (context.qualifierParts ?? context.qualifier.split(".").filter(Boolean)).map((part) => quoteCompletionApplyIdentifier(part, dialect)).join(".") : undefined,
     };
   });
 }
@@ -4360,6 +4656,13 @@ function buildColumnDetail(column: SqlCompletionColumn): string {
   let detail = column.dataType ? `${tableInfo}  [${column.dataType}]` : tableInfo;
   if (column.isNullable === false) {
     detail += "  NOT NULL";
+  }
+  // Surface the column comment inline in the completion row (e.g. Chinese
+  // field notes) so it shows without opening the side info panel. This was
+  // dropped when qualified completion queries were optimized; keep it here.
+  const comment = column.comment?.trim();
+  if (comment) {
+    detail += `  -- ${comment}`;
   }
   return detail;
 }
@@ -4711,6 +5014,7 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
       const boostByPrefix = computeBoost(snippet.prefix, prefix);
       const boostByLabel = computeBoost(snippet.label, prefix);
       const matchesByPrefix = matchesPrefix(snippet.prefix, prefix);
+      const isExactCustomTrigger = !shouldFormatBuiltinSnippet(snippet) && snippet.prefix.toLowerCase() === prefix.toLowerCase();
       // When the user types past the snippet prefix (e.g. "sele" vs prefix "sel"),
       // they are likely typing the actual keyword — reduce the base boost so
       // the real keyword can rank higher.
@@ -4726,7 +5030,8 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
         type: "snippet" as const,
         detail: body,
         apply,
-        boost: Math.max(boostByPrefix, boostByLabel) + baseBoost,
+        exactMatch: isExactCustomTrigger || undefined,
+        boost: Math.max(boostByPrefix, boostByLabel) + baseBoost + (isExactCustomTrigger ? EXACT_CUSTOM_SNIPPET_TRIGGER_BOOST : 0),
       };
     });
 }
@@ -4739,6 +5044,13 @@ function activeFunctionSignatures(databaseType?: DatabaseType): Map<string, stri
     for (const [name, parameters] of databaseSignatures) signatures.set(name, parameters);
   }
   return signatures;
+}
+
+const DORIS_FUNCTION_DESCRIPTIONS = new Map(DORIS_FUNCTION_DOCS);
+const EMPTY_FUNCTION_DESCRIPTIONS = new Map<string, string>();
+
+function activeFunctionDescriptions(databaseType?: DatabaseType): Map<string, string> {
+  return databaseType === "doris" || databaseType === "starrocks" ? DORIS_FUNCTION_DESCRIPTIONS : EMPTY_FUNCTION_DESCRIPTIONS;
 }
 
 function formatFunctionSignatureApply(definition: ClickHouseFunctionDefinition, omitOpeningParen: boolean): string {
@@ -4791,7 +5103,7 @@ function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<str
     items.push({
       label: functionName,
       type: "function" as const,
-      detail: functionDescriptions.get(name) ?? "function",
+      detail: activeFunctionDescriptions(databaseType).get(name) ?? functionDescriptions.get(name) ?? "function",
       apply: mysqlApply ? `${functionName}${applyGeneratedSqlTemplateKeywordCase(mysqlApply.slice(name.length), keywordCase)}` : `${functionName}(${paramStr})`,
       boost: computeBoost(name, prefix) + 300,
     });
@@ -5070,12 +5382,20 @@ function computeBoost(candidate: string, prefix: string): number {
 }
 
 // --- History-based ranking ---
+const COMPLETION_STATS_MAX_ENTRIES = 512;
 const completionStats = new Map<string, number>();
 
 /** Record a user selection to boost future rankings. */
 export function recordCompletionSelection(label: string, type: string): void {
   const key = `${type}:${label}`;
-  completionStats.set(key, (completionStats.get(key) || 0) + 1);
+  const count = completionStats.get(key) || 0;
+  completionStats.delete(key);
+  completionStats.set(key, count + 1);
+  while (completionStats.size > COMPLETION_STATS_MAX_ENTRIES) {
+    const oldest = completionStats.keys().next().value;
+    if (oldest === undefined) break;
+    completionStats.delete(oldest);
+  }
 }
 
 function getHistoryBoost(label: string, type: string): number {

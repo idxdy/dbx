@@ -22,6 +22,7 @@ use dbx_core::connection::AppState;
 use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
 use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::Storage;
+use dbx_mcp::{streamable_http_router, DbxBackend, HttpAuth, LocalBackend};
 use state::WebState;
 use tokio::sync::RwLock;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
@@ -145,6 +146,56 @@ fn mount_public_base_path(mut app: Router, public_base_path: &str, static_dir: O
         app = app.route_service(&format!("{public_base_path}/"), ServeFile::new(static_dir.join("index.html")));
     }
     app
+}
+
+/// Builds the native Web MCP endpoint. It is intentionally opt-in: exposing a
+/// token-bearing MCP server on a Web listener must never happen merely because
+/// DBX Web itself was started.
+fn web_mcp_router(web_state: &Arc<WebState>) -> Result<Option<Router>, String> {
+    let token = web_mcp_token()?;
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let allowed_hosts = comma_separated_env("DBX_WEB_MCP_ALLOWED_HOSTS");
+    if allowed_hosts.is_empty() {
+        return Err("DBX_WEB_MCP_ALLOWED_HOSTS is required when DBX Web MCP is enabled".into());
+    }
+
+    let allowed_origins = comma_separated_env("DBX_WEB_MCP_ALLOWED_ORIGINS");
+    let auth = HttpAuth::new(token, allowed_origins, false)?;
+    let backend: Arc<dyn DbxBackend> =
+        Arc::new(LocalBackend::from_app_state(web_state.app.clone(), web_state.data_dir.clone()));
+
+    Ok(Some(streamable_http_router(backend, "/mcp", auth, allowed_hosts, true)))
+}
+
+fn web_mcp_token() -> Result<Option<String>, String> {
+    let inline_token = std::env::var("DBX_WEB_MCP_TOKEN").ok();
+    let token_file = std::env::var("DBX_WEB_MCP_TOKEN_FILE").ok();
+    match (inline_token, token_file) {
+        (Some(_), Some(_)) => Err("set only one of DBX_WEB_MCP_TOKEN or DBX_WEB_MCP_TOKEN_FILE".into()),
+        (Some(token), None) if !token.trim().is_empty() => Ok(Some(token)),
+        (Some(_), None) => Err("DBX_WEB_MCP_TOKEN must not be empty".into()),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read DBX_WEB_MCP_TOKEN_FILE: {error}"))
+            .map(|token| token.trim_end_matches(['\r', '\n']).to_owned())
+            .and_then(|token| {
+                (!token.is_empty()).then_some(token).ok_or_else(|| "DBX_WEB_MCP_TOKEN_FILE is empty".into())
+            })
+            .map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn comma_separated_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned).collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Load the app-level LDAP login configuration from the app settings and
@@ -371,9 +422,13 @@ async fn main() {
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
+        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/database-info", post(routes::connection::connected_database_info))
         .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
+        .route("/connection/write-unlock", post(routes::connection::unlock_connection_writes))
+        .route("/connection/write-unlock/lock", post(routes::connection::lock_connection_writes))
+        .route("/connection/write-unlock/state", post(routes::connection::connection_write_unlock_state))
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
@@ -446,6 +501,7 @@ async fn main() {
         .route("/schema/databases", get(routes::schema::list_databases))
         .route("/schema/database-metadata", get(routes::schema::list_database_metadata))
         .route("/schema/database-storage", post(routes::schema::list_database_storage))
+        .route("/schema/xugu/tablespaces", get(routes::schema::list_xugu_tablespaces))
         .route("/schema/sqlserver/completion-context", get(routes::schema::get_sqlserver_completion_context))
         .route("/schema/doris/catalogs", get(routes::schema::list_doris_catalogs))
         .route("/schema/doris/catalog-databases", get(routes::schema::list_doris_catalog_databases))
@@ -454,6 +510,7 @@ async fn main() {
         .route("/schema/sqlserver/linked-server-schemas", get(routes::schema::list_sqlserver_linked_server_schemas))
         .route("/schema/sqlserver/linked-server-tables", get(routes::schema::list_sqlserver_linked_server_tables))
         .route("/schema/sqlserver/column-metadata", get(routes::schema::get_sqlserver_column_metadata))
+        .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/objects", get(routes::schema::list_objects))
@@ -468,6 +525,7 @@ async fn main() {
         .route("/schema/data-types", get(routes::schema::list_data_types))
         .route("/schema/indexes", get(routes::schema::list_indexes))
         .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
+        .route("/schema/reference-keys", get(routes::schema::list_reference_keys))
         .route("/schema/foreign-keys", get(routes::schema::list_foreign_keys))
         .route("/schema/triggers", get(routes::schema::list_triggers))
         .route("/schema/constraints", get(routes::schema::list_constraints))
@@ -579,6 +637,7 @@ async fn main() {
             "/query/build-data-grid-copy-insert-statement",
             post(routes::query::build_data_grid_copy_insert_statement),
         )
+        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route(
             "/query/build-data-grid-context-filter-condition",
             post(routes::query::build_data_grid_context_filter_condition),
@@ -640,6 +699,7 @@ async fn main() {
         .route("/redis/rename-key", post(routes::redis::rename_key))
         .route("/redis/hash-set", post(routes::redis::hash_set))
         .route("/redis/hash-del", post(routes::redis::hash_del))
+        .route("/redis/hash-field-update", post(routes::redis::hash_field_update))
         .route("/redis/hash-field-set-ttl", post(routes::redis::hash_field_set_ttl))
         .route("/redis/hash-field-set-expire-at", post(routes::redis::hash_field_set_expire_at))
         .route("/redis/list-push", post(routes::redis::list_push))
@@ -654,6 +714,8 @@ async fn main() {
         .route("/redis/check-json-module", post(routes::redis::check_json_module))
         .route("/redis/set-ttl", post(routes::redis::set_ttl))
         .route("/redis/set-expire-at", post(routes::redis::set_expire_at))
+        .route("/redis/set-keys-ttl", post(routes::redis::set_keys_ttl))
+        .route("/redis/set-keys-expire-at", post(routes::redis::set_keys_expire_at))
         .route("/redis/delete-keys", post(routes::redis::delete_keys))
         .route("/redis/flush-db", post(routes::redis::flush_db))
         .route("/redis/execute-command", post(routes::redis::execute_command))
@@ -864,6 +926,14 @@ async fn main() {
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
         )
+        .route(
+            "/document-store/elasticsearch/index-metadata",
+            post(routes::document_store::elasticsearch_get_index_metadata),
+        )
+        .route(
+            "/document-store/elasticsearch/documents/delete-all",
+            post(routes::document_store::elasticsearch_delete_all_documents),
+        )
         .route("/document-store/list-gridfs-buckets", post(routes::document_store::list_gridfs_buckets))
         .route("/document-store/create-gridfs-bucket", post(routes::document_store::create_gridfs_bucket))
         .route("/document-store/delete-gridfs-bucket", post(routes::document_store::delete_gridfs_bucket))
@@ -923,6 +993,21 @@ async fn main() {
         .route("/mongo/find-one-and-update", post(routes::mongo::find_one_and_update))
         .route("/mongo/find-one-and-replace", post(routes::mongo::find_one_and_replace))
         .route("/mongo/find-one-and-delete", post(routes::mongo::find_one_and_delete))
+        .route(
+            "/mongo/import/preview",
+            post(routes::mongodb_import_export::preview_import).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/import/preview-source", post(routes::mongodb_import_export::preview_uploaded_import))
+        .route("/mongo/import/source/release", post(routes::mongodb_import_export::release_import_source))
+        .route("/mongo/import/execute", post(routes::mongodb_import_export::execute_import))
+        .route("/mongo/import/progress/{importId}", get(routes::mongodb_import_export::import_progress))
+        .route("/mongo/import/cancel", post(routes::mongodb_import_export::cancel_import))
+        .route("/mongo/export", post(routes::mongodb_import_export::start_export))
+        .route("/mongo/export/progress/{exportId}", get(routes::mongodb_import_export::export_progress))
+        .route("/mongo/export/download/{exportId}", get(routes::mongodb_import_export::export_download))
+        .route("/mongo/export/cancel", post(routes::mongodb_import_export::cancel_export))
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
@@ -1000,9 +1085,12 @@ async fn main() {
         .route(
             "/sql-file/preview",
             post(routes::sql_file::preview_sql_file)
-                .layer(DefaultBodyLimit::max(routes::sql_file::SQL_FILE_UPLOAD_MAX_BYTES.saturating_add(1024 * 1024))),
+                // Upper bound only; the effective (possibly lower) limit configured via
+                // Settings > SQL File Size is enforced inside the handler at request time.
+                .layer(DefaultBodyLimit::max(routes::sql_file::sql_file_upload_hard_cap_bytes())),
         )
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))
+        .route("/sql-file/tables", post(routes::sql_file::inspect_sql_file_tables))
         .route("/sql-file/progress/{executionId}", get(routes::sql_file::sql_file_progress))
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
         // Table import
@@ -1032,6 +1120,7 @@ async fn main() {
             "/app-settings/mcp-policy",
             get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
         )
+        .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
@@ -1039,6 +1128,11 @@ async fn main() {
         .route(
             "/app-settings/max-retries",
             get(routes::app_settings::load_max_retries).put(routes::app_settings::save_max_retries),
+        )
+        .route(
+            "/app-settings/sql-file-upload-max-bytes",
+            get(routes::app_settings::load_sql_file_upload_max_bytes)
+                .put(routes::app_settings::save_sql_file_upload_max_mb),
         )
         .route(
             "/app-settings/ldap-login",
@@ -1087,6 +1181,11 @@ async fn main() {
         .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
         .layer(CompressionLayer::new().compress_when(web_compression_predicate()))
         .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    if let Some(mcp_router) = web_mcp_router(&web_state).expect("Invalid DBX Web MCP configuration") {
+        app = app.merge(mcp_router);
+        tracing::info!("DBX Web MCP is enabled at /mcp");
+    }
 
     let static_dir = std::env::var_os("DBX_STATIC_DIR").map(std::path::PathBuf::from);
     app = mount_public_base_path(app, &public_base_path, static_dir.as_deref());

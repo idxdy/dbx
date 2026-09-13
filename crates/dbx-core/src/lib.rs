@@ -43,9 +43,12 @@ pub mod database_search_sql;
 pub mod db;
 pub mod db_admin_sql;
 pub mod dml_binding;
+pub mod dml_preview_sql;
 pub mod docs;
 pub mod document_ops;
 pub mod driver_runtime;
+pub mod export_runtime;
+pub mod export_split_zip;
 pub mod external;
 pub mod hbase_ops;
 pub mod history;
@@ -53,10 +56,12 @@ pub mod jdbc;
 pub mod ldap_login;
 pub mod ldap_ops;
 pub mod ldap_schema;
+pub mod mcp_policy;
 pub mod models;
 pub mod mongo_oidc;
 pub mod mongo_ops;
 pub mod mongo_shell;
+pub mod mongodb_import_export;
 #[cfg(feature = "mq-admin")]
 pub mod mq;
 #[cfg(feature = "mq-admin")]
@@ -106,9 +111,11 @@ pub mod temporal_format;
 pub mod text_export;
 pub mod token_usage;
 pub mod transfer;
+pub mod transfer_rebuild;
 pub mod two_phase_commit;
 pub mod types;
 pub mod update;
+pub mod write_unlock;
 pub mod xlsx_export;
 
 pub const R2_CDN_BASE: &str = "https://dl.dbxio.com/";

@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/url"
@@ -1182,6 +1183,27 @@ func TestBuildDSNUsesStableDefaultPrefetchRows(t *testing.T) {
 	}
 }
 
+func TestReadQuerySessionPageDoesNotLookAheadAfterFullPage(t *testing.T) {
+	db, _ := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{{
+		queryContains: "SELECT * FROM TEST_VIEW",
+		args:          []driver.Value{},
+		columns:       []string{"ID"},
+		rows:          [][]driver.Value{{int64(1)}, {int64(2)}},
+	}})
+	s := newServer()
+	s.db = db
+	result, err := s.executeQueryPage(queryOptions{SQL: "SELECT * FROM TEST_VIEW"}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 || !result.HasMore || result.SessionID == nil {
+		t.Fatalf("full page should keep a lazy session without look-ahead: %+v", result)
+	}
+	if !s.closeQuerySession(*result.SessionID) {
+		t.Fatal("expected the query session to close")
+	}
+}
+
 func TestBuildDSNPreservesConfiguredPrefetchRows(t *testing.T) {
 	tests := []connectParams{
 		{
@@ -2274,6 +2296,283 @@ func TestRewriteOracleXMLTypeNestedRownumQuery(t *testing.T) {
 	}
 }
 
+func TestRewriteOracleSTGeometrySelectStar(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT * FROM TEST_GEOM`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{
+				{Name: "ID", DataType: "NUMBER"},
+				{Name: "GEOM", DataType: "ST_GEOMETRY", DataTypeOwner: "SDE"},
+				{Name: "NOTE", DataType: "VARCHAR2"},
+			}, nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT "ID", SDE.ST_AsText("GEOM") AS "GEOM", "NOTE" FROM TEST_GEOM`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleSTGeometryExplicitColumn(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.GEOM AS shape FROM TEST_GEOM t`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{{Name: "GEOM", DataType: "ST_GEOMETRY", DataTypeOwner: "sde"}}, nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT SDE.ST_AsText(t."GEOM") AS shape FROM TEST_GEOM t`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleSTGeometryAsDeferredValue(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.ID, t.GEOM FROM TEST_GEOM t`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{
+				{Name: "ID", DataType: "NUMBER"},
+				{Name: "GEOM", DataType: "ST_GEOMETRY", DataTypeOwner: "SDE"},
+			}, nil
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT t.ID, CASE WHEN t."GEOM" IS NULL THEN NULL ELSE '<ST_GEOMETRY>' END AS "GEOM", CASE WHEN t."GEOM" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_C_1" FROM TEST_GEOM t`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestOracleSTGeometryRequiresSDEOwner(t *testing.T) {
+	if !isOracleSTGeometry(oracleColumnMeta{DataType: "ST_GEOMETRY", DataTypeOwner: "sDe"}) {
+		t.Fatal("expected SDE.ST_GEOMETRY to be recognized")
+	}
+	if isOracleSTGeometry(oracleColumnMeta{DataType: "ST_GEOMETRY", DataTypeOwner: "OTHER"}) {
+		t.Fatal("unexpected rewrite for an unrelated ST_GEOMETRY type")
+	}
+	if isOracleSTGeometry(oracleColumnMeta{DataType: "ST_GEOMETRY"}) {
+		t.Fatal("unexpected rewrite when the type owner is unknown")
+	}
+}
+
+func TestRewriteOracleSTGeometrySkipsSetQueries(t *testing.T) {
+	input := `SELECT GEOM FROM TEST_GEOM UNION ALL SELECT GEOM FROM TEST_GEOM`
+	sqlText, err := rewriteOracleSelectSQL(
+		input,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{{Name: "GEOM", DataType: "ST_GEOMETRY", DataTypeOwner: "SDE"}}, nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sqlText != input {
+		t.Fatalf("set query should remain unchanged, got: %s", sqlText)
+	}
+}
+
+func TestRewriteOracleSDOGeometrySelectStar(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT * FROM TEST_GEOM`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{
+				{Name: "ID", DataType: "NUMBER"},
+				{Name: "GEOM", DataType: "SDO_GEOMETRY", DataTypeOwner: "PUBLIC"},
+				{Name: "NOTE", DataType: "VARCHAR2"},
+			}, nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT "ID", SDO_UTIL.TO_WKTGEOMETRY("GEOM") AS "GEOM", "NOTE" FROM TEST_GEOM`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleSDOGeometryExplicitColumn(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.GEOM AS shape FROM TEST_GEOM t`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{{Name: "GEOM", DataType: "SDO_GEOMETRY", DataTypeOwner: "PUBLIC"}}, nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT SDO_UTIL.TO_WKTGEOMETRY(t."GEOM") AS shape FROM TEST_GEOM t`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleSDOGeometryAsDeferredValue(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.ID, t.GEOM FROM TEST_GEOM t`,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			return []oracleColumnMeta{
+				{Name: "ID", DataType: "NUMBER"},
+				{Name: "GEOM", DataType: "SDO_GEOMETRY", DataTypeOwner: "PUBLIC"},
+			}, nil
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT t.ID, CASE WHEN t."GEOM" IS NULL THEN NULL ELSE '<SDO_GEOMETRY>' END AS "GEOM", CASE WHEN t."GEOM" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_C_1" FROM TEST_GEOM t`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestOracleSDOGeometryDoesNotRequireOwner(t *testing.T) {
+	if !isOracleSDOGeometry(oracleColumnMeta{DataType: "SDO_GEOMETRY", DataTypeOwner: "PUBLIC"}) {
+		t.Fatal("expected SDO_GEOMETRY via PUBLIC synonym to be recognized")
+	}
+	if !isOracleSDOGeometry(oracleColumnMeta{DataType: "sdo_geometry"}) {
+		t.Fatal("expected SDO_GEOMETRY to be recognized regardless of owner or case")
+	}
+	if isOracleSDOGeometry(oracleColumnMeta{DataType: "VARCHAR2"}) {
+		t.Fatal("unexpected rewrite for an unrelated data type")
+	}
+}
+
+func TestIsOracleExtprocAgentFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "ORA-28595 with SDE package context",
+			err:  errors.New(`ORA-28595: Extproc agent: Invalid DLL Path SDE.ST_GEOMETRY_SHAPELIB_PKG`),
+			want: true,
+		},
+		{
+			name: "ORA-28595 with operator package context",
+			err:  errors.New(`ORA-28595: Extproc agent: Invalid DLL Path SDE.ST_GEOMETRY_OPERATORS`),
+			want: true,
+		},
+		{
+			name: "lowercase ORA-28595",
+			err:  errors.New("ora-28595: extproc agent: invalid dll path"),
+			want: true,
+		},
+		{
+			name: "bare ORA code",
+			err:  errors.New("28595: Extproc agent: Invalid DLL Path"),
+			want: true,
+		},
+		{
+			name: "wrapped ORA-28595",
+			err:  fmt.Errorf("query failed: %w", errors.New("ORA-28595: Extproc agent: Invalid DLL Path")),
+			want: true,
+		},
+		{
+			name: "unrelated ORA error",
+			err:  errors.New("ORA-00942: table or view does not exist"),
+			want: false,
+		},
+		{
+			name: "connection error",
+			err:  errors.New("ORA-12170: TNS:Connect timeout occurred"),
+			want: false,
+		},
+		{
+			name: "SDE package without ORA-28595",
+			err:  errors.New("SDE.ST_GEOMETRY_SHAPELIB_PKG raised an error"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isOracleExtprocAgentFailure(tc.err); got != tc.want {
+				t.Fatalf("isOracleExtprocAgentFailure(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOracleExtprocFallbackSQL(t *testing.T) {
+	sdeColumns := func(schema, table string) ([]oracleColumnMeta, error) {
+		return []oracleColumnMeta{
+			{Name: "ID", DataType: "NUMBER"},
+			{Name: "GEOM", DataType: "ST_GEOMETRY", DataTypeOwner: "SDE"},
+		}, nil
+	}
+	t.Run("returns placeholder projection for extproc failure", func(t *testing.T) {
+		sqlText, ok := oracleExtprocFallbackSQL(
+			`SELECT * FROM SDE.TEST_GEOM`,
+			sdeColumns,
+			errors.New("ORA-28595: Extproc agent: Invalid DLL Path"),
+		)
+		if !ok {
+			t.Fatal("expected placeholder fallback SQL")
+		}
+		if !strings.Contains(sqlText, "'<ST_GEOMETRY>'") {
+			t.Fatalf("expected placeholder expression, got %s", sqlText)
+		}
+		if strings.Contains(sqlText, "SDE.ST_AsText") {
+			t.Fatalf("placeholder projection must not call SDE.ST_AsText, got %s", sqlText)
+		}
+	})
+	t.Run("keeps ST_AsText error for unrelated failures", func(t *testing.T) {
+		sqlText, ok := oracleExtprocFallbackSQL(
+			`SELECT * FROM SDE.TEST_GEOM`,
+			sdeColumns,
+			errors.New("ORA-12170: TNS:Connect timeout occurred"),
+		)
+		if ok {
+			t.Fatalf("unexpected fallback SQL: %s", sqlText)
+		}
+	})
+	t.Run("no fallback without rewriteable columns", func(t *testing.T) {
+		sqlText, ok := oracleExtprocFallbackSQL(
+			`SELECT * FROM SDE.TEST_GEOM`,
+			func(schema, table string) ([]oracleColumnMeta, error) {
+				return []oracleColumnMeta{{Name: "ID", DataType: "NUMBER"}}, nil
+			},
+			errors.New("ORA-28595: Extproc agent: Invalid DLL Path"),
+		)
+		if ok {
+			t.Fatalf("unexpected fallback SQL: %s", sqlText)
+		}
+	})
+	t.Run("no fallback when column metadata fails", func(t *testing.T) {
+		sqlText, ok := oracleExtprocFallbackSQL(
+			`SELECT * FROM SDE.TEST_GEOM`,
+			func(schema, table string) ([]oracleColumnMeta, error) {
+				return nil, errors.New("ORA-00942: table or view does not exist")
+			},
+			errors.New("ORA-28595: Extproc agent: Invalid DLL Path"),
+		)
+		if ok {
+			t.Fatalf("unexpected fallback SQL: %s", sqlText)
+		}
+	})
+}
+
 func TestRewriteOracleXMLTypeSkipsJoins(t *testing.T) {
 	called := false
 	sqlText, err := rewriteOracleXMLTypeSelectSQL(
@@ -2534,6 +2833,130 @@ func TestGetObjectSourceUsesDBMSMetadataForSequence(t *testing.T) {
 	}
 }
 
+func TestGetObjectSourceUsesDBMSMetadataForMaterializedView(t *testing.T) {
+	const ddl = `CREATE MATERIALIZED VIEW "HR"."SALES_MV" AS SELECT * FROM "HR"."SALES"`
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_METADATA.GET_DDL(:1, :2, :3)",
+			args:          []driver.Value{"MATERIALIZED_VIEW", "SALES_MV", "HR"},
+			rows:          [][]driver.Value{{ddl}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("HR", "SALES_MV", "MATERIALIZED_VIEW")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["source"] != ddl || result["object_type"] != "MATERIALIZED_VIEW" {
+		t.Fatalf("unexpected materialized view source: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetObjectSourcePropagatesMaterializedViewMetadataError(t *testing.T) {
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_METADATA.GET_DDL(:1, :2, :3)",
+			args:          []driver.Value{"MATERIALIZED_VIEW", "SALES_MV", "HR"},
+			err:           errors.New("ORA-31603: object not found"),
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("HR", "SALES_MV", "MATERIALIZED_VIEW")
+	if err == nil || !strings.Contains(err.Error(), "ORA-31603") {
+		t.Fatalf("expected DBMS_METADATA error, got result=%#v error=%v", result, err)
+	}
+	if result != nil {
+		t.Fatalf("metadata error must not return a successful source: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetObjectSourceAggregatesProcedureSourceInOracle(t *testing.T) {
+	const source = "PROCEDURE DBX_LARGE_SOURCE AS\nBEGIN\n  -- preserve <xml> & special characters\n  NULL;\nEND;"
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_XMLGEN.CONVERT",
+			args:          []driver.Value{"DBX_TEST", "DBX_LARGE_SOURCE", "PROCEDURE"},
+			rows:          [][]driver.Value{{source}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("DBX_TEST", "DBX_LARGE_SOURCE", "PROCEDURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["source"] != source || result["object_type"] != "PROCEDURE" {
+		t.Fatalf("unexpected procedure source: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetObjectSourceReturnsEmptyWhenAggregatedSourceIsNull(t *testing.T) {
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_XMLGEN.CONVERT",
+			args:          []driver.Value{"DBX_TEST", "MISSING_PROC", "PROCEDURE"},
+			rows:          [][]driver.Value{{nil}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("DBX_TEST", "MISSING_PROC", "PROCEDURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["source"] != "" {
+		t.Fatalf("missing procedure source should be empty: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetObjectSourceFallsBackWhenOracleAggregationFails(t *testing.T) {
+	const firstLine = "PROCEDURE DBX_SOURCE_FALLBACK AS\n"
+	const secondLine = "BEGIN NULL; END;"
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_XMLGEN.CONVERT",
+			args:          []driver.Value{"DBX_TEST", "DBX_SOURCE_FALLBACK", "PROCEDURE"},
+			err:           errors.New("ORA-19011: Character string buffer too small"),
+		},
+		{
+			queryContains: "SELECT TEXT",
+			args:          []driver.Value{"DBX_TEST", "DBX_SOURCE_FALLBACK", "PROCEDURE"},
+			rows:          [][]driver.Value{{firstLine}, {secondLine}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("DBX_TEST", "DBX_SOURCE_FALLBACK", "PROCEDURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["source"] != firstLine+secondLine {
+		t.Fatalf("unexpected fallback procedure source: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
 func TestGetObjectSourcePreservesQuotedSynonymName(t *testing.T) {
 	const synonym = "MixedSynonym"
 	const ddl = `CREATE OR REPLACE EDITIONABLE SYNONYM "AP"."MixedSynonym" FOR "ADM"."S_SPECS"`
@@ -2639,12 +3062,15 @@ func contains(values []string, target string) bool {
 }
 
 type oracleViewSourceQueryStep struct {
-	queryContains string
-	args          []driver.Value
-	columns       []string
-	rows          [][]driver.Value
-	err           error
-	exec          bool
+	queryContains    string
+	args             []driver.Value
+	columns          []string
+	rows             [][]driver.Value
+	err              error
+	exec             bool
+	panicText        string
+	nextPanicText    string
+	columnsPanicText string
 }
 
 type oracleViewSourceDriver struct {
@@ -2688,6 +3114,9 @@ func (c *oracleViewSourceConn) QueryContext(
 	if !strings.Contains(query, step.queryContains) {
 		return nil, errors.New("unexpected query: " + query)
 	}
+	if step.panicText != "" {
+		panic(step.panicText)
+	}
 	values := make([]driver.Value, len(args))
 	for index, arg := range args {
 		values[index] = arg.Value
@@ -2702,7 +3131,12 @@ func (c *oracleViewSourceConn) QueryContext(
 	if len(columns) == 0 {
 		columns = []string{"SOURCE"}
 	}
-	return &oracleViewSourceRows{columns: columns, values: step.rows}, nil
+	return &oracleViewSourceRows{
+		columns:          columns,
+		values:           step.rows,
+		nextPanicText:    step.nextPanicText,
+		columnsPanicText: step.columnsPanicText,
+	}, nil
 }
 
 func (c *oracleViewSourceConn) ExecContext(
@@ -2732,12 +3166,17 @@ func (c *oracleViewSourceConn) ExecContext(
 }
 
 type oracleViewSourceRows struct {
-	columns []string
-	values  [][]driver.Value
-	next    int
+	columns          []string
+	values           [][]driver.Value
+	next             int
+	nextPanicText    string
+	columnsPanicText string
 }
 
 func (r *oracleViewSourceRows) Columns() []string {
+	if r.columnsPanicText != "" {
+		panic(r.columnsPanicText)
+	}
 	return r.columns
 }
 
@@ -2746,6 +3185,9 @@ func (r *oracleViewSourceRows) Close() error {
 }
 
 func (r *oracleViewSourceRows) Next(dest []driver.Value) error {
+	if r.nextPanicText != "" {
+		panic(r.nextPanicText)
+	}
 	if r.next >= len(r.values) {
 		return io.EOF
 	}
@@ -2843,6 +3285,24 @@ func (r *oracleFastRows) Next(dest []driver.Value) error {
 	return nil
 }
 
+type oraclePanicDriver struct{}
+
+func (d *oraclePanicDriver) Open(string) (driver.Conn, error) {
+	return &oraclePanicConn{}, nil
+}
+
+type oraclePanicConn struct{}
+
+func (c *oraclePanicConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("use QueryContext directly")
+}
+func (c *oraclePanicConn) Close() error              { return nil }
+func (c *oraclePanicConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+
+func (c *oraclePanicConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	panic("simulated go-ora panic")
+}
+
 // -- timeout tests --
 
 func TestOracleDMLCancelInterruptsExecContext(t *testing.T) {
@@ -2914,6 +3374,234 @@ func TestOracleCursorSurvivesDeadlineWindow(t *testing.T) {
 	}
 	if rowCount != 3 {
 		t.Fatalf("expected 3 rows, got %d", rowCount)
+	}
+}
+
+func TestOracleQueryRowsRecoversDriverPanic(t *testing.T) {
+	driverName := "oracle-test-panic-" + strings.ReplaceAll(t.Name(), "/", "-")
+	sql.Register(driverName, &oraclePanicDriver{})
+	db, err := sql.Open(driverName, "dsn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	s := newServer()
+	s.db = db
+	rows, err := s.queryRowsWithTimeout("SELECT geom FROM test", nil, 1)
+	if rows != nil {
+		t.Fatal("panic path must not return rows")
+	}
+	var panicErr oracleDriverPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("expected oracle driver panic error, got %v", err)
+	}
+	s.activeCancelMu.Lock()
+	defer s.activeCancelMu.Unlock()
+	if s.activeCancel != nil || s.activeTimer != nil || len(s.activeRows) != 0 {
+		t.Fatalf("panic cleanup left active query state: cancel=%v timer=%v rows=%d", s.activeCancel != nil, s.activeTimer != nil, len(s.activeRows))
+	}
+}
+
+func TestOracleQueryRowsFallsBackToPlaceholderOnExtprocFailure(t *testing.T) {
+	metadataStep := oracleViewSourceQueryStep{
+		queryContains: "ALL_TAB_COLUMNS",
+		args:          []driver.Value{"SDE", "TEST_GEOM"},
+		columns:       []string{"COLUMN_NAME", "DATA_TYPE", "DATA_TYPE_OWNER"},
+		rows: [][]driver.Value{
+			{"ID", "NUMBER", nil},
+			{"GEOM", "ST_GEOMETRY", "SDE"},
+		},
+	}
+	db, _ := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{queryContains: "SELECT * FROM SDE.TEST_GEOM", args: []driver.Value{}, panicText: "simulated go-ora panic on SDE object column"},
+		metadataStep,
+		{queryContains: "SDE.ST_AsText", args: []driver.Value{}, err: errors.New("ORA-28595: Extproc agent: Invalid DLL Path")},
+		metadataStep,
+		{
+			queryContains: "'<ST_GEOMETRY>'",
+			args:          []driver.Value{},
+			columns:       []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"},
+			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>", "D:1"}},
+		},
+	})
+	s := newServer()
+	s.db = db
+	rows, err := s.queryRowsWithOracleValueRewriteIfNeeded("SELECT * FROM SDE.TEST_GEOM", 0, false)
+	if err != nil {
+		t.Fatalf("expected placeholder fallback to serve rows, got %v", err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(columns, []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"}) {
+		t.Fatalf("unexpected placeholder columns: %v", columns)
+	}
+	if !rows.Next() {
+		t.Fatalf("expected one placeholder row, got %v", rows.Err())
+	}
+	var id int64
+	var geom, marker string
+	if err := rows.Scan(&id, &geom, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if id != 1 || geom != "<ST_GEOMETRY>" || marker != "D:1" {
+		t.Fatalf("unexpected placeholder row: %v %v %v", id, geom, marker)
+	}
+}
+
+func TestOracleQueryRowsKeepsSTAsTextErrorWhenPlaceholderAlsoFails(t *testing.T) {
+	metadataStep := oracleViewSourceQueryStep{
+		queryContains: "ALL_TAB_COLUMNS",
+		args:          []driver.Value{"SDE", "TEST_GEOM"},
+		columns:       []string{"COLUMN_NAME", "DATA_TYPE", "DATA_TYPE_OWNER"},
+		rows: [][]driver.Value{
+			{"ID", "NUMBER", nil},
+			{"GEOM", "ST_GEOMETRY", "SDE"},
+		},
+	}
+	db, _ := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{queryContains: "SELECT * FROM SDE.TEST_GEOM", args: []driver.Value{}, panicText: "simulated go-ora panic on SDE object column"},
+		metadataStep,
+		{queryContains: "SDE.ST_AsText", args: []driver.Value{}, err: errors.New("ORA-28595: Extproc agent: Invalid DLL Path")},
+		metadataStep,
+		{queryContains: "'<ST_GEOMETRY>'", args: []driver.Value{}, err: errors.New("ORA-01013: user requested cancel of current operation")},
+	})
+	s := newServer()
+	s.db = db
+	rows, err := s.queryRowsWithOracleValueRewriteIfNeeded("SELECT * FROM SDE.TEST_GEOM", 0, false)
+	if rows != nil {
+		t.Fatal("failed fallback path must not return rows")
+	}
+	if err == nil || !strings.Contains(err.Error(), "ORA-28595") {
+		t.Fatalf("expected the original ST_AsText ORA-28595 error, got %v", err)
+	}
+}
+
+func TestReadQuerySessionPageConvertsPanicToError(t *testing.T) {
+	// A nil *sql.Rows makes rows.Next() panic with a nil pointer dereference,
+	// which stands in for go-ora panicking while decoding an unknown type.
+	session := &querySession{rows: nil, columns: []string{"A"}, columnTypes: []string{"NUMBER"}, remaining: 1}
+	result, err := readQuerySessionPage(session, 10)
+	var panicErr oracleDriverPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("expected oracle driver panic error, got %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("panic path must not return rows, got %v", result.Rows)
+	}
+}
+
+func TestExecuteQueryPageRetriesWithPlaceholderOnRowIterationPanic(t *testing.T) {
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "SELECT * FROM SDE.TEST_GEOM",
+			args:          []driver.Value{},
+			columns:       []string{"ID", "GEOM"},
+			rows:          [][]driver.Value{{int64(1), "raw geometry bytes"}},
+			nextPanicText: "simulated go-ora decode panic on custom type column",
+		},
+		{
+			queryContains: "ALL_TAB_COLUMNS",
+			args:          []driver.Value{"SDE", "TEST_GEOM"},
+			columns:       []string{"COLUMN_NAME", "DATA_TYPE", "DATA_TYPE_OWNER"},
+			rows: [][]driver.Value{
+				{"ID", "NUMBER", nil},
+				{"GEOM", "ST_GEOMETRY", "SDE"},
+			},
+		},
+		{
+			queryContains: "'<ST_GEOMETRY>'",
+			args:          []driver.Value{},
+			columns:       []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"},
+			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>", "D:1"}},
+		},
+	})
+	s := newServer()
+	s.db = db
+	result, err := s.executeQueryPage(queryOptions{SQL: "SELECT * FROM SDE.TEST_GEOM"}, 10)
+	if err != nil {
+		t.Fatalf("expected placeholder retry to serve the first page, got %v", err)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected one placeholder row, got %v", result.Rows)
+	}
+	want := []any{int64(1), "<ST_GEOMETRY>", "D:1"}
+	if !reflect.DeepEqual(result.Rows[0], want) {
+		t.Fatalf("unexpected row: %v, want %v", result.Rows[0], want)
+	}
+	if result.SessionID != nil || result.HasMore {
+		t.Fatalf("fully drained page must not keep a session: %v %v", result.SessionID, result.HasMore)
+	}
+}
+
+func TestExecuteQueryPageSurfacesPanicWhenPlaceholderNotApplicable(t *testing.T) {
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "SELECT * FROM SDE.TEST_GEOM",
+			args:          []driver.Value{},
+			columns:       []string{"ID"},
+			rows:          [][]driver.Value{{int64(1)}},
+			nextPanicText: "simulated go-ora decode panic on custom type column",
+		},
+		{
+			queryContains: "ALL_TAB_COLUMNS",
+			args:          []driver.Value{"SDE", "TEST_GEOM"},
+			columns:       []string{"COLUMN_NAME", "DATA_TYPE", "DATA_TYPE_OWNER"},
+			rows:          [][]driver.Value{{"ID", "NUMBER", nil}},
+		},
+	})
+	s := newServer()
+	s.db = db
+	result, err := s.executeQueryPage(queryOptions{SQL: "SELECT * FROM SDE.TEST_GEOM"}, 10)
+	var panicErr oracleDriverPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("expected oracle driver panic error, got %v", err)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("failed query must not return rows, got %v", result.Rows)
+	}
+}
+
+func TestRuntimeHandleLineRecoversRequestPanic(t *testing.T) {
+	db, _ := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains:    "SELECT * FROM SDE.TEST_GEOM",
+			args:             []driver.Value{},
+			columnsPanicText: "simulated go-ora panic while describing columns",
+		},
+	})
+	runtime := newRuntimeServer()
+	session := newServer()
+	session.db = db
+	runtime.sessions["agent-session-1"] = &agentSession{server: session}
+
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":5,"method":"execute_query_page","params":{"agentSessionId":"agent-session-1","sql":"SELECT * FROM SDE.TEST_GEOM","pageSize":10}}`)
+	if shutdown {
+		t.Fatal("recovered panic must not shut down the agent")
+	}
+	if resp.Error == nil {
+		t.Fatalf("expected panic error response, got %+v", resp)
+	}
+	if !strings.Contains(resp.Error.Message, "agent request panic") {
+		t.Fatalf("unexpected error message: %s", resp.Error.Message)
+	}
+	if string(resp.ID) != "5" {
+		t.Fatalf("panic response must keep the request id, got %s", resp.ID)
+	}
+
+	// The RPC stream must survive the panic and keep serving requests.
+	followUp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":6,"method":"handshake","params":{}}`)
+	if shutdown || followUp.Error != nil {
+		t.Fatalf("handshake after recovered panic failed: shutdown=%v error=%v", shutdown, followUp.Error)
 	}
 }
 

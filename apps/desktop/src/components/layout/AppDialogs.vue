@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch, defineAsyncComponent } from "vue";
+import { computed, ref, watch, defineAsyncComponent } from "vue";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -13,6 +13,7 @@ const SqlFileExecutionDialog = defineAsyncComponent(() => import("@/components/s
 const SchemaDiagramDialog = defineAsyncComponent(() => import("@/components/diagram/SchemaDiagramDialog.vue"));
 const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/DatabaseDocsDialog.vue"));
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
+const MongoImportDialog = defineAsyncComponent(() => import("@/components/document/MongoImportDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
 const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
@@ -24,6 +25,7 @@ const DataGenerateDialog = defineAsyncComponent(() => import("@/components/gener
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import { useReadOnlyUnlockStore, WRITE_UNLOCK_FIVE_MINUTES_SECS, WRITE_UNLOCK_ONE_MINUTE_SECS, type WriteUnlockDurationSecs } from "@/stores/readOnlyUnlockStore";
 import { useDialogSources } from "@/composables/useDialogSources";
 import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
@@ -58,6 +60,7 @@ const emit = defineEmits<{
   connectFailed: [message: string];
   openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
+  openConnectionSettings: [connectionId: string, initialTab: "advanced"];
   openLineageTarget: [
     target: {
       connectionId: string;
@@ -92,6 +95,8 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
 const productionSafetyStore = useProductionSafetyStore();
+const readOnlyUnlockStore = useReadOnlyUnlockStore();
+const unlockDuration = ref<WriteUnlockDurationSecs>(WRITE_UNLOCK_ONE_MINUTE_SECS);
 const sqlExecutionDangerStore = useSqlExecutionDangerStore();
 const dialogs = useDialogSources();
 const productionConfirmationDetails = computed(() => {
@@ -103,6 +108,20 @@ const productionConfirmationDetails = computed(() => {
     source: request.source || "-",
   });
 });
+const readOnlyUnlockDetails = computed(() => {
+  const request = readOnlyUnlockStore.pending;
+  if (!request) return "";
+  return t("readOnlyUnlock.confirmDetails", {
+    connection: request.connectionName || "-",
+    source: request.source || "-",
+  });
+});
+watch(
+  () => readOnlyUnlockStore.pending,
+  (pending) => {
+    if (pending) unlockDuration.value = WRITE_UNLOCK_ONE_MINUTE_SECS;
+  },
+);
 const multiDbDangerDetails = computed(() => {
   const request = sqlExecutionDangerStore.pending;
   if (!request) return "";
@@ -179,6 +198,32 @@ watch(
     @confirm="productionSafetyStore.confirm()"
   />
   <DangerConfirmDialog
+    v-if="readOnlyUnlockStore.pending"
+    :open="true"
+    :title="t('readOnlyUnlock.confirmTitle')"
+    :message="t('readOnlyUnlock.confirmMessage')"
+    :details-text="readOnlyUnlockDetails"
+    :sql="readOnlyUnlockStore.pending.sql"
+    :confirm-label="t('readOnlyUnlock.confirmAction')"
+    :close-on-confirm="false"
+    @update:open="(open) => !open && readOnlyUnlockStore.cancel()"
+    @confirm="readOnlyUnlockStore.confirm(unlockDuration)"
+  >
+    <template #options>
+      <fieldset class="mb-3 space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+        <legend class="text-xs font-medium text-foreground">{{ t("readOnlyUnlock.durationLabel") }}</legend>
+        <label class="flex items-center gap-2 text-sm">
+          <input v-model="unlockDuration" type="radio" class="accent-primary" :value="WRITE_UNLOCK_ONE_MINUTE_SECS" />
+          {{ t("readOnlyUnlock.durationOneMinute") }}
+        </label>
+        <label class="flex items-center gap-2 text-sm">
+          <input v-model="unlockDuration" type="radio" class="accent-primary" :value="WRITE_UNLOCK_FIVE_MINUTES_SECS" />
+          {{ t("readOnlyUnlock.durationFiveMinutes") }}
+        </label>
+      </fieldset>
+    </template>
+  </DangerConfirmDialog>
+  <DangerConfirmDialog
     v-if="sqlExecutionDangerStore.pending"
     :open="true"
     :title="t('multiDbExecute.dangerTitle')"
@@ -212,7 +257,16 @@ watch(
     :prefill-target-database="dialogs.transferPrefillTargetDatabase.value"
     :prefill-target-schema="dialogs.transferPrefillTargetSchema.value"
   />
-  <SchemaDiffDialog v-if="dialogs.showSchemaDiffDialog.value" v-model:open="dialogs.showSchemaDiffDialog.value" :prefill-connection-id="dialogs.schemaDiffPrefillConnectionId.value" :prefill-database="dialogs.schemaDiffPrefillDatabase.value" :prefill-schema="dialogs.schemaDiffPrefillSchema.value" />
+  <SchemaDiffDialog
+    v-if="dialogs.showSchemaDiffDialog.value"
+    v-model:open="dialogs.showSchemaDiffDialog.value"
+    :prefill-connection-id="dialogs.schemaDiffPrefillConnectionId.value"
+    :prefill-database="dialogs.schemaDiffPrefillDatabase.value"
+    :prefill-schema="dialogs.schemaDiffPrefillSchema.value"
+    :prefill-selected-routines="dialogs.schemaDiffPrefillSelectedRoutines.value"
+    :prefill-result-tab="dialogs.schemaDiffPrefillResultTab.value || undefined"
+    :session-id="dialogs.schemaDiffSessionId.value"
+  />
   <DataCompareDialog
     v-if="dialogs.showDataCompareDialog.value"
     v-model:open="dialogs.showDataCompareDialog.value"
@@ -220,6 +274,7 @@ watch(
     :prefill-database="dialogs.dataComparePrefillDatabase.value"
     :prefill-schema="dialogs.dataComparePrefillSchema.value"
     :prefill-table="dialogs.dataComparePrefillTable.value"
+    :session-id="dialogs.dataCompareSessionId.value"
   />
   <SqlFileExecutionDialog v-model:open="dialogs.showSqlFileDialog.value" :prefill-connection-id="dialogs.sqlFilePrefillConnectionId.value" :prefill-database="dialogs.sqlFilePrefillDatabase.value" :prefill-file-path="dialogs.sqlFilePrefillFilePath.value" />
   <SchemaDiagramDialog
@@ -229,6 +284,7 @@ watch(
     :prefill-database="dialogs.diagramPrefillDatabase.value"
     :prefill-schema="dialogs.diagramPrefillSchema.value"
     :focus-table-name="dialogs.diagramFocusTableName.value"
+    :focus-table-names="dialogs.diagramFocusTableNames.value"
     @open-target="emit('openDiagramTarget', $event)"
   />
   <DatabaseDocsDialog v-if="dialogs.showDocsDialog.value" v-model:open="dialogs.showDocsDialog.value" :prefill-connection-id="dialogs.docsPrefillConnectionId.value" :prefill-database="dialogs.docsPrefillDatabase.value" :prefill-schema="dialogs.docsPrefillSchema.value" />
@@ -240,6 +296,7 @@ watch(
     :prefill-schema="dialogs.tableImportPrefillSchema.value"
     :prefill-table="dialogs.tableImportPrefillTable.value"
   />
+  <MongoImportDialog v-model:open="dialogs.showMongoImportDialog.value" :connection-id="dialogs.mongoImportPrefillConnectionId.value" :database="dialogs.mongoImportPrefillDatabase.value" :collection="dialogs.mongoImportPrefillCollection.value" />
   <DataGenerateDialog
     v-if="dialogs.showTableDataGenerateDialog.value"
     v-model:open="dialogs.showTableDataGenerateDialog.value"
@@ -275,6 +332,7 @@ watch(
     :prefill-table="dialogs.databaseExportPrefillTable.value"
     :prefill-tables="dialogs.databaseExportPrefillTables.value"
     :prefill-all-databases="dialogs.databaseExportAllDatabases.value"
+    @open-connection-settings="emit('openConnectionSettings', $event, 'advanced')"
   />
   <ConfigConnectionSelectDialog
     v-if="dialogs.showConfigConnectionSelectDialog.value"

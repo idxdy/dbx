@@ -3,16 +3,16 @@ use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime
 use futures::{SinkExt, StreamExt};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use percent_encoding::percent_decode_str;
-use rust_decimal::Decimal;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
@@ -33,11 +33,11 @@ use crate::query::{await_stream_with_progress_timeout, DbOperationBudget, Stream
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
-    CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, CustomTypeDdl,
-    CustomTypeDetails, CustomTypeDomainConstraint, CustomTypeKind, CustomTypeMember, CustomTypeProperties,
-    DatabaseInfo, DatabaseStorageInfo, ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo,
-    ObjectStatistics, OwnerInfo, QueryMessage, QueryResult, RuleInfo, SchemaInfo, SequenceInfo, SpatialColumnBuilder,
-    TableInfo, TriggerInfo,
+    CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, ConstraintInfo,
+    CustomTypeDdl, CustomTypeDetails, CustomTypeDomainConstraint, CustomTypeKind, CustomTypeMember,
+    CustomTypeProperties, DatabaseInfo, DatabaseStorageInfo, ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo,
+    ObjectInfo, ObjectStatistics, OwnerInfo, QueryMessage, QueryResult, RuleInfo, SchemaInfo, SequenceInfo,
+    SpatialColumnBuilder, TableInfo, TriggerInfo,
 };
 
 pub(crate) const GAUSSDB_COMPATIBILITY_SQL: &str =
@@ -109,6 +109,7 @@ pub enum PostgresColumnDefaultState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostgresTablePartitionLocalObjects {
     pub has_primary_key: bool,
+    pub unique_constraints: BTreeSet<String>,
     pub foreign_keys: BTreeSet<String>,
     pub indexes: BTreeSet<String>,
     /// CHECK constraints with a local definition on this partition, as
@@ -167,6 +168,77 @@ impl<'a> FromSql<'a> for PgAnyString {
     }
 }
 
+struct PgNumeric(String);
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        decode_pg_numeric_bytes(raw).map(Self).ok_or_else(|| "invalid PostgreSQL numeric binary value".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+fn decode_pg_numeric_bytes(raw: &[u8]) -> Option<String> {
+    const POSITIVE: u16 = 0x0000;
+    const NEGATIVE: u16 = 0x4000;
+    const NAN: u16 = 0xC000;
+    const POSITIVE_INFINITY: u16 = 0xD000;
+    const NEGATIVE_INFINITY: u16 = 0xF000;
+
+    let digit_count = usize::from(u16::from_be_bytes(raw.get(0..2)?.try_into().ok()?));
+    let weight = i16::from_be_bytes(raw.get(2..4)?.try_into().ok()?);
+    let sign = u16::from_be_bytes(raw.get(4..6)?.try_into().ok()?);
+    let scale = usize::from(u16::from_be_bytes(raw.get(6..8)?.try_into().ok()?));
+    let expected_len = digit_count.checked_mul(2)?.checked_add(8)?;
+    if raw.len() != expected_len {
+        return None;
+    }
+    match sign {
+        NAN => return Some("NaN".to_string()),
+        POSITIVE_INFINITY => return Some("Infinity".to_string()),
+        NEGATIVE_INFINITY => return Some("-Infinity".to_string()),
+        POSITIVE | NEGATIVE => {}
+        _ => return None,
+    }
+
+    let digits = raw[8..].chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect::<Vec<_>>();
+    if digits.iter().any(|digit| *digit > 9999) {
+        return None;
+    }
+
+    let integer_groups = if weight >= 0 { usize::try_from(weight).ok()?.checked_add(1)? } else { 0 };
+    let fractional_groups = scale.checked_add(3)? / 4;
+    let mut text = String::with_capacity(integer_groups.saturating_mul(4).max(1).saturating_add(scale + 2));
+    if sign == NEGATIVE && digits.iter().any(|digit| *digit != 0) {
+        text.push('-');
+    }
+    if integer_groups == 0 {
+        text.push('0');
+    } else {
+        for group_index in 0..integer_groups {
+            let digit = digits.get(group_index).copied().unwrap_or(0);
+            if group_index == 0 {
+                write!(&mut text, "{digit}").ok()?;
+            } else {
+                write!(&mut text, "{digit:04}").ok()?;
+            }
+        }
+    }
+    if scale > 0 {
+        text.push('.');
+        let fractional_start = text.len();
+        for group_index in 0..fractional_groups {
+            let digit_index = i32::from(weight) + 1 + i32::try_from(group_index).ok()?;
+            let digit = usize::try_from(digit_index).ok().and_then(|index| digits.get(index)).copied().unwrap_or(0);
+            write!(&mut text, "{digit:04}").ok()?;
+        }
+        text.truncate(fractional_start + scale);
+    }
+    Some(text)
+}
+
 /// PostgreSQL `money` is sent in the binary protocol as a signed 64-bit
 /// integer scaled by 100 (the smallest unit of the currency). It is not
 /// decoded by `rust_decimal`, so attempting to read it as `Decimal` produces
@@ -193,6 +265,199 @@ fn format_pg_money(value: i64) -> String {
     } else {
         formatted
     }
+}
+
+/// A `FromSql` adapter for PostgreSQL arrays of any dimension. tokio-postgres's
+/// `Vec<T>` rejects arrays with more than one dimension, and a multi-
+/// dimensional column carries the same array OID as its flat counterpart, so
+/// `'{{1,2},{3,4}}'::int[]` fell through every probe in the array chain and
+/// rendered as NULL (#8457). Renders PostgreSQL's own array literal syntax.
+struct PgNdimArrayLiteral(String);
+
+impl<'a> FromSql<'a> for PgNdimArrayLiteral {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        pg_ndim_array_literal(raw).map(Self).ok_or_else(|| "invalid PostgreSQL array binary value".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Array(_))
+    }
+}
+
+fn pg_ndim_array_literal(raw: &[u8]) -> Option<String> {
+    fn read_i32(raw: &[u8], cursor: &mut usize) -> Option<i32> {
+        let bytes = raw.get(*cursor..*cursor + 4)?.try_into().ok()?;
+        *cursor += 4;
+        Some(i32::from_be_bytes(bytes))
+    }
+
+    let mut cursor = 0usize;
+    let ndim = read_i32(raw, &mut cursor)?;
+    if !(1..=6).contains(&ndim) {
+        return None;
+    }
+    let _null_flags = read_i32(raw, &mut cursor)?;
+    let element_type = Type::from_oid(read_i32(raw, &mut cursor)? as u32);
+    let mut lengths = Vec::with_capacity(ndim as usize);
+    for _ in 0..ndim {
+        let len = read_i32(raw, &mut cursor)?;
+        if len < 0 {
+            return None;
+        }
+        lengths.push(len as usize);
+        let _lower_bound = read_i32(raw, &mut cursor)?;
+    }
+    let total = lengths.iter().try_fold(1usize, |acc, &len| acc.checked_mul(len))?;
+    let mut elements: Vec<Option<&[u8]>> = Vec::with_capacity(total);
+    for _ in 0..total {
+        let len = read_i32(raw, &mut cursor)?;
+        if len < 0 {
+            elements.push(None);
+        } else {
+            let bytes = raw.get(cursor..cursor + len as usize)?;
+            cursor += len as usize;
+            elements.push(Some(bytes));
+        }
+    }
+
+    let mut literal = String::new();
+    pg_ndim_array_group(&lengths, &elements, element_type.as_ref(), &mut literal);
+    Some(literal)
+}
+
+fn pg_ndim_array_group(dims: &[usize], elements: &[Option<&[u8]>], element_type: Option<&Type>, out: &mut String) {
+    out.push('{');
+    if dims.len() == 1 {
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            match element {
+                None => out.push_str("NULL"),
+                Some(bytes) => out.push_str(&pg_ndim_array_element(element_type, bytes)),
+            }
+        }
+    } else {
+        let stride: usize = dims[1..].iter().product();
+        for index in 0..dims[0] {
+            if index > 0 {
+                out.push(',');
+            }
+            pg_ndim_array_group(&dims[1..], &elements[index * stride..(index + 1) * stride], element_type, out);
+        }
+    }
+    out.push('}');
+}
+
+fn pg_ndim_array_element(element_type: Option<&Type>, bytes: &[u8]) -> String {
+    match pg_ndim_array_element_json(element_type, bytes) {
+        serde_json::Value::String(text) => quote_pg_array_element(&text),
+        serde_json::Value::Bool(value) => (if value { "t" } else { "f" }).to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => "NULL".to_string(),
+    }
+}
+
+/// Quotes one array element the way `array_out` does: empty strings, NULL-like
+/// text, and anything containing structural characters or whitespace is
+/// double-quoted with embedded quotes and backslashes doubled.
+fn quote_pg_array_element(text: &str) -> String {
+    let needs_quoting = text.is_empty()
+        || text.eq_ignore_ascii_case("null")
+        || text.bytes().any(|b| matches!(b, b'{' | b'}' | b',' | b'"' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'));
+    if !needs_quoting {
+        return text.to_string();
+    }
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for ch in text.chars() {
+        if ch == '"' || ch == '\\' {
+            quoted.push(ch);
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+// Direct from_sql calls bypass the codec's accepts() gate, so every probe
+// must check the element type itself before decoding.
+fn pg_ndim_array_element_json(element_type: Option<&Type>, bytes: &[u8]) -> serde_json::Value {
+    let ty = match element_type {
+        Some(ty) => ty,
+        None => return serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned()),
+    };
+    if <bool as FromSql>::accepts(ty) {
+        if let Ok(value) = <bool as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::Bool(value);
+        }
+    }
+    if <i8 as FromSql>::accepts(ty) {
+        if let Ok(value) = <i8 as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::Number(value.into());
+        }
+    }
+    if <i16 as FromSql>::accepts(ty) {
+        if let Ok(value) = <i16 as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::Number(value.into());
+        }
+    }
+    if <i32 as FromSql>::accepts(ty) {
+        if let Ok(value) = <i32 as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::Number(value.into());
+        }
+    }
+    if <i64 as FromSql>::accepts(ty) {
+        if let Ok(value) = <i64 as FromSql>::from_sql(ty, bytes) {
+            return super::safe_i64_to_json(value);
+        }
+    }
+    if <f32 as FromSql>::accepts(ty) {
+        if let Ok(value) = <f32 as FromSql>::from_sql(ty, bytes) {
+            return pg_float_number(value as f64);
+        }
+    }
+    if <f64 as FromSql>::accepts(ty) {
+        if let Ok(value) = <f64 as FromSql>::from_sql(ty, bytes) {
+            return pg_float_number(value);
+        }
+    }
+    if *ty == Type::NUMERIC {
+        if let Some(text) = decode_pg_numeric_bytes(bytes) {
+            return serde_json::Value::String(text);
+        }
+    }
+    if <uuid::Uuid as FromSql>::accepts(ty) {
+        if let Ok(value) = <uuid::Uuid as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value.to_string());
+        }
+    }
+    if <chrono::NaiveDate as FromSql>::accepts(ty) {
+        if let Ok(value) = <chrono::NaiveDate as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value.to_string());
+        }
+    }
+    if <chrono::NaiveTime as FromSql>::accepts(ty) {
+        if let Ok(value) = <chrono::NaiveTime as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value.to_string());
+        }
+    }
+    if <chrono::NaiveDateTime as FromSql>::accepts(ty) {
+        if let Ok(value) = <chrono::NaiveDateTime as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value.to_string());
+        }
+    }
+    if <chrono::DateTime<chrono::Utc> as FromSql>::accepts(ty) {
+        if let Ok(value) = <chrono::DateTime<chrono::Utc> as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value.to_rfc3339());
+        }
+    }
+    if <String as FromSql>::accepts(ty) {
+        if let Ok(value) = <String as FromSql>::from_sql(ty, bytes) {
+            return serde_json::Value::String(value);
+        }
+    }
+    serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// A `FromSql` adapter that accepts any PostgreSQL type and returns the raw
@@ -555,8 +820,8 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     if let Ok(values) = row.try_get::<_, Vec<Option<bool>>>(idx) {
         return Some(pg_optional_array_to_json(values, serde_json::Value::Bool));
     }
-    if let Ok(values) = row.try_get::<_, Vec<Option<Decimal>>>(idx) {
-        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
+    if let Ok(values) = row.try_get::<_, Vec<Option<PgNumeric>>>(idx) {
+        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.0)));
     }
     if let Ok(values) = row.try_get::<_, Vec<Option<uuid::Uuid>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
@@ -596,6 +861,11 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     }
     if let Ok(values) = row.try_get::<_, Vec<Option<PgAnyString>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.0)));
+    }
+    // Multi-dimensional arrays share the array OID with flat ones but fail
+    // every Vec<T> probe above; fall back to the server's own literal form.
+    if let Ok(literal) = row.try_get::<_, PgNdimArrayLiteral>(idx) {
+        return Some(serde_json::Value::String(literal.0));
     }
     None
 }
@@ -818,10 +1088,9 @@ pub(crate) fn pg_value_to_json_classified(row: &Row, idx: usize, col_type: PgCol
                 PgTemporalFallback::Probe => pg_fallback_value_to_json(row, idx),
             }
         }
-        PgColType::Numeric => row
-            .try_get::<_, Decimal>(idx)
-            .map(|v: Decimal| serde_json::Value::String(v.to_string()))
-            .unwrap_or(serde_json::Value::Null),
+        PgColType::Numeric => {
+            row.try_get::<_, PgNumeric>(idx).map(|v| serde_json::Value::String(v.0)).unwrap_or(serde_json::Value::Null)
+        }
         PgColType::Money => row
             .try_get::<_, PgMoney>(idx)
             .map(|v| serde_json::Value::String(format_pg_money(v.0)))
@@ -902,7 +1171,11 @@ fn decode_pg_text_wkb(value: &str) -> Option<super::wkb::DecodedGeometry> {
         .or_else(|| trimmed.strip_prefix("\\x"))
         .or_else(|| trimmed.strip_prefix("\\X"))
         .unwrap_or(trimmed);
-    if hex.len() < 10 || !hex.len().is_multiple_of(2) || !matches!(&hex[..2], "00" | "01") || !hex.is_ascii() {
+    // `is_ascii()` must be checked before slicing `hex[..2]`: multibyte UTF-8
+    // text (e.g. Redshift simple-query values probed with an unknown column
+    // type) would otherwise panic on a non-char byte boundary and abort the
+    // process under `panic = "abort"`.
+    if hex.len() < 10 || !hex.len().is_multiple_of(2) || !hex.is_ascii() || !matches!(&hex[..2], "00" | "01") {
         return None;
     }
     let bytes = hex
@@ -1081,6 +1354,31 @@ where
             Ok(value) => return Ok(value),
             Err(error) => errors.push(pg_error_to_string(error)),
         }
+    }
+    log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
+    Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
+}
+
+async fn query_with_non_empty_compat_fallback<F, Fut>(
+    log_context: &str,
+    tiers: &[&'static str],
+    mut run: F,
+) -> Result<Vec<ColumnInfo>, String>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ColumnInfo>, tokio_postgres::Error>>,
+{
+    let mut empty_result = None;
+    let mut errors = Vec::new();
+    for sql in tiers {
+        match run(sql).await {
+            Ok(columns) if !columns.is_empty() => return Ok(columns),
+            Ok(columns) => empty_result = Some(columns),
+            Err(error) => errors.push(pg_error_to_string(error)),
+        }
+    }
+    if let Some(columns) = empty_result {
+        return Ok(columns);
     }
     log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
     Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
@@ -1343,12 +1641,34 @@ fn postgres_select_stream_outcome(stream: tokio_postgres::RowStream) -> Postgres
     PostgresSelectStreamOutcome::Binary { stream, metadata }
 }
 
+async fn prepare_unnamed_select_metadata(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+) -> Result<PreparedSelectMetadata, tokio_postgres::Error> {
+    // query_typed_raw sends Describe and Execute together. If its result has an
+    // unknown user-defined type, tokio-postgres then resolves that type with a
+    // second query on the same connection before returning the RowStream. A
+    // large result can fill the connection buffers and block that type lookup.
+    // Describe once without executing so custom types are cached before the
+    // actual unnamed stream starts. The stream remains unnamed to tolerate
+    // server-side prepared statement loss in snapshot/proxy environments.
+    let stmt = client.prepare(sql).await?;
+    Ok(prepared_select_metadata(stmt.columns()))
+}
+
 async fn start_postgres_select_stream(
     client: &deadpool_postgres::Client,
     sql: &str,
     force_unnamed: bool,
 ) -> Result<PostgresSelectStreamOutcome, tokio_postgres::Error> {
     if force_unnamed || postgres_client_uses_unnamed_statements(client) {
+        let metadata = prepare_unnamed_select_metadata(client, sql).await?;
+        if let Some(unsupported_type) = metadata.unsupported_type {
+            return Ok(PostgresSelectStreamOutcome::TextFallback {
+                column_types: metadata.column_types,
+                unsupported_type,
+            });
+        }
         return postgres_query_unnamed(client, sql).await.map(postgres_select_stream_outcome);
     }
 
@@ -1951,20 +2271,45 @@ async fn stream_query_rows_text_on_client(
 }
 
 pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, String> {
+    connect_with_max_connections(url, fallback_timeout, 10).await
+}
+
+/// Creates a PostgreSQL pool with an explicit checkout bound.
+///
+/// Session-scoped DBX pools use a single connection so temporary tables and
+/// other connection-local state cannot migrate between physical clients.
+pub async fn connect_with_max_connections(
+    url: &str,
+    fallback_timeout: Duration,
+    max_connections: usize,
+) -> Result<Pool, String> {
     #[cfg(all(windows, target_vendor = "win7"))]
     {
-        connect_with_optional_local_timezone(url, fallback_timeout, None).await
+        connect_with_optional_local_timezone_with_max_connections(url, fallback_timeout, None, max_connections).await
     }
 
     #[cfg(not(all(windows, target_vendor = "win7")))]
     {
         let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
-        connect_with_local_timezone(url, fallback_timeout, &timezone).await
+        connect_with_local_timezone_with_max_connections(url, fallback_timeout, &timezone, max_connections).await
     }
 }
 
+/// Test-only thin wrappers (the library now connects through
+/// `connect_with_max_connections`, which carries the pool bound).
+#[cfg(test)]
 async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, timezone: &str) -> Result<Pool, String> {
-    connect_with_optional_local_timezone(url, fallback_timeout, Some(timezone)).await
+    connect_with_local_timezone_with_max_connections(url, fallback_timeout, timezone, 10).await
+}
+
+async fn connect_with_local_timezone_with_max_connections(
+    url: &str,
+    fallback_timeout: Duration,
+    timezone: &str,
+    max_connections: usize,
+) -> Result<Pool, String> {
+    connect_with_optional_local_timezone_with_max_connections(url, fallback_timeout, Some(timezone), max_connections)
+        .await
 }
 
 /// Identity of one physical backend connection for notice attribution:
@@ -2155,23 +2500,33 @@ async fn drain_postgres_notices(client: &deadpool_postgres::Client) -> Vec<Query
     }
 }
 
+#[cfg(test)]
 async fn connect_with_optional_local_timezone(
     url: &str,
     fallback_timeout: Duration,
     timezone: Option<&str>,
 ) -> Result<Pool, String> {
+    connect_with_optional_local_timezone_with_max_connections(url, fallback_timeout, timezone, 10).await
+}
+
+async fn connect_with_optional_local_timezone_with_max_connections(
+    url: &str,
+    fallback_timeout: Duration,
+    timezone: Option<&str>,
+    max_connections: usize,
+) -> Result<Pool, String> {
     let url_with_keepalive = inject_postgres_keepalive_params(url);
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
 
-    let first_attempt = connect_postgres_pool_attempt(&url_with_keepalive, timeout).await;
+    let first_attempt = connect_postgres_pool_attempt(&url_with_keepalive, timeout, max_connections).await;
     let (pool, client) = match first_attempt {
         Err(error) if postgres_error_should_retry_without_tls(&error) => {
             let Some(fallback_url) = postgres_ssl_fallback_url(&url_with_keepalive) else {
                 return Err(error);
             };
             log::info!("PostgreSQL TLS handshake failed in sslmode=prefer; retrying without TLS");
-            connect_postgres_pool_attempt(&fallback_url, timeout).await?
+            connect_postgres_pool_attempt(&fallback_url, timeout, max_connections).await?
         }
         result => result?,
     };
@@ -2193,6 +2548,7 @@ async fn connect_with_optional_local_timezone(
 async fn connect_postgres_pool_attempt(
     url: &str,
     timeout: Duration,
+    max_connections: usize,
 ) -> Result<(Pool, deadpool_postgres::Client), String> {
     let postgres_url = postgres_connection_url(url)?;
     super::with_connection_timeout("PostgreSQL", timeout, async {
@@ -2228,7 +2584,7 @@ async fn connect_postgres_pool_attempt(
             )
         };
         let pool = Pool::builder(mgr)
-            .max_size(10)
+            .max_size(max_connections.max(1))
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(timeout))
             .create_timeout(Some(timeout))
@@ -3307,6 +3663,9 @@ fn apply_partition_local_object_row(
 ) {
     match object_kind {
         "constraint" if object_type == "p" => entry.has_primary_key = true,
+        "constraint" if object_type == "u" && !object_name.is_empty() => {
+            entry.unique_constraints.insert(object_name);
+        }
         "constraint" if object_type == "f" && !object_name.is_empty() => {
             entry.foreign_keys.insert(object_name);
         }
@@ -3696,23 +4055,34 @@ async fn list_indexes_for_relations_with_sql(
     for row in &rows {
         let Ok(relid) = row.try_get::<_, i64>(0) else { continue };
         let all_cols: Vec<String> = row.try_get::<_, Vec<String>>(2).unwrap_or_default();
-        let nkeyatts = row.try_get::<_, Option<i16>>(7).ok().flatten().unwrap_or(all_cols.len() as i16) as usize;
+        let all_opclasses: Vec<Option<String>> = row.try_get::<_, Vec<Option<String>>>(3).unwrap_or_default();
+        let nkeyatts = row.try_get::<_, Option<i16>>(8).ok().flatten().unwrap_or(all_cols.len() as i16) as usize;
         let split_at = nkeyatts.min(all_cols.len());
         let key_cols = all_cols[..split_at].to_vec();
+        let key_opclasses = if all_opclasses.len() == all_cols.len() {
+            all_opclasses[..split_at].to_vec()
+        } else {
+            vec![None; split_at]
+        };
         let included = if split_at < all_cols.len() { all_cols[split_at..].to_vec() } else { vec![] };
-        let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(10).unwrap_or_default();
+        let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(11).unwrap_or_default();
         let key_is_expression =
             if all_is_expr.len() == all_cols.len() { all_is_expr[..split_at].to_vec() } else { Vec::new() };
+        let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(12).unwrap_or_default();
+        let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
         result.entry(relid).or_default().push(IndexInfo {
             name: pg_row_try_string(row, 1),
             columns: key_cols,
-            is_unique: pg_row_try_bool(row, 3).unwrap_or(false),
-            is_primary: pg_row_try_bool(row, 4).unwrap_or(false),
-            filter: row.try_get::<_, Option<String>>(5).ok().flatten(),
-            index_type: row.try_get::<_, Option<String>>(6).ok().flatten(),
+            is_unique: pg_row_try_bool(row, 4).unwrap_or(false),
+            is_primary: pg_row_try_bool(row, 5).unwrap_or(false),
+            filter: row.try_get::<_, Option<String>>(6).ok().flatten(),
+            index_type: row.try_get::<_, Option<String>>(7).ok().flatten(),
             included_columns: if included.is_empty() { None } else { Some(included) },
-            comment: row.try_get::<_, Option<String>>(9).ok().flatten(),
+            comment: row.try_get::<_, Option<String>>(10).ok().flatten(),
             key_is_expression,
+            column_opclasses: key_opclasses,
+            key_options,
+            constraint_backed: pg_row_try_bool(row, 13).unwrap_or(false),
         });
     }
     Ok(result)
@@ -3729,7 +4099,8 @@ fn postgres_indexes_for_relations_query_tiers() -> [&'static str; 2] {
 // line up, and result columns are read positionally.
 fn postgres_indexes_for_relations_sql() -> &'static str {
     "SELECT t.oid::bigint AS relid, i.relname AS index_name, \
-             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
+             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
+             array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
@@ -3737,13 +4108,17 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              ix.indnkeyatts AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
-             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression \
+             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_am am ON am.oid = i.relam \
-             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
+             JOIN LATERAL unnest(ix.indkey, ix.indclass) WITH ORDINALITY AS k(attnum, class_oid, n) ON true \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
+             LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
+             LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
              WHERE t.oid = ANY($1::bigint[]) \
              GROUP BY t.oid, i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY t.oid, i.relname"
@@ -3754,7 +4129,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
 fn postgres_indexes_for_relations_compat_sql() -> &'static str {
     "SELECT t.oid::bigint AS relid, i.relname AS index_name, \
              ARRAY( \
-               SELECT COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, pos.n, true)) \
+               SELECT COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, pos.n, false)) \
                FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
                LEFT JOIN pg_attribute a \
                  ON a.attrelid = t.oid \
@@ -3762,11 +4137,24 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS columns, \
+             ARRAY( \
+               SELECT CASE WHEN oc.opcdefault THEN NULL \
+                           ELSE oc.opcname \
+                      END \
+               FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
+               LEFT JOIN pg_attribute a \
+                 ON a.attrelid = t.oid \
+                AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
+                AND a.attnum > 0 \
+               LEFT JOIN pg_opclass oc \
+                 ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               ORDER BY pos.n \
+             ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
-             NULL::smallint AS nkeyatts, \
+             array_length(string_to_array(ix.indoption::text, ' '), 1)::smallint AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              ARRAY( \
@@ -3777,7 +4165,9 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
-             ) AS key_is_expression \
+             ) AS key_is_expression, \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -3786,8 +4176,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
              ORDER BY t.oid, i.relname"
 }
 
-/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)` since
-/// this query is `information_schema`-based rather than oid-based.
+/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)`.
 pub async fn list_foreign_keys_for_relations(
     pool: &Pool,
     relations: &[(String, String)],
@@ -3795,9 +4184,20 @@ pub async fn list_foreign_keys_for_relations(
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let schemas: Vec<&str> = relations.iter().map(|(schema, _)| schema.as_str()).collect();
     let tables: Vec<&str> = relations.iter().map(|(_, table)| table.as_str()).collect();
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_for_relations_sql(), &[&schemas, &tables])
-        .await
-        .map_err(|e| e.to_string())?;
+    let tiers = postgres_foreign_keys_for_relations_query_tiers();
+    query_with_compat_fallback("list_foreign_keys_for_relations", &tiers, |sql| {
+        list_foreign_keys_for_relations_with_sql(&client, sql, &schemas, &tables)
+    })
+    .await
+}
+
+async fn list_foreign_keys_for_relations_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    schemas: &[&str],
+    tables: &[&str],
+) -> Result<HashMap<(String, String), Vec<ForeignKeyInfo>>, tokio_postgres::Error> {
+    let rows = postgres_query_cached(client, sql, &[&schemas, &tables]).await?;
     let mut result: HashMap<(String, String), Vec<ForeignKeyInfo>> = HashMap::new();
     for row in &rows {
         let key = (pg_row_try_string(row, 0), pg_row_try_string(row, 1));
@@ -3807,35 +4207,73 @@ pub async fn list_foreign_keys_for_relations(
             ref_schema: Some(pg_row_try_string(row, 4)),
             ref_table: pg_row_try_string(row, 5),
             ref_column: pg_row_try_string(row, 6),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 7)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 8)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 7)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 8)),
         });
     }
     Ok(result)
 }
 
+fn postgres_foreign_keys_for_relations_query_tiers() -> [&'static str; 2] {
+    [postgres_foreign_keys_for_relations_sql(), postgres_foreign_keys_for_relations_compat_sql()]
+}
+
 fn postgres_foreign_keys_for_relations_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
-     fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
      FROM unnest($1::text[], $2::text[]) AS rel(rel_schema, rel_table) \
-     JOIN information_schema.table_constraints tc \
-       ON tc.table_schema = rel.rel_schema AND tc.table_name = rel.rel_table \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-     ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
+}
+
+// PostgreSQL 9.3 and older only accept one array argument to unnest(). Pair
+// the schema/table arrays through their shared subscript so the fallback stays
+// one bounded query and preserves each relation tuple's position.
+// WITH ORDINALITY is equally unavailable before 9.4, so pair conkey/confkey
+// positions with generate_series plus plain subscripts — the same pre-9.4
+// technique the index compat SQL relies on. The series bounds must stay
+// constant: before PostgreSQL 9.3 a FROM item's function arguments cannot
+// reference an earlier FROM item (implicit LATERAL), so bound the series by
+// INDEX_MAX_KEYS (32, stable across PostgreSQL 9–18) and cap the ordinal with
+// a join-condition guard instead.
+fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
+    "SELECT rel.rel_schema, rel.rel_table, \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM ( \
+       SELECT ($1::text[])[rel.i] AS rel_schema, ($2::text[])[rel.i] AS rel_table \
+       FROM generate_subscripts($1::text[], 1) AS rel(i) \
+     ) AS rel \
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
 
 /// Batched sibling of `get_table_comment`.
@@ -3933,9 +4371,19 @@ pub async fn get_table_partition_local_objects_for_relations(
     oids: &[i64],
 ) -> Result<HashMap<i64, PostgresTablePartitionLocalObjects>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_partition_local_objects_for_relations_sql(), &[&oids])
-        .await
-        .map_err(|e| e.to_string())?;
+    let tiers = postgres_table_partition_local_objects_for_relations_query_tiers();
+    query_with_compat_fallback("get_table_partition_local_objects_for_relations", &tiers, |sql| {
+        get_table_partition_local_objects_for_relations_with_sql(&client, sql, oids)
+    })
+    .await
+}
+
+async fn get_table_partition_local_objects_for_relations_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    oids: &[i64],
+) -> Result<HashMap<i64, PostgresTablePartitionLocalObjects>, tokio_postgres::Error> {
+    let rows = postgres_query_cached(client, sql, &[&oids]).await?;
     let mut result: HashMap<i64, PostgresTablePartitionLocalObjects> = HashMap::new();
     for row in &rows {
         let Ok(relid) = row.try_get::<_, i64>(0) else { continue };
@@ -3947,11 +4395,56 @@ pub async fn get_table_partition_local_objects_for_relations(
     Ok(result)
 }
 
+fn postgres_table_partition_local_objects_for_relations_query_tiers() -> [&'static str; 2] {
+    [
+        postgres_table_partition_local_objects_for_relations_sql(),
+        postgres_table_partition_local_objects_for_relations_compat_sql(),
+    ]
+}
+
 fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
     "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
-     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','f') \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
+     UNION ALL \
+     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
+     FROM pg_catalog.pg_constraint con \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype = 'c' AND con.conislocal \
+     UNION ALL \
+     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type \
+     FROM pg_catalog.pg_index ix \
+     JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
+     WHERE ix.indrelid = ANY($1::bigint[]) \
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = idx.oid) \
+     UNION ALL \
+     SELECT a.attrelid::bigint, 'column_default'::text AS object_kind, a.attname AS object_name, \
+            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type \
+     FROM pg_catalog.pg_attribute a \
+     JOIN pg_catalog.pg_inherits i ON i.inhrelid = a.attrelid \
+     JOIN pg_catalog.pg_attribute pa \
+       ON pa.attrelid = i.inhparent AND pa.attname = a.attname AND pa.attnum > 0 AND NOT pa.attisdropped \
+     LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+     LEFT JOIN pg_catalog.pg_attrdef pad ON pad.adrelid = pa.attrelid AND pad.adnum = pa.attnum \
+     WHERE a.attrelid = ANY($1::bigint[]) AND a.attnum > 0 AND NOT a.attisdropped \
+       AND ( \
+         (ad.oid IS NOT NULL AND (pad.oid IS NULL \
+              OR pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) \
+                 IS DISTINCT FROM pg_catalog.pg_get_expr(pad.adbin, pad.adrelid))) \
+         OR (ad.oid IS NULL AND pad.oid IS NOT NULL) \
+       ) \
+     ORDER BY relid, object_kind, object_name"
+}
+
+// PostgreSQL 9.2 has row_to_json(), but not the JSON ->> operator used above
+// to probe conparentid without directly referencing that newer catalog
+// column. Pre-11 servers do not have parent-linked constraint clones, so the
+// compatibility tier can omit only that filter and keep the same batched
+// result shape.
+fn postgres_table_partition_local_objects_for_relations_compat_sql() -> &'static str {
+    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
+     FROM pg_catalog.pg_constraint con \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
      UNION ALL \
      SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
      FROM pg_catalog.pg_constraint con \
@@ -4006,6 +4499,282 @@ fn postgres_check_constraints_sql() -> &'static str {
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'c' \
      ORDER BY con.conname"
+}
+
+/// All constraints on a table (primary key, foreign key, unique, check,
+/// exclude, and — on PG 18+ — not-null), as full `ConstraintInfo` records.
+/// `pg_constraint.contype` letters are expanded to display labels and the
+/// `conkey`/`confkey` attribute numbers are resolved to column names.
+/// PostgreSQL has no per-constraint disabled state, so `enabled` is always
+/// true; a `NOT VALID` constraint (e.g. an added-but-unvalidated CHECK or
+/// FK) reports `valid = false` and surfaces the "Not validated" badge.
+pub async fn list_constraints(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ConstraintInfo>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, postgres_constraints_sql(), &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .iter()
+        .map(|row| ConstraintInfo {
+            name: pg_row_try_string(row, 0),
+            constraint_type: postgres_constraint_type_label(&pg_row_try_string(row, 1)),
+            definition: pg_row_try_string(row, 2),
+            columns: row.try_get::<_, Vec<String>>(3).unwrap_or_default(),
+            ref_schema: row.try_get::<_, Option<String>>(4).ok().flatten(),
+            ref_table: row.try_get::<_, Option<String>>(5).ok().flatten(),
+            ref_columns: row.try_get::<_, Vec<String>>(6).unwrap_or_default(),
+            match_type: postgres_constraint_match_type(row.try_get::<_, Option<String>>(7).ok().flatten()),
+            on_update: postgres_fk_action_label(row.try_get::<_, Option<String>>(8).ok().flatten()),
+            on_delete: postgres_fk_action_label(row.try_get::<_, Option<String>>(9).ok().flatten()),
+            deferrable: row.try_get::<_, bool>(10).unwrap_or(false),
+            initially_deferred: row.try_get::<_, bool>(11).unwrap_or(false),
+            enabled: true,
+            valid: row.try_get::<_, bool>(12).unwrap_or(true),
+        })
+        .collect())
+}
+
+/// OpenGauss-compatible constraint metadata without PostgreSQL's array/LATERAL
+/// dependencies. Older OpenGauss releases expose conkey/confkey as catalog
+/// vectors but may reject WITH ORDINALITY or decode them differently on the
+/// wire, so resolve attribute numbers in Rust.
+pub async fn list_opengauss_constraints(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ConstraintInfo>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = match postgres_query_cached(&client, opengauss_constraints_sql(true), &[&schema, &table]).await {
+        Ok(rows) => rows,
+        Err(error) if is_missing_opengauss_constraint_column(&error, "convalidated") => {
+            log::debug!(
+                "[opengauss][constraints] convalidated unavailable; defaulting valid=true: {}",
+                pg_error_to_string(error)
+            );
+            postgres_query_cached(&client, opengauss_constraints_sql(false), &[&schema, &table])
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let local_relation_oid =
+        pg_row_try_u32(&rows[0], 13).ok_or("OpenGauss constraint metadata did not return a local relation OID")?;
+    let local_attributes = opengauss_relation_attributes(&client, local_relation_oid).await?;
+    let mut referenced_attributes: HashMap<u32, HashMap<i16, String>> = HashMap::new();
+    let mut result = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let name = pg_row_try_string(&row, 0);
+        let kind = pg_row_try_string(&row, 1);
+        let column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(&row, 3))
+            .map_err(|error| format!("failed to parse OpenGauss constraint {name} columns: {error}"))?;
+        let ref_column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(&row, 6))
+            .map_err(|error| format!("failed to parse OpenGauss constraint {name} referenced columns: {error}"))?;
+        let referenced_relation_oid = pg_row_try_u32(&row, 14).filter(|oid| *oid != 0);
+        let ref_columns = if kind == "f" {
+            if let Some(oid) = referenced_relation_oid {
+                if let std::collections::hash_map::Entry::Vacant(entry) = referenced_attributes.entry(oid) {
+                    entry.insert(opengauss_relation_attributes(&client, oid).await?);
+                }
+                map_opengauss_attribute_names(&ref_column_numbers, referenced_attributes.get(&oid).unwrap())
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        result.push(ConstraintInfo {
+            name,
+            constraint_type: postgres_constraint_type_label(&kind),
+            definition: pg_row_try_string(&row, 2),
+            columns: map_opengauss_attribute_names(&column_numbers, &local_attributes),
+            ref_schema: row.try_get::<_, Option<String>>(4).ok().flatten(),
+            ref_table: row.try_get::<_, Option<String>>(5).ok().flatten(),
+            ref_columns,
+            match_type: postgres_constraint_match_type(pg_row_try_optional_text(&row, 7)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(&row, 8)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(&row, 9)),
+            deferrable: pg_row_try_bool(&row, 10).unwrap_or(false),
+            initially_deferred: pg_row_try_bool(&row, 11).unwrap_or(false),
+            enabled: true,
+            valid: pg_row_try_bool(&row, 12).unwrap_or(true),
+        });
+    }
+    Ok(result)
+}
+
+fn opengauss_constraints_sql(include_validated: bool) -> &'static str {
+    if include_validated {
+        "SELECT COALESCE(con.conname, ''), \
+                con.contype::text, \
+                COALESCE(pg_catalog.pg_get_constraintdef(con.oid, true), ''), \
+                COALESCE(con.conkey::text, ''), \
+                refn.nspname, refc.relname, COALESCE(con.confkey::text, ''), \
+                CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END, \
+                CASE WHEN con.contype = 'f' THEN con.confupdtype::text END, \
+                CASE WHEN con.contype = 'f' THEN con.confdeltype::text END, \
+                con.condeferrable, con.condeferred, con.convalidated, \
+                con.conrelid::oid, con.confrelid::oid \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_class refc ON refc.oid = con.confrelid \
+         LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = refc.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+         ORDER BY COALESCE(con.conname, '')"
+    } else {
+        "SELECT COALESCE(con.conname, ''), \
+                con.contype::text, \
+                COALESCE(pg_catalog.pg_get_constraintdef(con.oid, true), ''), \
+                COALESCE(con.conkey::text, ''), \
+                refn.nspname, refc.relname, COALESCE(con.confkey::text, ''), \
+                CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END, \
+                CASE WHEN con.contype = 'f' THEN con.confupdtype::text END, \
+                CASE WHEN con.contype = 'f' THEN con.confdeltype::text END, \
+                con.condeferrable, con.condeferred, TRUE, \
+                con.conrelid::oid, con.confrelid::oid \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_class refc ON refc.oid = con.confrelid \
+         LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = refc.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+         ORDER BY COALESCE(con.conname, '')"
+    }
+}
+
+async fn opengauss_relation_attributes(
+    client: &tokio_postgres::Client,
+    relation_oid: u32,
+) -> Result<HashMap<i16, String>, String> {
+    let rows = client
+        .query(
+            "SELECT a.attnum, a.attname::text FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+            &[&relation_oid],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows.iter().filter_map(|row| Some((row.try_get::<_, i16>(0).ok()?, pg_row_try_string(row, 1)))).collect())
+}
+
+fn parse_opengauss_attribute_numbers(raw: &str) -> Result<Vec<i16>, String> {
+    let value = raw.trim().trim_matches(|character| matches!(character, '{' | '}' | '[' | ']'));
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<i16>().map_err(|_| format!("invalid attribute number {part:?}")))
+        .collect()
+}
+
+fn map_opengauss_attribute_names(numbers: &[i16], attributes: &HashMap<i16, String>) -> Vec<String> {
+    numbers.iter().filter_map(|number| attributes.get(number).cloned()).collect()
+}
+
+fn pg_row_try_u32(row: &Row, idx: usize) -> Option<u32> {
+    row.try_get::<_, u32>(idx)
+        .ok()
+        .or_else(|| row.try_get::<_, i64>(idx).ok().and_then(|value| u32::try_from(value).ok()))
+        .or_else(|| pg_row_try_string(row, idx).parse::<u32>().ok())
+}
+
+fn pg_row_try_optional_text(row: &Row, idx: usize) -> Option<String> {
+    if let Ok(value) = row.try_get::<_, Option<String>>(idx) {
+        return value.filter(|value| !value.is_empty());
+    }
+    row.try_get::<_, PgRawBytes>(idx)
+        .ok()
+        .and_then(|value| String::from_utf8(value.0).ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_missing_opengauss_constraint_column(error: &tokio_postgres::Error, column: &str) -> bool {
+    error.as_db_error().is_some_and(|db_error| {
+        db_error.code().code() == "42703" && db_error.message().to_ascii_lowercase().contains(column)
+    })
+}
+
+fn postgres_constraints_sql() -> &'static str {
+    "SELECT con.conname, \
+            con.contype::text, \
+            pg_catalog.pg_get_constraintdef(con.oid, true) AS definition, \
+            COALESCE(conkey.attnames, ARRAY[]::text[]) AS columns, \
+            refn.nspname AS ref_schema, \
+            refc.relname AS ref_table, \
+            COALESCE(confkey.attnames, ARRAY[]::text[]) AS ref_columns, \
+            CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END AS match_type, \
+            CASE WHEN con.contype = 'f' THEN con.confupdtype::text END AS on_update, \
+            CASE WHEN con.contype = 'f' THEN con.confdeltype::text END AS on_delete, \
+            con.condeferrable, \
+            con.condeferred, \
+            con.convalidated \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     LEFT JOIN pg_catalog.pg_class refc ON refc.oid = con.confrelid \
+     LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = refc.relnamespace \
+     LEFT JOIN LATERAL ( \
+         SELECT array_agg(a.attname::text ORDER BY ord.ord) AS attnames \
+         FROM unnest(con.conkey) WITH ORDINALITY AS ord(attnum, ord) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ord.attnum AND NOT a.attisdropped \
+     ) conkey ON true \
+     LEFT JOIN LATERAL ( \
+         SELECT array_agg(a.attname::text ORDER BY ord.ord) AS attnames \
+         FROM unnest(con.confkey) WITH ORDINALITY AS ord(attnum, ord) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = ord.attnum AND NOT a.attisdropped \
+     ) confkey ON true \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+     ORDER BY con.conname"
+}
+
+/// Expand a `pg_constraint.contype` letter to a human-readable label.
+fn postgres_constraint_type_label(contype: &str) -> String {
+    match contype {
+        "c" => "CHECK".to_string(),
+        "f" => "FOREIGN KEY".to_string(),
+        "p" => "PRIMARY KEY".to_string(),
+        "u" => "UNIQUE".to_string(),
+        "t" => "CONSTRAINT TRIGGER".to_string(),
+        "x" => "EXCLUDE".to_string(),
+        "n" => "NOT NULL".to_string(),
+        _ => contype.to_string(),
+    }
+}
+
+/// Normalize a `confupdtype`/`confdeltype` letter to an `information_schema`
+/// style referential-action label.
+fn postgres_fk_action_label(action: Option<String>) -> Option<String> {
+    action
+        .as_deref()
+        .and_then(|value| match value {
+            "a" => Some("NO ACTION"),
+            "r" => Some("RESTRICT"),
+            "c" => Some("CASCADE"),
+            "n" => Some("SET NULL"),
+            "d" => Some("SET DEFAULT"),
+            _ => None,
+        })
+        .map(str::to_string)
+}
+
+/// Normalize a `confmatchtype` letter to a match-type label.
+fn postgres_constraint_match_type(match_type: Option<String>) -> Option<String> {
+    match_type
+        .as_deref()
+        .and_then(|value| match value {
+            "f" => Some("FULL"),
+            "p" => Some("PARTIAL"),
+            "s" | "u" => Some("SIMPLE"),
+            _ => None,
+        })
+        .map(str::to_string)
 }
 
 fn postgres_table_partition_relation_sql() -> &'static str {
@@ -4063,7 +4832,7 @@ fn postgres_table_partition_local_objects_sql() -> &'static str {
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','f') \
+     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
      SELECT 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
@@ -5669,7 +6438,8 @@ async fn get_columns_with_sql(
 pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let tiers = [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL, POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL];
-    query_with_compat_fallback("get_columns", &tiers, |sql| get_columns_with_sql(&client, sql, schema, table)).await
+    query_with_non_empty_compat_fallback("get_columns", &tiers, |sql| get_columns_with_sql(&client, sql, schema, table))
+        .await
 }
 
 fn pg_quote_literal(value: &str) -> String {
@@ -5767,6 +6537,16 @@ pub(crate) enum PostgresSearchPathContext {
     LocalQueryTransaction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresSearchPathBaseline {
+    configured: String,
+    first_resolved_schema: Option<String>,
+    has_explicit_pg_catalog: bool,
+}
+
+type PostgresSearchPathBaselineEntry = (Weak<deadpool_postgres::StatementCache>, PostgresSearchPathBaseline);
+type PostgresSearchPathBaselineCache = Mutex<HashMap<usize, PostgresSearchPathBaselineEntry>>;
+
 pub(crate) fn postgres_set_search_path_sql(schema: &str, context: PostgresSearchPathContext) -> String {
     let (scope, suffix) = match context {
         // Ordinary queries and exports historically fall back to public for
@@ -5781,12 +6561,93 @@ pub(crate) fn postgres_set_search_path_sql(schema: &str, context: PostgresSearch
 }
 
 fn postgres_set_single_schema_search_path_sql(schema: &str, context: PostgresSearchPathContext) -> String {
-    let scope = if context == PostgresSearchPathContext::LocalTransaction { " LOCAL" } else { "" };
+    let scope = if matches!(
+        context,
+        PostgresSearchPathContext::LocalTransaction | PostgresSearchPathContext::LocalQueryTransaction
+    ) {
+        " LOCAL"
+    } else {
+        ""
+    };
     format!("SET{scope} search_path TO {}", pg_quote_ident(schema))
 }
 
+/// Whether a trimmed search_path element is the `"$user"` placeholder that
+/// PostgreSQL accepts in `SET search_path` but Redshift rejects with a syntax
+/// error; identifiers merely containing the substring do not count.
+fn is_postgres_user_placeholder(element: &str) -> bool {
+    matches!(element, "$user" | "\"$user\"")
+}
+
+fn postgres_set_preserved_search_path_sql(
+    schema: &str,
+    context: PostgresSearchPathContext,
+    baseline: &PostgresSearchPathBaseline,
+) -> String {
+    let scope = if matches!(
+        context,
+        PostgresSearchPathContext::LocalTransaction | PostgresSearchPathContext::LocalQueryTransaction
+    ) {
+        " LOCAL"
+    } else {
+        ""
+    };
+    let configured = baseline.configured.trim();
+    // Redshift rejects the "$user" placeholder inside `SET search_path` even
+    // though `current_setting('search_path')` reports it, so any preserved-path
+    // statement containing the element fails with a syntax error. Drop the
+    // literal `"$user"` / `$user` elements (never a plain replace, which would
+    // also mangle ordinary identifiers containing that substring); keeping the
+    // placeholder is pointless while switching schemas anyway because the
+    // selected schema is already prepended first.
+    let configured_elements: Vec<&str> = configured.split(',').map(str::trim).collect();
+    let drops_user_placeholder = configured_elements.iter().any(|element| is_postgres_user_placeholder(element));
+    let configured = if drops_user_placeholder {
+        configured_elements
+            .iter()
+            .filter(|element| !is_postgres_user_placeholder(element))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        configured.to_string()
+    };
+    let selected_schema = pg_quote_ident(schema);
+    // The first resolved schema can come from "$user". Once that placeholder is
+    // removed for compatible servers, the selected schema must replace it unless
+    // the configured path also contains that schema explicitly.
+    let selected_schema_is_explicit = configured_elements
+        .iter()
+        .any(|element| !is_postgres_user_placeholder(element) && (*element == schema || *element == selected_schema));
+    let selected_schema_was_removed = drops_user_placeholder
+        && baseline.first_resolved_schema.as_deref() == Some(schema)
+        && !selected_schema_is_explicit;
+    let mut path = if baseline.first_resolved_schema.as_deref() == Some(schema) && !selected_schema_was_removed {
+        configured
+    } else if configured.is_empty() {
+        selected_schema.clone()
+    } else {
+        format!("{selected_schema}, {configured}")
+    };
+    if path.is_empty() {
+        path = selected_schema;
+    }
+    if !baseline.has_explicit_pg_catalog {
+        path.push_str(", pg_catalog");
+    }
+    format!("SET{scope} search_path TO {path}")
+}
+
 fn postgres_requires_single_schema_search_path(error: &str) -> bool {
-    error.to_ascii_lowercase().contains("does not support search_path with multiple names")
+    let error = error.to_ascii_lowercase();
+    if error.contains("does not support search_path with multiple names") {
+        return true;
+    }
+    // Redshift rejects incompatible search_path elements (e.g. "$user") with
+    // `ERROR: syntax error at or near "$" in context "search_path TO ..."`.
+    // Only treat it as a single-schema case when the very same message mentions
+    // search_path, so unrelated syntax errors near "$" fall through untouched.
+    error.contains("syntax error at or near \"$\"") && error.contains("search_path")
 }
 
 fn postgres_single_schema_clients() -> &'static Mutex<HashMap<usize, Weak<deadpool_postgres::StatementCache>>> {
@@ -5815,6 +6676,61 @@ fn mark_postgres_client_single_schema_search_path(client: &deadpool_postgres::Cl
     clients.insert(key, Arc::downgrade(statement_cache));
 }
 
+fn postgres_search_path_baselines() -> &'static PostgresSearchPathBaselineCache {
+    static BASELINES: OnceLock<PostgresSearchPathBaselineCache> = OnceLock::new();
+    BASELINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_postgres_search_path_baseline(client: &deadpool_postgres::Client) -> Option<PostgresSearchPathBaseline> {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut baselines = postgres_search_path_baselines().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match baselines.get(&key) {
+        Some((cached, baseline)) if cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, statement_cache)) => {
+            Some(baseline.clone())
+        }
+        _ => {
+            baselines.remove(&key);
+            None
+        }
+    }
+}
+
+fn cache_postgres_search_path_baseline(client: &deadpool_postgres::Client, baseline: PostgresSearchPathBaseline) {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut baselines = postgres_search_path_baselines().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    baselines.retain(|_, (cached, _)| cached.strong_count() > 0);
+    baselines.insert(key, (Arc::downgrade(statement_cache), baseline));
+}
+
+async fn postgres_search_path_baseline(
+    client: &deadpool_postgres::Client,
+    timeout_duration: Duration,
+) -> Result<PostgresSearchPathBaseline, String> {
+    if let Some(baseline) = cached_postgres_search_path_baseline(client) {
+        return Ok(baseline);
+    }
+    let row = tokio::time::timeout(
+        timeout_duration,
+        client.query_one(
+            "SELECT current_setting('search_path'), (current_schemas(false))[1], \
+                    'pg_catalog' = ANY(current_schemas(false))",
+            &[],
+        ),
+    )
+    .await
+    .map_err(|_| format!("PostgreSQL schema.get timed out after {} seconds", timeout_duration.as_secs()))?
+    .map_err(pg_error_to_string)?;
+    let baseline = PostgresSearchPathBaseline {
+        configured: row.try_get(0).map_err(|error| error.to_string())?,
+        first_resolved_schema: row.try_get(1).map_err(|error| error.to_string())?,
+        has_explicit_pg_catalog: row.try_get(2).map_err(|error| error.to_string())?,
+    };
+    cache_postgres_search_path_baseline(client, baseline.clone());
+    Ok(baseline)
+}
+
 pub(crate) async fn set_postgres_search_path(
     client: &deadpool_postgres::Client,
     schema: &str,
@@ -5831,7 +6747,13 @@ pub(crate) async fn set_postgres_search_path(
         .await;
     }
 
-    let primary_sql = postgres_set_search_path_sql(schema, context);
+    let primary_sql = match postgres_search_path_baseline(client, timeout_duration).await {
+        Ok(baseline) => postgres_set_preserved_search_path_sql(schema, context, &baseline),
+        Err(error) => {
+            log::warn!("[postgres][schema.get:error] schema={schema} error={error}; using compatibility fallback");
+            postgres_set_search_path_sql(schema, context)
+        }
+    };
     match execute_postgres_infra_statement(client, &primary_sql, timeout_duration, "schema.set").await {
         Ok(affected) => Ok(affected),
         Err(primary_error) if postgres_requires_single_schema_search_path(&primary_error) => {
@@ -5856,27 +6778,60 @@ fn query_result_row_limit(max_rows: Option<usize>) -> usize {
     max_rows.unwrap_or(crate::query::MAX_ROWS).max(1)
 }
 
+/// Returns whether a parsed DML statement produces a result set, or `None` when
+/// the statement is not DML.
+fn postgres_dml_statement_returns_rows(statement: &Statement) -> Option<bool> {
+    match statement {
+        Statement::Insert(insert) => Some(insert.returning.is_some()),
+        Statement::Update(update) => Some(update.returning.is_some()),
+        Statement::Delete(delete) => Some(delete.returning.is_some()),
+        Statement::Merge(merge) => Some(merge.output.is_some()),
+        _ => None,
+    }
+}
+
+/// `WITH cte AS (...) UPDATE ...` parses as a query whose body is the wrapped
+/// DML statement; returns that statement so its `RETURNING` clause can decide.
+fn postgres_query_body_dml(body: &SetExpr) -> Option<&Statement> {
+    match body {
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => Some(statement),
+        _ => None,
+    }
+}
+
 /// Returns whether PostgreSQL should execute this statement through the row
 /// retrieval path. DML without `RETURNING` needs `execute` for its command
 /// tag/affected-row count, while DML with `RETURNING` produces a result set.
 pub(crate) fn postgres_statement_returns_rows(sql: &str) -> bool {
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE"]) {
         return true;
     }
 
+    // A leading `WITH` is usually a CTE query, but PostgreSQL also allows a CTE
+    // to be followed directly by INSERT/UPDATE/DELETE/MERGE, which only returns
+    // rows with `RETURNING`. The prefix alone cannot decide, so parse it and
+    // keep the row-returning assumption whenever parsing does not say otherwise.
+    let leads_with_cte = starts_with_executable_sql_keyword(sql, &["WITH"]);
+
     let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
-        return false;
+        return leads_with_cte;
     };
     let [statement] = statements.as_slice() else {
-        return false;
+        return leads_with_cte;
     };
 
+    if let Some(returns_rows) = postgres_dml_statement_returns_rows(statement) {
+        return returns_rows;
+    }
+
     match statement {
-        Statement::Insert(insert) => insert.returning.is_some(),
-        Statement::Update(update) => update.returning.is_some(),
-        Statement::Delete(delete) => delete.returning.is_some(),
-        Statement::Merge(merge) => merge.output.is_some(),
-        _ => false,
+        Statement::Query(query) => {
+            postgres_query_body_dml(&query.body).and_then(postgres_dml_statement_returns_rows).unwrap_or(true)
+        }
+        _ => leads_with_cte,
     }
 }
 
@@ -5918,6 +6873,44 @@ pub async fn execute_query_with_max_rows(
     }
 }
 
+/// Progress-aware variant of [`execute_query_with_max_rows`] for long transfers.
+///
+/// Row-returning queries run under an *inactivity* budget: the clock is reset
+/// every time PostgreSQL actually delivers a row, so a large table that keeps
+/// streaming is never cancelled merely for exceeding the timeout in total. Only
+/// a genuine stall (no row for the whole timeout) is reported as a timeout.
+/// Statements that return no rows have no incremental progress to report, so
+/// they keep the plain wall-clock path.
+pub(crate) async fn execute_query_with_max_rows_progress(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    progress_clock: Arc<StreamProgressClock>,
+    timeout: Option<Duration>,
+) -> Result<QueryResult, String> {
+    if !postgres_statement_returns_rows(sql) {
+        // DDL/DML expose no incremental progress, so keep the original wall-clock
+        // budget: a hung write must still be bounded by the configured timeout.
+        return crate::query::wait_for_query_opt(None, timeout, execute_query_with_max_rows(pool, sql, max_rows)).await;
+    }
+
+    let start = Instant::now();
+    let row_limit = query_result_row_limit(max_rows);
+    let timeout_error = format!("Query timed out after {} seconds", timeout.map_or(0, |timeout| timeout.as_secs()));
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let clock_for_select = progress_clock.clone();
+    await_stream_with_progress_timeout(
+        async move {
+            execute_select_query_with_progress(&client, sql, start, row_limit, Some(&clock_for_select), false).await
+        },
+        timeout,
+        progress_clock,
+        None,
+        timeout_error,
+    )
+    .await
+}
+
 pub async fn execute_query_with_max_rows_and_cancel(
     pool: &Pool,
     sql: &str,
@@ -5941,15 +6934,8 @@ pub async fn execute_query_with_max_rows_and_cancel(
     .await
 }
 
-fn postgres_read_only_transaction_setup(schema: Option<&str>) -> Vec<(String, &'static str)> {
-    let mut statements = vec![("BEGIN READ ONLY".to_string(), "explain_analyze.begin")];
-    if let Some(schema) = schema.map(str::trim).filter(|schema| !schema.is_empty()) {
-        statements.push((
-            postgres_set_search_path_sql(schema, PostgresSearchPathContext::LocalQueryTransaction),
-            "explain_analyze.schema",
-        ));
-    }
-    statements
+fn postgres_read_only_transaction_setup() -> Vec<(String, &'static str)> {
+    vec![("BEGIN READ ONLY".to_string(), "explain_analyze.begin")]
 }
 
 fn postgres_read_only_transaction_cleanup_error(error: String) -> String {
@@ -5995,12 +6981,21 @@ pub async fn execute_query_in_read_only_transaction_with_rollback(
     cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
     let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
-    let setup = postgres_read_only_transaction_setup(schema);
+    let setup = postgres_read_only_transaction_setup();
 
     run_postgres_operation_with_rollback(
         || async {
             for (statement, stage) in setup {
                 execute_postgres_infra_statement(&client, &statement, budget.recycle_timeout, stage).await?;
+            }
+            if let Some(schema) = schema.map(str::trim).filter(|schema| !schema.is_empty()) {
+                set_postgres_search_path(
+                    &client,
+                    schema,
+                    PostgresSearchPathContext::LocalQueryTransaction,
+                    budget.recycle_timeout,
+                )
+                .await?;
             }
 
             execute_postgres_user_query_with_mode(
@@ -6688,7 +7683,8 @@ async fn execute_query_with_max_rows_inner(
 // Sibling of `postgres_indexes_for_relations_sql` (~line 3288), for a single
 // (schema, table) instead of a batch of oids — see the note there.
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
-             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
+             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
+             array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
@@ -6696,14 +7692,18 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              ix.indnkeyatts AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
-             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression \
+             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
+             JOIN LATERAL unnest(ix.indkey, ix.indclass) WITH ORDINALITY AS k(attnum, class_oid, n) ON true \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
+             LEFT JOIN pg_opclass oc ON oc.oid = k.class_oid \
+             LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace \
              WHERE t.oid = (CASE WHEN $1 = '' THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY i.relname";
@@ -6712,7 +7712,7 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
 // 3312) — see the note on `POSTGRES_INDEXES_SQL` above.
 const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              ARRAY( \
-               SELECT COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, pos.n, true)) \
+               SELECT COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, pos.n, false)) \
                FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
                LEFT JOIN pg_attribute a \
                  ON a.attrelid = t.oid \
@@ -6720,11 +7720,24 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS columns, \
+             ARRAY( \
+               SELECT CASE WHEN oc.opcdefault THEN NULL \
+                           ELSE oc.opcname \
+                      END \
+               FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
+               LEFT JOIN pg_attribute a \
+                 ON a.attrelid = t.oid \
+                AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
+                AND a.attnum > 0 \
+               LEFT JOIN pg_opclass oc \
+                 ON oc.oid = (string_to_array(ix.indclass::text, ' '))[pos.n]::oid \
+               ORDER BY pos.n \
+             ) AS column_opclasses, \
              (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
-             NULL::smallint AS nkeyatts, \
+             array_length(string_to_array(ix.indoption::text, ' '), 1)::smallint AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              ARRAY( \
@@ -6735,7 +7748,9 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
-             ) AS key_is_expression \
+             ) AS key_is_expression, \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -6818,6 +7833,16 @@ pub(crate) async fn postgres_relation_relkind(
     row.map(|row| row.try_get::<_, String>(0)).transpose().map_err(pg_error_to_string)
 }
 
+/// Compute per-column operator classes from `pg_opclass` joined via
+/// `pg_index.indclass`. For each key column position, the schema-qualified
+/// opclass (`quote_ident(nspname) || '.' || quote_ident(opcname)`) is returned
+/// unless the class is the type's default (`oc.opcdefault`), so DDL regeneration
+/// resolves the opclass regardless of `search_path`. This applies to every key
+/// position, including expression keys (`a.attname IS NULL`): the per-column
+/// `pg_get_indexdef(indexrelid, colno, pretty)` call returns only the bare
+/// expression text (PostgreSQL sets `attrsOnly = (colno != 0)`, so the
+/// opclass/COLLATE/DESC block is skipped — see `ruleutils.c`), so the opclass
+/// must be read from `indclass` rather than parsed out of that text.
 async fn list_indexes_with_sql(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -6830,25 +7855,36 @@ async fn list_indexes_with_sql(
         .iter()
         .map(|row| {
             let all_cols: Vec<String> = row.try_get::<_, Vec<String>>(1).unwrap_or_default();
-            let nkeyatts = row.try_get::<_, Option<i16>>(6).ok().flatten().unwrap_or(all_cols.len() as i16) as usize;
+            let all_opclasses: Vec<Option<String>> = row.try_get::<_, Vec<Option<String>>>(2).unwrap_or_default();
+            let nkeyatts = row.try_get::<_, Option<i16>>(7).ok().flatten().unwrap_or(all_cols.len() as i16) as usize;
             let split_at = nkeyatts.min(all_cols.len());
             let key_cols = all_cols[..split_at].to_vec();
+            let key_opclasses = if all_opclasses.len() == all_cols.len() {
+                all_opclasses[..split_at].to_vec()
+            } else {
+                vec![None; split_at]
+            };
             let included = if split_at < all_cols.len() { all_cols[split_at..].to_vec() } else { vec![] };
             // `a.attname IS NULL` at a given key position means that key part came back from
             // pg_get_indexdef (a functional/expression key part), not from a real column (#6295).
-            let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(9).unwrap_or_default();
+            let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(10).unwrap_or_default();
             let key_is_expression =
                 if all_is_expr.len() == all_cols.len() { all_is_expr[..split_at].to_vec() } else { Vec::new() };
+            let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(11).unwrap_or_default();
+            let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
             IndexInfo {
                 name: pg_row_try_string(row, 0),
                 columns: key_cols,
-                is_unique: pg_row_try_bool(row, 2).unwrap_or(false),
-                is_primary: pg_row_try_bool(row, 3).unwrap_or(false),
-                filter: row.try_get::<_, Option<String>>(4).ok().flatten(),
-                index_type: row.try_get::<_, Option<String>>(5).ok().flatten(),
+                is_unique: pg_row_try_bool(row, 3).unwrap_or(false),
+                is_primary: pg_row_try_bool(row, 4).unwrap_or(false),
+                filter: row.try_get::<_, Option<String>>(5).ok().flatten(),
+                index_type: row.try_get::<_, Option<String>>(6).ok().flatten(),
                 included_columns: if included.is_empty() { None } else { Some(included) },
-                comment: row.try_get::<_, Option<String>>(8).ok().flatten(),
+                comment: row.try_get::<_, Option<String>>(9).ok().flatten(),
                 key_is_expression,
+                column_opclasses: key_opclasses,
+                key_options,
+                constraint_backed: pg_row_try_bool(row, 12).unwrap_or(false),
             }
         })
         .collect())
@@ -6885,42 +7921,59 @@ pub async fn list_invalid_indexes(pool: &Pool, schema: &str, table: &str) -> Res
 }
 
 fn postgres_foreign_keys_sql() -> &'static str {
-    "SELECT fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
-     FROM information_schema.table_constraints tc \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-       AND fk.table_schema = $1 AND fk.table_name = $2 \
-     ORDER BY fk.constraint_name, fk.ordinal_position"
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
 }
 
-fn postgres_foreign_key_action(value: String) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+// Pre-9.4 sibling of `postgres_foreign_keys_sql`: WITH ORDINALITY requires
+// PostgreSQL 9.4, so pair conkey/confkey positions with generate_series plus
+// plain subscripts. The series bounds must stay constant: before PostgreSQL
+// 9.3 a FROM item's function arguments cannot reference an earlier FROM item
+// (implicit LATERAL), so bound the series by INDEX_MAX_KEYS (32, stable across
+// PostgreSQL 9–18) and cap the ordinal with a join-condition guard instead.
+fn postgres_foreign_keys_compat_sql() -> &'static str {
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
 }
 
-pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
-
+async fn list_foreign_keys_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &'static str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, tokio_postgres::Error> {
+    let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
     Ok(rows
         .iter()
         .map(|row| ForeignKeyInfo {
@@ -6929,10 +7982,92 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
             ref_schema: Some(pg_row_try_string(row, 2)),
             ref_table: pg_row_try_string(row, 3),
             ref_column: pg_row_try_string(row, 4),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 5)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 6)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 5)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 6)),
         })
         .collect())
+}
+
+pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let tiers = [postgres_foreign_keys_sql(), postgres_foreign_keys_compat_sql()];
+    query_with_compat_fallback("list_foreign_keys", &tiers, |sql| {
+        list_foreign_keys_with_sql(&client, sql, schema, table)
+    })
+    .await
+}
+
+/// OpenGauss-safe foreign key metadata. Mirrors `list_opengauss_constraints`:
+/// older OpenGauss releases may reject WITH ORDINALITY or decode catalog arrays
+/// differently on the wire, so read conkey/confkey as text and resolve the
+/// attribute numbers in Rust.
+pub async fn list_opengauss_foreign_keys(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, opengauss_foreign_keys_sql(), &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let local_relation_oid =
+        pg_row_try_u32(&rows[0], 7).ok_or("OpenGauss foreign key metadata did not return a local relation OID")?;
+    let local_attributes = opengauss_relation_attributes(&client, local_relation_oid).await?;
+    let mut referenced_attributes: HashMap<u32, HashMap<i16, String>> = HashMap::new();
+    let mut result = Vec::new();
+
+    for row in &rows {
+        let name = pg_row_try_string(row, 0);
+        let column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 3))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} columns: {error}"))?;
+        let ref_column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 4))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} referenced columns: {error}"))?;
+        let ref_schema = pg_row_try_string(row, 1);
+        let ref_table = pg_row_try_string(row, 2);
+        let on_update = postgres_fk_action_label(pg_row_try_optional_text(row, 5));
+        let on_delete = postgres_fk_action_label(pg_row_try_optional_text(row, 6));
+        let Some(referenced_relation_oid) = pg_row_try_u32(row, 8).filter(|oid| *oid != 0) else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = referenced_attributes.entry(referenced_relation_oid) {
+            entry.insert(opengauss_relation_attributes(&client, referenced_relation_oid).await?);
+        }
+        let ref_attributes = referenced_attributes.get(&referenced_relation_oid).unwrap();
+        for (fk_number, pk_number) in column_numbers.iter().zip(ref_column_numbers.iter()) {
+            let Some(column) = local_attributes.get(fk_number) else { continue };
+            let Some(ref_column) = ref_attributes.get(pk_number) else { continue };
+            result.push(ForeignKeyInfo {
+                name: name.clone(),
+                column: column.clone(),
+                ref_schema: Some(ref_schema.clone()),
+                ref_table: ref_table.clone(),
+                ref_column: ref_column.clone(),
+                on_update: on_update.clone(),
+                on_delete: on_delete.clone(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn opengauss_foreign_keys_sql() -> &'static str {
+    "SELECT con.conname, \
+            ref_n.nspname, ref_c.relname, \
+            COALESCE(con.conkey::text, ''), COALESCE(con.confkey::text, ''), \
+            con.confupdtype::text, con.confdeltype::text, \
+            con.conrelid::oid, con.confrelid::oid \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname"
 }
 
 fn postgres_table_dependencies_sql() -> &'static str {
@@ -7165,6 +8300,39 @@ fn postgres_sequence_last_values_sql() -> &'static str {
      WHERE c.relkind = 'S' AND n.nspname = $1"
 }
 
+// PostgreSQL 9.x sibling of `postgres_sequences_sql`: the `pg_sequence` catalog
+// (and the `pg_sequence_last_value` function used below) were only added in
+// PostgreSQL 10. Older servers still expose the same properties through the
+// portable `information_schema.sequences` view, which is what openGauss's
+// tier already relies on for the same reason.
+fn postgres_sequences_compat_sql() -> &'static str {
+    "SELECT s.sequence_name, \
+      COALESCE(s.data_type::text, 'bigint'), \
+      COALESCE(s.start_value::text, '1'), \
+      COALESCE(s.minimum_value::text, '1'), \
+      COALESCE(s.maximum_value::text, '9223372036854775807'), \
+      COALESCE(s.increment::text, '1'), \
+      COALESCE(s.cycle_option::text, 'NO') \
+     FROM information_schema.sequences s \
+     WHERE s.sequence_schema = $1 \
+     ORDER BY s.sequence_name"
+}
+
+// Pre-PG10 servers have no `pg_sequence_last_value(oid)` function to read an
+// arbitrary sequence's current value from a single batched query, so the
+// compat tier falls back to querying each sequence relation directly (the
+// pre-10 way of reading `last_value`), one round trip per sequence.
+async fn postgres_sequence_last_value_compat(
+    client: &deadpool_postgres::Client,
+    schema: &str,
+    sequence_name: &str,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    let qualified = format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(sequence_name));
+    let sql = format!("SELECT last_value::text FROM {qualified}");
+    let rows = postgres_query_cached(client, &sql, &[]).await?;
+    Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()))
+}
+
 fn opengauss_sequence_last_values_sql() -> &'static str {
     "SELECT c.relname, (pg_sequence_last_value(c.oid)).last_value::text \
      FROM pg_class c \
@@ -7213,15 +8381,58 @@ async fn list_sequences_with_sql(
 }
 
 pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -> Result<Vec<SequenceInfo>, String> {
-    // PostgreSQL 10+ stores sequence properties in pg_sequence.
-    list_sequences_with_sql(
-        pool,
-        schema,
-        with_last_values,
-        postgres_sequences_sql(),
-        postgres_sequence_last_values_sql(),
-    )
-    .await
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+
+    // PostgreSQL 10+ stores sequence properties in pg_sequence; older servers
+    // fall back to the portable information_schema.sequences view.
+    let (rows, is_legacy) = match postgres_query_cached(&client, postgres_sequences_sql(), &[&schema]).await {
+        Ok(rows) => (rows, false),
+        Err(primary_error) => match postgres_query_cached(&client, postgres_sequences_compat_sql(), &[&schema]).await {
+            Ok(rows) => {
+                log::debug!(
+                    "[postgres][sequences:compat-used] pg_sequence catalog unavailable ({}); serving sequence metadata from information_schema.sequences",
+                    pg_error_to_string(primary_error)
+                );
+                (rows, true)
+            }
+            Err(_) => return Err(primary_error.to_string()),
+        },
+    };
+
+    let mut sequences: Vec<SequenceInfo> = rows
+        .iter()
+        .map(|row| SequenceInfo {
+            name: pg_row_try_string(row, 0),
+            data_type: pg_row_try_string(row, 1),
+            start_value: pg_row_try_string(row, 2),
+            min_value: pg_row_try_string(row, 3),
+            max_value: pg_row_try_string(row, 4),
+            increment: pg_row_try_string(row, 5),
+            cycle: pg_row_try_string(row, 6) == "YES",
+            last_value: None,
+        })
+        .collect();
+
+    if with_last_values {
+        if is_legacy {
+            for seq in sequences.iter_mut() {
+                if let Ok(Some(value)) = postgres_sequence_last_value_compat(&client, schema, &seq.name).await {
+                    seq.last_value = Some(value);
+                }
+            }
+        } else if let Ok(rows) = postgres_query_cached(&client, postgres_sequence_last_values_sql(), &[&schema]).await {
+            for row in rows {
+                let name: String = pg_row_try_string(&row, 0);
+                if let Ok(Some(value)) = row.try_get::<_, Option<String>>(1) {
+                    if let Some(seq) = sequences.iter_mut().find(|s| s.name == name) {
+                        seq.last_value = Some(value);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(sequences)
 }
 
 pub async fn list_opengauss_sequences(
@@ -7536,6 +8747,154 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_postgres::types::FromSql;
+
+    fn postgres_numeric_binary(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(8 + digits.len() * 2);
+        raw.extend_from_slice(&u16::try_from(digits.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&weight.to_be_bytes());
+        raw.extend_from_slice(&sign.to_be_bytes());
+        raw.extend_from_slice(&scale.to_be_bytes());
+        for digit in digits {
+            raw.extend_from_slice(&digit.to_be_bytes());
+        }
+        raw
+    }
+
+    fn postgres_numeric_array_binary(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        raw.extend_from_slice(&i32::from(values.iter().any(Option::is_none)).to_be_bytes());
+        raw.extend_from_slice(&Type::NUMERIC.oid().to_be_bytes());
+        raw.extend_from_slice(&i32::try_from(values.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            if let Some(value) = value {
+                raw.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+                raw.extend_from_slice(value);
+            } else {
+                raw.extend_from_slice(&(-1_i32).to_be_bytes());
+            }
+        }
+        raw
+    }
+
+    fn postgres_ndim_array_binary(elem_type: &Type, dims: &[i32], elements: &[Option<Vec<u8>>]) -> Vec<u8> {
+        assert_eq!(dims.iter().map(|&len| len as usize).product::<usize>(), elements.len());
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&i32::try_from(dims.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&i32::from(elements.iter().any(Option::is_none)).to_be_bytes());
+        raw.extend_from_slice(&elem_type.oid().to_be_bytes());
+        for len in dims {
+            raw.extend_from_slice(&len.to_be_bytes());
+            raw.extend_from_slice(&1_i32.to_be_bytes());
+        }
+        for element in elements {
+            if let Some(element) = element {
+                raw.extend_from_slice(&i32::try_from(element.len()).unwrap().to_be_bytes());
+                raw.extend_from_slice(element);
+            } else {
+                raw.extend_from_slice(&(-1_i32).to_be_bytes());
+            }
+        }
+        raw
+    }
+
+    fn int4_bytes(value: i32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    fn text_bytes(value: &str) -> Vec<u8> {
+        value.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn ndim_array_decodes_two_dimensional_integers_as_server_literal() {
+        // `SELECT '{{1,2,3},{4,5,6},{7,8,9}}'::int[]` — same _int4 OID as a
+        // flat array, but tokio-postgres's Vec<T> rejects ndim > 1 (#8457).
+        let raw = postgres_ndim_array_binary(
+            &Type::INT4,
+            &[3, 3],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9].iter().map(|&v| Some(int4_bytes(v))).collect::<Vec<_>>(),
+        );
+        let decoded = PgNdimArrayLiteral::from_sql(&Type::INT4_ARRAY, &raw).unwrap();
+        assert_eq!(decoded.0, "{{1,2,3},{4,5,6},{7,8,9}}");
+    }
+
+    #[test]
+    fn ndim_array_quotes_text_elements_and_renders_nulls() {
+        let raw = postgres_ndim_array_binary(
+            &Type::TEXT,
+            &[2, 2],
+            &[Some(text_bytes("a b")), Some(text_bytes("c,d")), Some(text_bytes("")), None],
+        );
+        let decoded = PgNdimArrayLiteral::from_sql(&Type::TEXT_ARRAY, &raw).unwrap();
+        assert_eq!(decoded.0, r#"{{"a b","c,d"},{"",NULL}}"#);
+    }
+
+    #[test]
+    fn ndim_array_renders_bool_and_double_scalars() {
+        let bool_raw = postgres_ndim_array_binary(&Type::BOOL, &[2], &[Some(vec![1]), Some(vec![0])]);
+        assert_eq!(PgNdimArrayLiteral::from_sql(&Type::BOOL_ARRAY, &bool_raw).unwrap().0, "{t,f}");
+
+        let float_raw = postgres_ndim_array_binary(&Type::FLOAT8, &[2], &[Some(1.5f64.to_be_bytes().to_vec()), None]);
+        assert_eq!(PgNdimArrayLiteral::from_sql(&Type::FLOAT8_ARRAY, &float_raw).unwrap().0, "{1.5,NULL}");
+    }
+
+    #[test]
+    fn postgres_numeric_binary_values_preserve_arbitrary_precision() {
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 0, &[])).as_deref(), Some("0"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 2, &[])).as_deref(), Some("0.00"));
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(1, 0x0000, 4, &[1, 2345, 6789])).as_deref(),
+            Some("12345.6789")
+        );
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(-1, 0x4000, 7, &[12, 3000])).as_deref(),
+            Some("-0.0012300")
+        );
+
+        let tiny = decode_pg_numeric_bytes(&postgres_numeric_binary(-77, 0x0000, 307, &[10])).unwrap();
+        assert_eq!(tiny, format!("0.{}1", "0".repeat(306)));
+        assert_eq!(tiny.len(), 309);
+
+        let mut huge_digits = vec![9];
+        huge_digits.extend(std::iter::repeat_n(9999, 77));
+        let huge = "9".repeat(309);
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(77, 0x0000, 0, &huge_digits)).as_deref(),
+            Some(huge.as_str())
+        );
+
+        let decoded = PgNumeric::from_sql(&Type::NUMERIC, &postgres_numeric_binary(-77, 0x0000, 307, &[10])).unwrap();
+        assert_eq!(decoded.0, tiny);
+        assert!(PgNumeric::accepts(&Type::NUMERIC));
+        assert!(!PgNumeric::accepts(&Type::INT8));
+
+        let array_raw = postgres_numeric_array_binary(&[
+            Some(postgres_numeric_binary(-77, 0x0000, 307, &[10])),
+            None,
+            Some(postgres_numeric_binary(77, 0x0000, 0, &huge_digits)),
+        ]);
+        let array = Vec::<Option<PgNumeric>>::from_sql(&Type::NUMERIC_ARRAY, &array_raw).unwrap();
+        assert_eq!(
+            array.into_iter().map(|value| value.map(|value| value.0)).collect::<Vec<_>>(),
+            vec![Some(tiny), None, Some(huge)]
+        );
+    }
+
+    #[test]
+    fn postgres_numeric_binary_values_preserve_special_values_and_reject_malformed_payloads() {
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xC000, 0, &[])).as_deref(), Some("NaN"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xD000, 0, &[])).as_deref(), Some("Infinity"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xF000, 0, &[])).as_deref(), Some("-Infinity"));
+        assert!(decode_pg_numeric_bytes(&[]).is_none());
+        assert!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x8000, 0, &[])).is_none());
+        assert!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 0, &[10_000])).is_none());
+
+        let mut trailing_bytes = postgres_numeric_binary(0, 0x0000, 0, &[1]);
+        trailing_bytes.push(0);
+        assert!(decode_pg_numeric_bytes(&trailing_bytes).is_none());
+    }
 
     #[test]
     fn postgres_money_binary_values_are_decoded_with_two_decimal_places() {
@@ -8038,14 +9397,7 @@ mod tests {
     #[test]
     fn postgres_explain_analyze_uses_read_only_transaction_local_schema() {
         assert_eq!(
-            postgres_read_only_transaction_setup(Some("sales")),
-            vec![
-                ("BEGIN READ ONLY".to_string(), "explain_analyze.begin"),
-                ("SET LOCAL search_path TO \"sales\", pg_catalog, public".to_string(), "explain_analyze.schema"),
-            ]
-        );
-        assert_eq!(
-            postgres_read_only_transaction_setup(None),
+            postgres_read_only_transaction_setup(),
             vec![("BEGIN READ ONLY".to_string(), "explain_analyze.begin")]
         );
     }
@@ -8364,6 +9716,161 @@ mod tests {
             ),
             "SET LOCAL search_path TO \"tenant\"\"; RESET search_path; --\""
         );
+        assert_eq!(
+            postgres_set_single_schema_search_path_sql("application", PostgresSearchPathContext::LocalQueryTransaction),
+            "SET LOCAL search_path TO \"application\""
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_keeps_the_configured_path_when_selected_schema_is_first() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "application, extensions, public".to_string(),
+            first_resolved_schema: Some("application".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO application, extensions, public, pg_catalog"
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_prepends_selected_schema_without_dropping_configured_items() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "extensions, public".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"application\", extensions, public, pg_catalog"
+        );
+        assert_eq!(
+            postgres_set_preserved_search_path_sql(
+                "application",
+                PostgresSearchPathContext::LocalQueryTransaction,
+                &baseline,
+            ),
+            "SET LOCAL search_path TO \"application\", extensions, public, pg_catalog"
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_drops_redshift_user_placeholder_elements() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "\"$user\", public".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dwd_views\", public, pg_catalog"
+        );
+
+        let bare_baseline = PostgresSearchPathBaseline {
+            configured: "$user, public".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &bare_baseline),
+            "SET search_path TO \"dwd_views\", public, pg_catalog"
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_replaces_matching_user_placeholder_with_selected_schema() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "\"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dbx_test\", public, pg_catalog"
+        );
+
+        let explicit_baseline = PostgresSearchPathBaseline {
+            configured: "dbx_test, \"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &explicit_baseline),
+            "SET search_path TO dbx_test, public, pg_catalog"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_GAUSSDB_URL, DBX_TEST_GAUSSDB_SCHEMA, and DBX_TEST_GAUSSDB_TABLE"]
+    async fn gaussdb_selected_schema_matching_user_is_applied() {
+        let url = std::env::var("DBX_TEST_GAUSSDB_URL").expect("DBX_TEST_GAUSSDB_URL");
+        let schema = std::env::var("DBX_TEST_GAUSSDB_SCHEMA").expect("DBX_TEST_GAUSSDB_SCHEMA");
+        let table = std::env::var("DBX_TEST_GAUSSDB_TABLE").expect("DBX_TEST_GAUSSDB_TABLE");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect gaussdb");
+
+        let current_schema =
+            execute_query_with_schema(&pool, &schema, "SELECT current_schema()").await.expect("query current schema");
+        assert_eq!(current_schema.rows[0][0].as_str(), Some(schema.as_str()));
+
+        execute_query_with_schema(&pool, &schema, &format!("SELECT 1 FROM {} LIMIT 1", pg_quote_ident(&table)))
+            .await
+            .expect("query unqualified table in selected schema");
+    }
+
+    #[test]
+    fn postgres_search_path_user_placeholder_only_baseline_falls_back_to_selected_schema() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "\"$user\"".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dwd_views\", pg_catalog"
+        );
+
+        let explicit_catalog_baseline = PostgresSearchPathBaseline {
+            configured: "$user".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: true,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql(
+                "dwd_views",
+                PostgresSearchPathContext::Query,
+                &explicit_catalog_baseline
+            ),
+            "SET search_path TO \"dwd_views\""
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_keeps_identifiers_containing_user_placeholder_substrings() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "my$user_schema, \"$user_backup\", public".to_string(),
+            first_resolved_schema: Some("public".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dwd_views\", my$user_schema, \"$user_backup\", public, pg_catalog"
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_keeps_explicit_pg_catalog_position() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "extensions, pg_catalog, public".to_string(),
+            first_resolved_schema: Some("extensions".to_string()),
+            has_explicit_pg_catalog: true,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("application", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"application\", extensions, pg_catalog, public"
+        );
     }
 
     #[test]
@@ -8372,6 +9879,16 @@ mod tests {
             "ERROR: Hologres does not support search_path with multiple names: admaterial."
         ));
         assert!(!postgres_requires_single_schema_search_path("ERROR: permission denied for schema admaterial"));
+    }
+
+    #[test]
+    fn postgres_single_schema_fallback_matches_redshift_user_placeholder_syntax_error() {
+        assert!(postgres_requires_single_schema_search_path(
+            "ERROR: syntax error at or near \"$\" in context \"search_path TO \"dwd_views\", \"$user\", public\", at line 1"
+        ));
+        assert!(!postgres_requires_single_schema_search_path(
+            "ERROR: syntax error at or near \"$\" in context \"SELECT * FROM t WHERE id = $1\", at line 1"
+        ));
     }
 
     #[test]
@@ -8392,6 +9909,47 @@ mod tests {
             "DELETE FROM users WHERE id = 1",
             "MERGE INTO users AS target USING updates AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET name = source.name",
             "INSERT INTO users (note) VALUES ('RETURNING is text')",
+        ] {
+            assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
+        }
+    }
+
+    #[test]
+    fn cte_wrapped_dml_parses_as_query_body() {
+        let statements = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "WITH cte AS (SELECT id FROM t) UPDATE t SET x = 1 WHERE id IN (SELECT id FROM cte)",
+        )
+        .expect("CTE-wrapped UPDATE should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected a single Statement::Query, got: {statements:?}");
+        };
+        assert!(query.with.is_some(), "expected the CTE to be attached to the query");
+        assert!(
+            matches!(postgres_query_body_dml(&query.body), Some(Statement::Update(_))),
+            "expected an UPDATE body, got: {:?}",
+            query.body
+        );
+    }
+
+    #[test]
+    fn postgres_statement_returns_rows_for_cte_wrapped_dml() {
+        for sql in [
+            "WITH cte AS (SELECT id FROM t) SELECT * FROM cte",
+            "WITH cte AS (SELECT id FROM t) UPDATE t SET x = 1 WHERE id IN (SELECT id FROM cte) RETURNING id",
+            "WITH cte AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM cte) RETURNING id",
+            "WITH cte AS (SELECT id FROM t) INSERT INTO u (id) SELECT id FROM cte RETURNING id",
+            // Not parseable by sqlparser: keep assuming a CTE query returns rows.
+            "WITH RECURSIVE cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte",
+        ] {
+            assert!(postgres_statement_returns_rows(sql), "expected result rows for: {sql}");
+        }
+
+        for sql in [
+            "WITH cte AS (SELECT id FROM t) UPDATE t SET x = 1 WHERE id IN (SELECT id FROM cte)",
+            "WITH cte AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM cte)",
+            "WITH cte AS (SELECT id FROM t) INSERT INTO u (id) SELECT id FROM cte",
+            "  with cte as (select id from t)\n  update t set x = 1 where id in (select id from cte)  ",
         ] {
             assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
         }
@@ -8498,6 +10056,17 @@ mod tests {
         assert_eq!(pg_text_fallback_value("SRID=4326;point(1 2)", None), (serde_json::json!("point(1 2)"), Some(4326)));
     }
 
+    #[test]
+    fn postgres_text_fallback_does_not_panic_on_multibyte_text() {
+        // Redshift reads decode every simple-query value through the hex-WKB
+        // probe with an unknown column type, so ordinary multibyte text must
+        // pass through instead of slicing at a non-char byte boundary.
+        for value in ["中文字符测试数据", "🚚运输状态标签", "0101中文不是几何数据"] {
+            assert_eq!(pg_text_fallback_value(value, None), (serde_json::json!(value), None));
+            assert_eq!(pg_text_fallback_value(value, Some(PgColType::Geometry)), (serde_json::json!(value), None));
+        }
+    }
+
     struct DockerPostgres {
         name: String,
         port: u16,
@@ -8524,6 +10093,16 @@ mod tests {
     }
 
     async fn start_docker_postgres() -> Option<DockerPostgres> {
+        start_docker_postgres_image("postgres:16-alpine", &[]).await
+    }
+
+    // PostgreSQL 9.3 (pre-pg_sequence/pg_sequence_last_value) only ships an
+    // amd64 image, so Apple Silicon hosts need explicit emulation.
+    async fn start_docker_postgres_9_3() -> Option<DockerPostgres> {
+        start_docker_postgres_image("postgres:9.3", &["--platform", "linux/amd64"]).await
+    }
+
+    async fn start_docker_postgres_image(image: &str, extra_args: &[&str]) -> Option<DockerPostgres> {
         if !docker_ready() {
             eprintln!("skipping docker-backed postgres test because Docker is unavailable");
             return None;
@@ -8533,12 +10112,9 @@ mod tests {
         let container = DockerPostgres { name: format!("dbx-postgres-enum-{}", uuid::Uuid::new_v4()), port };
 
         let status = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &container.name])
+            .args(extra_args)
             .args([
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                &container.name,
                 "-e",
                 "POSTGRES_PASSWORD=postgres",
                 "-e",
@@ -8547,7 +10123,7 @@ mod tests {
                 "POSTGRES_DB=postgres",
                 "-p",
                 &format!("{port}:5432"),
-                "postgres:16-alpine",
+                image,
             ])
             .status()
             .expect("start docker postgres");
@@ -9200,9 +10776,64 @@ mod tests {
     fn postgres_foreign_keys_sql_selects_referential_actions() {
         let sql = postgres_foreign_keys_sql();
 
-        assert!(sql.contains("rc.update_rule AS on_update"));
-        assert!(sql.contains("rc.delete_rule AS on_delete"));
-        assert!(sql.contains("information_schema.referential_constraints rc"));
+        assert!(sql.contains("pg_catalog.pg_constraint"));
+        assert!(sql.contains("con.confupdtype::text AS on_update_raw"));
+        assert!(sql.contains("con.confdeltype::text AS on_delete_raw"));
+        assert!(sql.contains("confdeltype"));
+        assert!(sql.contains("ref_n.nspname"));
+        assert!(sql.contains("unnest(con.conkey) WITH ORDINALITY"));
+        assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(sql.contains("con.contype = 'f'"));
+        assert!(sql.contains("NOT a.attisdropped"));
+        assert!(sql.contains("JOIN LATERAL"));
+        assert!(!sql.contains("information_schema"));
+    }
+
+    #[test]
+    fn postgres_foreign_key_metadata_has_legacy_catalog_fallback() {
+        // The compat tiers exist for pre-9.4 servers, so they must avoid WITH
+        // ORDINALITY (a 9.4 feature) and pair conkey/confkey positions through
+        // generate_series + plain array subscripts instead, mirroring the index
+        // compat invariant.
+        for compat_sql in [postgres_foreign_keys_compat_sql(), postgres_foreign_keys_for_relations_compat_sql()] {
+            assert!(!compat_sql.contains("WITH ORDINALITY"));
+            assert!(compat_sql.contains("generate_series"));
+            assert!(compat_sql.contains("array_length(con.conkey, 1)"));
+            assert!(compat_sql.contains("con.contype = 'f'"));
+            assert!(compat_sql.contains("NOT a.attisdropped"));
+            assert!(!compat_sql.contains("information_schema"));
+        }
+        // OpenGauss resolves attribute numbers in Rust, so its SQL must not
+        // expand catalog arrays at all.
+        let opengauss_sql = opengauss_foreign_keys_sql();
+        assert!(!opengauss_sql.contains("WITH ORDINALITY"));
+        assert!(!opengauss_sql.contains("unnest"));
+        assert!(opengauss_sql.contains("con.conkey::text"));
+        assert!(opengauss_sql.contains("con.confkey::text"));
+    }
+
+    #[test]
+    fn postgres_foreign_key_compat_sql_keeps_series_bounds_lateral_free() {
+        // Before PostgreSQL 9.3 a FROM item's function arguments cannot
+        // reference an earlier FROM item (implicit LATERAL), so the compat
+        // tiers must keep the generate_series bounds constant at
+        // INDEX_MAX_KEYS and cap the ordinal with a join-condition guard.
+        // The pg_attribute subscripts must still pair conkey/confkey by the
+        // guarded ordinal so composite keys stay aligned.
+        for compat_sql in [postgres_foreign_keys_compat_sql(), postgres_foreign_keys_for_relations_compat_sql()] {
+            assert!(!compat_sql.contains("generate_series(1, array_length"));
+            assert!(
+                compat_sql.contains("JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1)")
+            );
+            assert!(compat_sql.contains("(con.conkey)[fk.ord]"));
+            assert!(compat_sql.contains("(con.confkey)[fk.ord]"));
+            assert!(!compat_sql.contains("LATERAL"));
+            assert!(!compat_sql.contains("WITH ORDINALITY"));
+        }
+        // The modern tiers keep explicit JOIN LATERAL and stay gated behind
+        // the compat fallback.
+        assert!(postgres_foreign_keys_sql().contains("JOIN LATERAL"));
+        assert!(postgres_foreign_keys_for_relations_sql().contains("JOIN LATERAL"));
     }
 
     #[test]
@@ -9223,14 +10854,6 @@ mod tests {
         assert!(compat_sql.contains("pg_catalog.pg_inherits"));
         assert!(compat_sql.contains("con.contype = 'f'"));
         assert!(compat_sql.contains("ORDER BY table_name, ref_table"));
-    }
-
-    #[test]
-    fn postgres_foreign_key_action_keeps_non_empty_action() {
-        assert_eq!(postgres_foreign_key_action("CASCADE".to_string()), Some("CASCADE".to_string()));
-        assert_eq!(postgres_foreign_key_action(" SET NULL ".to_string()), Some("SET NULL".to_string()));
-        assert_eq!(postgres_foreign_key_action("".to_string()), None);
-        assert_eq!(postgres_foreign_key_action("  ".to_string()), None);
     }
 
     #[test]
@@ -9829,6 +11452,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DBX_LIVE_PG_TRANSFER_SOURCE_URL pointing at a disposable PostgreSQL"]
+    async fn live_postgres_progress_read_survives_a_total_duration_beyond_the_timeout() {
+        let Ok(url) = std::env::var("DBX_LIVE_PG_TRANSFER_SOURCE_URL") else {
+            return;
+        };
+        let pool = connect(&url, Duration::from_secs(5)).await.unwrap();
+
+        // 20 rows produced ~50 ms apart: the statement streams for ~1 s in total,
+        // well beyond the 200 ms budget, while never stalling that long between
+        // rows — the exact shape a progress-aware transfer read has to survive.
+        // Each row carries >8 KB so PostgreSQL flushes it immediately instead of
+        // buffering the whole (tiny) result set and sending it in one packet.
+        let sql = "SELECT pg_sleep(0.05) IS NULL AS slept, repeat('x', 20000) AS payload, n \
+                   FROM generate_series(1, 20) AS n";
+
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let result =
+            execute_query_with_max_rows_progress(&pool, sql, None, progress_clock, Some(Duration::from_millis(200)))
+                .await;
+        assert!(result.is_ok(), "progress-aware read must survive a total duration beyond the timeout: {result:?}");
+        assert_eq!(result.unwrap().rows.len(), 20);
+
+        // Contrast: the same statement under a plain, never-reset wall-clock budget
+        // must time out, proving this test actually exercises the difference.
+        let wall_clock = await_stream_with_progress_timeout(
+            execute_query_with_max_rows(&pool, sql, None),
+            Some(Duration::from_millis(200)),
+            Arc::new(StreamProgressClock::new()),
+            None,
+            "Query timed out after 0 seconds".to_string(),
+        )
+        .await;
+        assert!(wall_clock.is_err(), "the wall-clock path must still time out");
+    }
+
+    #[tokio::test]
     async fn postgres_row_query_timeout_still_fires_after_no_progress() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let error = await_stream_with_progress_timeout(
@@ -10018,7 +11677,7 @@ mod tests {
         assert!(info_compat_sql.contains("c.relkind IN ('r','p','f')"));
         assert!(info_compat_sql.contains("LIMIT 1"));
         assert!(local_objects_sql.contains("row_to_json(con)->>'conparentid'"));
-        assert!(local_objects_sql.contains("con.contype IN ('p','f')"));
+        assert!(local_objects_sql.contains("con.contype IN ('p','u','f')"));
         assert!(local_objects_sql.contains("i.inhrelid = idx.oid"));
         assert!(local_objects_sql.contains("con.contype = 'c' AND con.conislocal"));
         assert!(!local_objects_sql.contains("con.coninhcount = 0"));
@@ -10060,6 +11719,82 @@ mod tests {
         assert!(sql.contains("pg_catalog.pg_get_constraintdef(con.oid, true)"));
         assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
         assert!(sql.contains("ORDER BY con.conname"));
+    }
+
+    #[test]
+    fn postgres_constraints_sql_covers_all_contypes_and_referential_fields() {
+        let sql = postgres_constraints_sql();
+        assert!(sql.contains("con.contype::text"));
+        assert!(sql.contains("pg_catalog.pg_get_constraintdef(con.oid, true)"));
+        // FK-only referential columns are conditionally selected.
+        assert!(sql.contains("CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END"));
+        assert!(sql.contains("CASE WHEN con.contype = 'f' THEN con.confupdtype::text END"));
+        assert!(sql.contains("CASE WHEN con.contype = 'f' THEN con.confdeltype::text END"));
+        // conkey/confkey attribute numbers are resolved to names via laterals.
+        assert!(sql.contains("unnest(con.conkey) WITH ORDINALITY"));
+        assert!(sql.contains("unnest(con.confkey) WITH ORDINALITY"));
+        // attname (pg_attribute type `name`) is explicitly cast to text so the
+        // array decodes as text[] (matching the COALESCE fallback and Vec<String>).
+        assert!(sql.contains("array_agg(a.attname::text ORDER BY ord.ord)"));
+        assert_eq!(sql.matches("attname::text").count(), 2);
+        assert!(sql.contains("a.attisdropped"));
+        assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(sql.contains("c.relkind IN ('r','p','f')"));
+        assert!(sql.contains("ORDER BY con.conname"));
+    }
+
+    #[test]
+    fn opengauss_constraint_sql_avoids_array_and_ordinality_dependencies() {
+        let sql = opengauss_constraints_sql(true);
+        assert!(sql.contains("con.conkey::text"));
+        assert!(sql.contains("con.confkey::text"));
+        assert!(sql.contains("con.conrelid::oid"));
+        assert!(sql.contains("con.confrelid::oid"));
+        assert!(!sql.contains("unnest("));
+        assert!(!sql.contains("WITH ORDINALITY"));
+        assert!(!sql.contains("LATERAL"));
+    }
+
+    #[test]
+    fn opengauss_constraint_sql_falls_back_without_convalidated() {
+        let sql = opengauss_constraints_sql(false);
+        assert!(sql.contains("TRUE"));
+        assert!(!sql.contains("con.convalidated"));
+    }
+
+    #[test]
+    fn opengauss_constraint_attribute_vectors_are_strict() {
+        assert_eq!(parse_opengauss_attribute_numbers("1 2 4").unwrap(), vec![1, 2, 4]);
+        assert_eq!(parse_opengauss_attribute_numbers("{3,2}").unwrap(), vec![3, 2]);
+        assert_eq!(parse_opengauss_attribute_numbers("[4, 5]").unwrap(), vec![4, 5]);
+        assert!(parse_opengauss_attribute_numbers("1 bad 3").is_err());
+    }
+
+    #[test]
+    fn postgres_constraint_type_label_expands_contype_letters() {
+        assert_eq!(postgres_constraint_type_label("p"), "PRIMARY KEY");
+        assert_eq!(postgres_constraint_type_label("f"), "FOREIGN KEY");
+        assert_eq!(postgres_constraint_type_label("u"), "UNIQUE");
+        assert_eq!(postgres_constraint_type_label("c"), "CHECK");
+        assert_eq!(postgres_constraint_type_label("x"), "EXCLUDE");
+        assert_eq!(postgres_constraint_type_label("n"), "NOT NULL");
+        assert_eq!(postgres_constraint_type_label("unknown"), "unknown");
+    }
+
+    #[test]
+    fn postgres_fk_action_label_and_match_type_normalize_letters() {
+        assert_eq!(postgres_fk_action_label(Some("c".to_string())).as_deref(), Some("CASCADE"));
+        assert_eq!(postgres_fk_action_label(Some("n".to_string())).as_deref(), Some("SET NULL"));
+        assert_eq!(postgres_fk_action_label(Some("d".to_string())).as_deref(), Some("SET DEFAULT"));
+        assert_eq!(postgres_fk_action_label(Some("a".to_string())).as_deref(), Some("NO ACTION"));
+        assert_eq!(postgres_fk_action_label(Some("r".to_string())).as_deref(), Some("RESTRICT"));
+        assert_eq!(postgres_fk_action_label(Some("zz".to_string())), None);
+        assert_eq!(postgres_fk_action_label(None), None);
+        assert_eq!(postgres_constraint_match_type(Some("f".to_string())).as_deref(), Some("FULL"));
+        assert_eq!(postgres_constraint_match_type(Some("s".to_string())).as_deref(), Some("SIMPLE"));
+        assert_eq!(postgres_constraint_match_type(Some("u".to_string())).as_deref(), Some("SIMPLE"));
+        assert_eq!(postgres_constraint_match_type(Some("p".to_string())).as_deref(), Some("PARTIAL"));
+        assert_eq!(postgres_constraint_match_type(Some("zz".to_string())), None);
     }
 
     #[test]
@@ -10156,6 +11891,42 @@ mod tests {
         assert!(index_tiers[0].contains("ix.indnkeyatts"));
         assert!(!index_tiers[1].contains("ix.indnkeyatts"));
         assert!(index_tiers[1].contains("string_to_array(ix.indkey::text, ' ')"));
+
+        let local_object_tiers = postgres_table_partition_local_objects_for_relations_query_tiers();
+        assert_eq!(local_object_tiers.len(), 2);
+        assert!(local_object_tiers[0].contains("row_to_json(con)->>'conparentid'"));
+        assert!(!local_object_tiers[1].contains("row_to_json"));
+        assert!(!local_object_tiers[1].contains("conparentid"));
+        assert!(local_object_tiers.iter().all(|sql| sql.contains("con.conrelid = ANY($1::bigint[])")));
+    }
+
+    #[test]
+    fn postgres_partition_batch_foreign_keys_keep_ordered_paired_compat_tier() {
+        let tiers = postgres_foreign_keys_for_relations_query_tiers();
+        assert_eq!(tiers.len(), 2);
+
+        let modern_sql = tiers[0];
+        assert_eq!(modern_sql, postgres_foreign_keys_for_relations_sql());
+        assert!(modern_sql.contains("unnest($1::text[], $2::text[])"));
+        assert!(!modern_sql.contains("generate_subscripts"));
+        assert!(modern_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!modern_sql.contains("information_schema"));
+        assert!(modern_sql.contains("con.confupdtype::text"));
+        assert!(modern_sql.contains("confdeltype"));
+        assert!(modern_sql.contains("con.contype = 'f'"));
+        assert!(modern_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
+
+        let compat_sql = tiers[1];
+        assert_eq!(compat_sql, postgres_foreign_keys_for_relations_compat_sql());
+        assert!(!compat_sql.contains("unnest($1::text[]"));
+        assert!(compat_sql.contains("generate_subscripts($1::text[], 1)"));
+        assert!(compat_sql.contains("($1::text[])[rel.i] AS rel_schema"));
+        assert!(compat_sql.contains("($2::text[])[rel.i] AS rel_table"));
+        assert!(compat_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!compat_sql.contains("information_schema"));
+        assert!(compat_sql.contains("confdeltype"));
+        assert!(compat_sql.contains("con.contype = 'f'"));
+        assert!(compat_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
     }
 
     #[test]
@@ -10208,6 +11979,33 @@ mod tests {
     #[test]
     fn postgres_sequence_last_values_are_read_as_text() {
         assert!(postgres_sequence_last_values_sql().contains("pg_sequence_last_value(c.oid)::text"));
+    }
+
+    #[test]
+    fn postgres_sequences_compat_sql_avoids_pg10_only_catalog() {
+        let sql = postgres_sequences_compat_sql();
+        assert!(!sql.contains("pg_sequence"));
+        assert!(sql.contains("information_schema.sequences"));
+        assert!(sql.contains("sequence_schema = $1"));
+    }
+
+    #[tokio::test]
+    async fn list_sequences_falls_back_on_postgres_9_without_pg_sequence_catalog() {
+        let Some(container) = start_docker_postgres_9_3().await else {
+            return;
+        };
+
+        let pool = connect(&container.url(), Duration::from_secs(5)).await.expect("connect postgres 9.3");
+        execute_query(&pool, "CREATE SEQUENCE demo_seq START 5").await.expect("create sequence");
+        execute_query(&pool, "SELECT nextval('demo_seq')").await.expect("advance sequence");
+
+        let sequences = list_sequences(&pool, "public", true).await.expect("list_sequences should not 500 on PG9");
+
+        let demo_seq = sequences.iter().find(|s| s.name == "demo_seq").expect("demo_seq present");
+        assert_eq!(demo_seq.last_value.as_deref(), Some("5"));
+        assert_eq!(demo_seq.start_value, "5");
+        assert_eq!(demo_seq.increment, "1");
+        assert!(!demo_seq.cycle);
     }
 
     #[test]
@@ -10668,6 +12466,152 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn postgres_legacy_batched_ddl_metadata_preserves_relation_pairs_across_compat_tiers() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let schema = format!("dbx_batch_fkeys_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let client = pool.get().await.expect("get postgres client");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema_ident}; \
+                 CREATE TABLE {schema_ident}.parent_a (id integer PRIMARY KEY); \
+                 CREATE TABLE {schema_ident}.parent_b (id integer PRIMARY KEY); \
+                 CREATE TABLE {schema_ident}.child_a ( \
+                   id integer PRIMARY KEY, parent_id integer, \
+                   CONSTRAINT child_a_parent_fk FOREIGN KEY (parent_id) REFERENCES {schema_ident}.parent_a(id) \
+                 ); \
+                 CREATE TABLE {schema_ident}.child_b ( \
+                   id integer PRIMARY KEY, parent_id integer, \
+                   CONSTRAINT child_b_parent_fk FOREIGN KEY (parent_id) REFERENCES {schema_ident}.parent_b(id) \
+                 ); \
+                 CREATE TABLE {schema_ident}.without_fk (id integer PRIMARY KEY)"
+            ))
+            .await
+            .expect("create batched foreign-key fixtures");
+
+        let version_num = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .expect("query PostgreSQL version")
+            .get::<_, String>(0)
+            .parse::<u32>()
+            .expect("server_version_num should be numeric");
+        let has_conparentid = client
+            .query_one(
+                "SELECT EXISTS ( \
+                   SELECT 1 FROM pg_catalog.pg_attribute \
+                   WHERE attrelid = 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                     AND attname = 'conparentid' AND NOT attisdropped \
+                 )",
+                &[],
+            )
+            .await
+            .expect("probe pg_constraint.conparentid")
+            .get::<_, bool>(0);
+        if version_num < 110000 {
+            assert!(!has_conparentid, "pre-11 PostgreSQL must not have parent-linked constraint clones");
+        }
+
+        let empty = list_foreign_keys_for_relations(&pool, &[]).await.expect("empty relation batch");
+        assert!(empty.is_empty());
+
+        let single_relations = vec![(schema.clone(), "child_a".to_string())];
+        let single = list_foreign_keys_for_relations(&pool, &single_relations).await.expect("single relation batch");
+        let single_fk = &single[&(schema.clone(), "child_a".to_string())][0];
+        assert_eq!(single_fk.name, "child_a_parent_fk");
+        assert_eq!(single_fk.ref_table, "parent_a");
+
+        // Keep the pairs deliberately out of name order. A cross product or
+        // independently unnested array would duplicate or misattribute keys.
+        let relations = vec![
+            (schema.clone(), "child_b".to_string()),
+            (schema.clone(), "without_fk".to_string()),
+            (schema.clone(), "child_a".to_string()),
+        ];
+        let batched = list_foreign_keys_for_relations(&pool, &relations).await.expect("multi-relation batch");
+        assert_eq!(batched.len(), 2, "batched keys: {batched:?}");
+        assert!(!batched.contains_key(&(schema.clone(), "without_fk".to_string())));
+        assert_eq!(batched[&(schema.clone(), "child_a".to_string())][0].ref_table, "parent_a");
+        assert_eq!(batched[&(schema.clone(), "child_b".to_string())][0].ref_table, "parent_b");
+
+        let schemas: Vec<&str> = relations.iter().map(|(schema, _)| schema.as_str()).collect();
+        let tables: Vec<&str> = relations.iter().map(|(_, table)| table.as_str()).collect();
+        let compat = list_foreign_keys_for_relations_with_sql(
+            &client,
+            postgres_foreign_keys_for_relations_compat_sql(),
+            &schemas,
+            &tables,
+        )
+        .await
+        .expect("subscript-paired compatibility query");
+        assert_eq!(compat[&(schema.clone(), "child_a".to_string())][0].ref_table, "parent_a");
+        assert_eq!(compat[&(schema.clone(), "child_b".to_string())][0].ref_table, "parent_b");
+
+        let modern = list_foreign_keys_for_relations_with_sql(
+            &client,
+            postgres_foreign_keys_for_relations_sql(),
+            &schemas,
+            &tables,
+        )
+        .await;
+        if version_num >= 90400 {
+            let modern = modern.expect("multi-array unnest primary query");
+            assert_eq!(modern[&(schema.clone(), "child_a".to_string())][0].ref_table, "parent_a");
+            assert_eq!(modern[&(schema.clone(), "child_b".to_string())][0].ref_table, "parent_b");
+        } else {
+            modern.expect_err("pre-9.4 server must reject multi-array unnest");
+        }
+
+        let relation_oids: Vec<i64> = client
+            .query(
+                "SELECT c.oid::bigint \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 ORDER BY c.relname",
+                &[&schema],
+            )
+            .await
+            .expect("query fixture relation oids")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        get_table_partition_local_objects_for_relations_with_sql(
+            &client,
+            postgres_table_partition_local_objects_for_relations_compat_sql(),
+            &relation_oids,
+        )
+        .await
+        .expect("pre-parent-clone local-object query");
+        let modern_local_objects = get_table_partition_local_objects_for_relations_with_sql(
+            &client,
+            postgres_table_partition_local_objects_for_relations_sql(),
+            &relation_oids,
+        )
+        .await;
+        if version_num >= 90300 {
+            modern_local_objects.expect("JSON-extraction local-object query");
+        } else {
+            modern_local_objects.expect_err("PostgreSQL 9.2 must reject the JSON ->> operator");
+        }
+        drop(client);
+
+        let child_ddl = crate::schema::pg_ddl_with_partitions(&pool, &schema, "child_a")
+            .await
+            .expect("display DDL with foreign key");
+        let without_fk_ddl = crate::schema::pg_ddl_with_partitions(&pool, &schema, "without_fk")
+            .await
+            .expect("display DDL without foreign key");
+        execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE"))
+            .await
+            .expect("drop batched foreign-key fixtures");
+
+        assert!(child_ddl.contains("FOREIGN KEY"), "child ddl: {child_ddl}");
+        assert!(!without_fk_ddl.contains("FOREIGN KEY"), "without-fk ddl: {without_fk_ddl}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
     async fn postgres_ddl_emits_not_valid_check_constraints_as_separate_replayable_alter() {
         let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
         let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
@@ -10969,8 +12913,36 @@ mod tests {
         drop(client);
 
         let query_sql = format!("SELECT marker, {helper_ident}() AS helper FROM pg_settings");
+        let stale_session_recovery = async {
+            let client = pool.get().await.map_err(|error| error.to_string())?;
+            set_postgres_search_path(&client, &schema, PostgresSearchPathContext::Query, Duration::from_secs(5))
+                .await?;
+            client.execute("SET search_path TO public", &[]).await.map_err(pg_error_to_string)?;
+            set_postgres_search_path(&client, &schema, PostgresSearchPathContext::Query, Duration::from_secs(5))
+                .await?;
+            let selected: String = client
+                .query_one("SELECT marker FROM pg_settings", &[])
+                .await
+                .map_err(pg_error_to_string)?
+                .try_get(0)
+                .map_err(pg_error_to_string)?;
+            client.execute("RESET search_path", &[]).await.map_err(pg_error_to_string)?;
+            Ok::<_, String>(selected)
+        }
+        .await;
         let ordinary_result = execute_query_with_schema(&pool, &schema, &query_sql).await;
         let path_after_ordinary = execute_query(&pool, "SHOW search_path").await;
+        let read_only_result = execute_query_in_read_only_transaction_with_rollback(
+            &pool,
+            Some(&schema),
+            &query_sql,
+            None,
+            None,
+            DbOperationBudget::with_defaults(),
+            None,
+        )
+        .await;
+        let path_after_read_only = execute_query(&pool, "SHOW search_path").await;
 
         let mut streamed_rows = Vec::new();
         let streaming_result = stream_select_query_with_cancel(
@@ -11041,11 +13013,17 @@ mod tests {
             .expect("clean search_path fixtures");
 
         let ordinary = ordinary_result.expect("ordinary schema query");
+        assert_eq!(stale_session_recovery.expect("recover stale session search_path"), "selected-schema");
         assert_eq!(
             ordinary.rows,
             vec![vec![serde_json::json!("selected-schema"), serde_json::json!("public-fallback")]]
         );
         assert_eq!(path_after_ordinary.expect("path after ordinary query").rows, initial_path.rows);
+        assert_eq!(
+            read_only_result.expect("read-only schema query").rows,
+            vec![vec![serde_json::json!("selected-schema"), serde_json::json!("public-fallback")]]
+        );
+        assert_eq!(path_after_read_only.expect("path after read-only query").rows, initial_path.rows);
         assert_eq!(streaming_result.expect("streaming schema query"), 1);
         assert_eq!(
             streamed_rows,
@@ -11063,7 +13041,8 @@ mod tests {
     fn postgres_index_metadata_has_legacy_catalog_fallback() {
         assert!(POSTGRES_INDEXES_SQL.contains("ix.indnkeyatts"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indnkeyatts"));
-        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("NULL::smallint AS nkeyatts"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("AS nkeyatts"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indoption::text"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("LATERAL"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("WITH ORDINALITY"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("generate_series"));
@@ -11075,6 +13054,8 @@ mod tests {
             postgres_indexes_for_relations_compat_sql(),
         ] {
             assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
+            assert!(sql.contains("AS constraint_backed"));
+            assert!(sql.contains("con.conindid = i.oid"));
         }
     }
 
@@ -11085,6 +13066,37 @@ mod tests {
         assert!(POSTGRES_INDEXES_SQL.contains("array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("SELECT a.attname IS NULL"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("AS key_is_expression"));
+    }
+
+    #[test]
+    fn postgres_index_metadata_tracks_per_key_ordering_without_include_columns() {
+        for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
+            assert!(sql.contains("ix.indoption[(k.n - 1)::int]"));
+            assert!(sql.contains("FILTER (WHERE k.n <= ix.indnkeyatts)"));
+        }
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(sql.contains("string_to_array(ix.indoption::text, ' ')") && sql.contains("AS key_options"));
+        }
+    }
+
+    #[test]
+    fn postgres_index_metadata_schema_qualifies_opclass() {
+        // The LATERAL (modern) index-introspection SQL returns each non-default
+        // opclass schema-qualified (`quote_ident(nspname) || '.' || quote_ident(opcname)`)
+        // and joins `pg_namespace` on `opcnamespace`, so DDL regeneration resolves
+        // opclasses (e.g. `gin_trgm_ops` from `pg_trgm`) regardless of `search_path`.
+        // The compat (pre-LATERAL) fallback keeps bare `oc.opcname` — no regression,
+        // just no schema-qualification for the rare old-PG × non-default-schema case.
+        for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
+            assert!(
+                sql.contains("quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname)"),
+                "expected schema-qualified opclass in {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN pg_namespace opcns ON opcns.oid = oc.opcnamespace"),
+                "expected opcnamespace join in {sql}"
+            );
+        }
     }
 
     #[test]
@@ -12072,6 +14084,12 @@ mod tests {
         .expect("stream unnamed query inside backup snapshot");
         assert_eq!(columns, vec!["value"]);
         assert_eq!(rows[0][0], serde_json::json!(45));
+        let prepared_count = client
+            .query_typed_one("SELECT count(*)::int8 FROM pg_prepared_statements", &[])
+            .await
+            .expect("count server-side prepared statements")
+            .get::<_, i64>(0);
+        assert_eq!(prepared_count, 0, "snapshot stream metadata preparation must not retain a named statement");
         client.execute_typed("SELECT 1", &[]).await.expect("snapshot remains usable");
         client.execute_typed("ROLLBACK", &[]).await.expect("rollback backup snapshot");
     }

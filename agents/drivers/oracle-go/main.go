@@ -30,7 +30,11 @@ import (
 const protocolVersion = 1
 const multiSessionProtocolVersion = 2
 const defaultMaxRows = 1000
-const oracleDefaultPrefetchRows = "100"
+
+// A normal data-grid page contains 100 rows. Prefetching a little more than
+// one page reduces round trips while reading subsequent pages without
+// buffering the much larger export limit.
+const oracleDefaultPrefetchRows = "256"
 const oracleCharsetZHS32GB18030 = 854
 const legacyAgentSessionID = "__legacy__"
 const maxAgentSessions = 256
@@ -261,6 +265,17 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+// oracleDriverPanicError keeps a third-party driver panic on the request path
+// so the agent can try a safe projection rewrite instead of terminating the
+// process and breaking the RPC stream.
+type oracleDriverPanicError struct {
+	value any
+}
+
+func (e oracleDriverPanicError) Error() string {
+	return fmt.Sprintf("oracle driver panic: %v", e.value)
+}
+
 type connectParams struct {
 	Host             string `json:"host"`
 	Port             int    `json:"port"`
@@ -419,8 +434,9 @@ type querySession struct {
 }
 
 type oracleColumnMeta struct {
-	Name     string
-	DataType string
+	Name          string
+	DataType      string
+	DataTypeOwner string
 }
 
 type oracleColumnMetaLoader func(schema, table string) ([]oracleColumnMeta, error)
@@ -624,19 +640,28 @@ func newRuntimeServer() *runtimeServer {
 	return &runtimeServer{sessions: map[string]*agentSession{}}
 }
 
-func (r *runtimeServer) handleLine(line string) (response, bool) {
+func (r *runtimeServer) handleLine(line string) (resp response, shutdown bool) {
 	var req request
+	// Last-resort guard: a panic anywhere on the request path must not kill
+	// the agent process and break the RPC stream, so convert it to a readable
+	// error response instead of an end-of-stream failure.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			resp = errorResponse(req.ID, fmt.Errorf("agent request panic: %v", recovered))
+			shutdown = false
+		}
+	}()
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
 		return errorResponse(nil, err), false
 	}
 	if len(req.ID) == 0 {
 		req.ID = json.RawMessage("1")
 	}
-	result, shutdown, err := r.dispatch(req.Method, req.Params)
+	result, shouldShutdown, err := r.dispatch(req.Method, req.Params)
 	if err != nil {
 		return errorResponse(req.ID, err), false
 	}
-	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shutdown
+	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shouldShutdown
 }
 
 func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessage) (any, bool, error) {
@@ -2600,7 +2625,7 @@ func (s *server) loadOracleColumnMeta(schema, table string) ([]oracleColumnMeta,
 
 func (s *server) loadOracleColumnMetaByName(schema, table string) ([]oracleColumnMeta, error) {
 	rows, err := s.queryRows(`
-SELECT COLUMN_NAME, DATA_TYPE
+SELECT COLUMN_NAME, DATA_TYPE, DATA_TYPE_OWNER
 FROM ALL_TAB_COLUMNS
 WHERE OWNER = :1 AND TABLE_NAME = :2
 ORDER BY COLUMN_ID`, []any{schema, table})
@@ -2611,8 +2636,12 @@ ORDER BY COLUMN_ID`, []any{schema, table})
 	var result []oracleColumnMeta
 	for rows.Next() {
 		var item oracleColumnMeta
-		if err := rows.Scan(&item.Name, &item.DataType); err != nil {
+		var dataTypeOwner sql.NullString
+		if err := rows.Scan(&item.Name, &item.DataType, &dataTypeOwner); err != nil {
 			return nil, err
+		}
+		if dataTypeOwner.Valid {
+			item.DataTypeOwner = dataTypeOwner.String
 		}
 		result = append(result, item)
 	}
@@ -2924,7 +2953,7 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 		}
 		return map[string]any{"name": name, "object_type": objectType, "schema": schema, "source": source}, nil
 	}
-	if upperType == "SEQUENCE" || upperType == "SYNONYM" {
+	if upperType == "MATERIALIZED_VIEW" || upperType == "SEQUENCE" || upperType == "SYNONYM" {
 		return s.getMetadataObjectSource(schema, name, upperType)
 	}
 
@@ -2959,6 +2988,39 @@ func (s *server) getMetadataObjectSource(schema, name, objectType string) (map[s
 }
 
 func (s *server) loadObjectSourceText(schema, name, objectType string) (string, bool, error) {
+	source, found, err := s.loadAggregatedObjectSourceText(schema, name, objectType)
+	if err == nil {
+		return source, found, nil
+	}
+	return s.loadObjectSourceTextRows(schema, name, objectType)
+}
+
+func (s *server) loadAggregatedObjectSourceText(schema, name, objectType string) (string, bool, error) {
+	rows, err := s.queryRows(`
+SELECT DBMS_XMLGEN.CONVERT(
+  XMLAGG(XMLELEMENT(E, TEXT) ORDER BY LINE).EXTRACT('//text()').GETCLOBVAL(),
+  1
+)
+FROM ALL_SOURCE
+WHERE OWNER = :1 AND NAME = :2 AND TYPE = :3`, []any{schema, name, objectType})
+	if err != nil {
+		return "", false, err
+	}
+	defer s.closeRows(rows)
+	if !rows.Next() {
+		return "", false, rows.Err()
+	}
+	var source sql.NullString
+	if err := rows.Scan(&source); err != nil {
+		return "", false, err
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	return source.String, source.Valid, nil
+}
+
+func (s *server) loadObjectSourceTextRows(schema, name, objectType string) (string, bool, error) {
 	rows, err := s.queryRows(`
 SELECT TEXT
 FROM ALL_SOURCE
@@ -3713,34 +3775,70 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 			HasMore:         false,
 		}, err
 	}
-	rows, err := s.queryRowsWithOracleValueRewriteIfNeeded(sqlText, opts.TimeoutSecs, opts.DeferLOBs)
+	result, session, err := s.runPagedOracleSelect(sqlText, opts, pageSize, start)
 	if err != nil {
 		return queryPageResult{}, err
 	}
-	columns, err := rows.Columns()
-	if err != nil {
-		s.closeRows(rows)
-		return queryPageResult{}, err
-	}
-	columnTypes := columnTypeNames(rows)
-	maxRows := opts.MaxRows
-	if maxRows <= 0 {
-		maxRows = defaultMaxRows
-	}
-	session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
-	result, err := readQuerySessionPage(session, pageSize)
-	result.ExecutionTimeMS = time.Since(start).Milliseconds()
-	if err != nil {
-		s.closeRows(rows)
-		return queryPageResult{}, err
-	}
-	if result.HasMore {
+	if session != nil {
 		sessionID := s.storeQuerySession(session)
 		result.SessionID = &sessionID
-	} else {
-		s.closeRows(rows)
 	}
 	return result, nil
+}
+
+// runPagedOracleSelect executes a SELECT through the value-rewrite path and
+// reads its first page. It returns the live session when more pages remain.
+// When the first page panics while decoding an unsupported column type (before
+// any row was streamed to the client), it retries once with the placeholder
+// projection so the remaining columns stay readable; panics on later pages
+// surface as errors instead.
+func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSize int, start time.Time) (queryPageResult, *querySession, error) {
+	for attempt := 0; ; attempt++ {
+		rows, err := s.queryRowsWithOracleValueRewriteIfNeeded(sqlText, opts.TimeoutSecs, opts.DeferLOBs)
+		if err != nil {
+			return queryPageResult{}, nil, err
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			s.closeRows(rows)
+			return queryPageResult{}, nil, err
+		}
+		columnTypes := columnTypeNames(rows)
+		maxRows := opts.MaxRows
+		if maxRows <= 0 {
+			maxRows = defaultMaxRows
+		}
+		session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
+		result, err := readQuerySessionPage(session, pageSize)
+		result.ExecutionTimeMS = time.Since(start).Milliseconds()
+		if err != nil {
+			s.closeRows(rows)
+			var panicErr oracleDriverPanicError
+			if attempt == 0 && errors.As(err, &panicErr) {
+				if placeholder, ok := oraclePlaceholderRetrySQL(sqlText, s.loadOracleColumnMeta); ok {
+					sqlText = placeholder
+					continue
+				}
+			}
+			return queryPageResult{}, nil, err
+		}
+		if result.HasMore {
+			return result, session, nil
+		}
+		s.closeRows(rows)
+		return result, nil, nil
+	}
+}
+
+// oraclePlaceholderRetrySQL returns the placeholder projection used to retry a
+// query whose first page panicked while decoding values of an unsupported
+// column type. It reports false when no placeholder rewrite applies.
+func oraclePlaceholderRetrySQL(sqlText string, loadColumns oracleColumnMetaLoader) (string, bool) {
+	placeholder, err := rewriteOracleSelectSQL(sqlText, loadColumns, true)
+	if err != nil || placeholder == sqlText {
+		return "", false
+	}
+	return placeholder, true
 }
 
 func (s *server) fetchQueryPage(sessionID string, pageSize int) (queryPageResult, error) {
@@ -3779,32 +3877,13 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 	if !isQuerySQL(sqlText) {
 		return queryPageResult{}, errors.New("table read requires a SELECT query")
 	}
-	rows, err := s.queryRowsWithOracleValueRewriteIfNeeded(sqlText, opts.TimeoutSecs, opts.DeferLOBs)
+	result, session, err := s.runPagedOracleSelect(sqlText, opts, pageSize, start)
 	if err != nil {
 		return queryPageResult{}, err
 	}
-	columns, err := rows.Columns()
-	if err != nil {
-		s.closeRows(rows)
-		return queryPageResult{}, err
-	}
-	columnTypes := columnTypeNames(rows)
-	maxRows := opts.MaxRows
-	if maxRows <= 0 {
-		maxRows = defaultMaxRows
-	}
-	session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
-	result, err := readQuerySessionPage(session, pageSize)
-	result.ExecutionTimeMS = time.Since(start).Milliseconds()
-	if err != nil {
-		s.closeRows(rows)
-		return queryPageResult{}, err
-	}
-	if result.HasMore {
+	if session != nil {
 		sessionID := s.storeTableReadSession(session)
 		result.SessionID = &sessionID
-	} else {
-		s.closeRows(rows)
 	}
 	return result, nil
 }
@@ -3863,11 +3942,21 @@ func (s *server) closeAllQuerySessions() {
 	}
 }
 
-func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult, error) {
+func readQuerySessionPage(session *querySession, pageSize int) (result queryPageResult, err error) {
+	// go-ora can panic while decoding row values for column types it does not
+	// support (for example custom object types). Convert those panics to errors
+	// so row iteration failures never terminate the agent process and break
+	// the RPC stream.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = queryPageResult{}
+			err = oracleDriverPanicError{value: recovered}
+		}
+	}()
 	if pageSize <= 0 {
 		pageSize = defaultMaxRows
 	}
-	result := queryPageResult{Columns: session.columns, ColumnTypes: session.columnTypes, Rows: [][]any{}, SessionID: nil, HasMore: false}
+	result = queryPageResult{Columns: session.columns, ColumnTypes: session.columnTypes, Rows: [][]any{}, SessionID: nil, HasMore: false}
 	for len(result.Rows) < pageSize && session.remaining > 0 {
 		if session.pending != nil {
 			result.Rows = append(result.Rows, session.pending)
@@ -3887,6 +3976,13 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 	}
 	if session.remaining <= 0 {
 		result.Truncated = true
+		return result, nil
+	}
+	// A full page is enough evidence that another page may exist. Do not read
+	// one extra row just to decide has_more: with a prefetch boundary this
+	// forces another Oracle round trip before the first page can be displayed.
+	if len(result.Rows) >= pageSize {
+		result.HasMore = true
 		return result, nil
 	}
 	if session.rows.Next() {
@@ -4071,6 +4167,26 @@ func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeout
 	}
 	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
 	if err != nil {
+		var panicErr oracleDriverPanicError
+		if errors.As(err, &panicErr) {
+			rewritten, rewriteErr := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, false)
+			if rewriteErr == nil && rewritten != sqlText {
+				rewrittenRows, rewrittenErr := s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+				if rewrittenErr == nil {
+					return rewrittenRows, nil
+				}
+				// When the server's ArcSDE extproc agent is broken, the
+				// SDE.ST_AsText rewrite itself fails with ORA-28595 and would
+				// hide the remaining columns; retry once with the placeholder
+				// projection so the query stays readable.
+				if placeholder, ok := oracleExtprocFallbackSQL(sqlText, s.loadOracleColumnMeta, rewrittenErr); ok {
+					if placeholderRows, placeholderErr := s.queryRowsWithTimeout(placeholder, nil, timeoutSecs); placeholderErr == nil {
+						return placeholderRows, nil
+					}
+				}
+				return nil, rewrittenErr
+			}
+		}
 		return nil, err
 	}
 	typeNames := columnTypeNames(rows)
@@ -4098,6 +4214,34 @@ func oracleColumnTypeNamesContainXMLType(typeNames []string) bool {
 		}
 	}
 	return false
+}
+
+// isOracleExtprocAgentFailure reports whether err is an Oracle extproc agent
+// failure (ORA-28595, typically raised through SDE.ST_GEOMETRY_SHAPELIB_PKG or
+// SDE.ST_GEOMETRY_OPERATORS) that makes every SDE.ST_GEOMETRY function call
+// unusable on the server. Matching stays deliberately narrow: the ORA code
+// must be present; SDE package names alone never trigger it.
+func isOracleExtprocAgentFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Accept both the "ORA-28595" form and a bare "28595" code.
+	return strings.Contains(strings.ToUpper(err.Error()), "28595")
+}
+
+// oracleExtprocFallbackSQL returns the placeholder projection to retry with
+// when the panic-fallback SDE.ST_AsText rewrite failed because of a broken
+// extproc agent (ORA-28595). It reports false when the error is unrelated or
+// no placeholder rewrite applies.
+func oracleExtprocFallbackSQL(sqlText string, loadColumns oracleColumnMetaLoader, rewriteErr error) (string, bool) {
+	if !isOracleExtprocAgentFailure(rewriteErr) {
+		return "", false
+	}
+	placeholder, err := rewriteOracleSelectSQL(sqlText, loadColumns, true)
+	if err != nil || placeholder == sqlText {
+		return "", false
+	}
+	return placeholder, true
 }
 
 func (s *server) rewriteXMLTypeSelectSQL(sqlText string) (string, error) {
@@ -4237,7 +4381,7 @@ func rewriteDirectOracleSelectSQL(sqlText string, loadColumns oracleColumnMetaLo
 	if fromIdx < 0 {
 		return sqlText, false, false, nil
 	}
-	if deferLOBs && oracleSQLHasTopLevelSetOperator(sqlText, fromIdx+len("from")) {
+	if oracleSQLHasTopLevelSetOperator(sqlText, fromIdx+len("from")) {
 		return sqlText, false, false, nil
 	}
 	selectListPrefix, selectList := splitOracleSelectListModifier(sqlText[selectStart:fromIdx])
@@ -4389,10 +4533,12 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 			for _, column := range columns {
 				columnRef := oracleColumnRef(tableRef.AliasText, column.Name)
 				outputAlias := quoteIdentifier(column.Name)
-				if isOracleXMLType(column.DataType) && !deferLOBs {
+				if isOracleGeometryType(column) && !deferLOBs {
+					rewritten = append(rewritten, oracleGeometryExpression(column, columnRef, outputAlias))
+				} else if isOracleXMLType(column.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
 				} else if deferLOBs {
-					if expressions, ok := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, column.DataType); ok {
+					if expressions, ok := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, column); ok {
 						rewritten = append(rewritten, expressions...)
 					} else {
 						rewritten = append(rewritten, columnRef)
@@ -4413,6 +4559,12 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 					outputAlias = quoteIdentifier(meta.Name)
 				}
 				columnRef := oracleColumnRef(qualifier, meta.Name)
+				if isOracleGeometryType(meta) && !deferLOBs {
+					rewritten = append(rewritten, oracleGeometryExpression(meta, columnRef, outputAlias))
+					changed = true
+					sourceIndex++
+					continue
+				}
 				if isOracleXMLType(meta.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
 					changed = true
@@ -4420,7 +4572,7 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 					continue
 				}
 				if deferLOBs {
-					if expressions, isLOB := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, meta.DataType); isLOB {
+					if expressions, isLOB := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, meta); isLOB {
 						rewritten = append(rewritten, expressions...)
 						changed = true
 						sourceIndex++
@@ -4435,15 +4587,41 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 	return rewritten, changed
 }
 
-func oracleDeferredLOBExpressions(columnRef, outputAlias string, sourceIndex int, dataType string) ([]string, bool) {
-	kind, placeholder, ok := oracleDeferredLOBKind(dataType)
+func oracleDeferredLOBExpressions(columnRef, outputAlias string, sourceIndex int, column oracleColumnMeta) ([]string, bool) {
+	kind, placeholder, ok := oracleDeferredLOBKind(column.DataType)
+	valueRef := columnRef
+	if isOracleGeometryType(column) {
+		kind, placeholder, ok = "C", oracleGeometryPlaceholder(column), true
+	}
 	if !ok {
 		return nil, false
 	}
-	valueExpression := fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE '%s' END AS %s", columnRef, placeholder, outputAlias)
+	valueExpression := fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE '%s' END AS %s", valueRef, placeholder, outputAlias)
 	markerAlias := fmt.Sprintf("%s%s_%d", largeValueBytesColumnPrefix, kind, sourceIndex)
-	markerExpression := fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE 'D:1' END AS %s", columnRef, quoteIdentifier(markerAlias))
+	markerExpression := fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE 'D:1' END AS %s", valueRef, quoteIdentifier(markerAlias))
 	return []string{valueExpression, markerExpression}, true
+}
+
+func oracleSTGeometryExpression(columnRef, alias string) string {
+	return fmt.Sprintf("SDE.ST_AsText(%s) AS %s", columnRef, alias)
+}
+
+func oracleSDOGeometryExpression(columnRef, alias string) string {
+	return fmt.Sprintf("SDO_UTIL.TO_WKTGEOMETRY(%s) AS %s", columnRef, alias)
+}
+
+func oracleGeometryExpression(column oracleColumnMeta, columnRef, alias string) string {
+	if isOracleSDOGeometry(column) {
+		return oracleSDOGeometryExpression(columnRef, alias)
+	}
+	return oracleSTGeometryExpression(columnRef, alias)
+}
+
+func oracleGeometryPlaceholder(column oracleColumnMeta) string {
+	if isOracleSDOGeometry(column) {
+		return "<SDO_GEOMETRY>"
+	}
+	return "<ST_GEOMETRY>"
 }
 
 func oracleDeferredLOBKind(dataType string) (kind, placeholder string, ok bool) {
@@ -4543,7 +4721,7 @@ func oracleQualifierMatchesTable(qualifier string, tableRef oracleTableRef) bool
 
 func oracleColumnsNeedValueRewrite(columns []oracleColumnMeta, deferLOBs bool) bool {
 	for _, column := range columns {
-		if isOracleXMLType(column.DataType) || (deferLOBs && isOracleDeferredLOBType(column.DataType)) {
+		if isOracleGeometryType(column) || isOracleXMLType(column.DataType) || (deferLOBs && isOracleDeferredLOBType(column.DataType)) {
 			return true
 		}
 	}
@@ -4567,6 +4745,29 @@ func isOracleDeferredLOBType(dataType string) bool {
 func isOracleXMLType(dataType string) bool {
 	normalized := strings.ToUpper(strings.TrimSpace(dataType))
 	return normalized == "XMLTYPE" || normalized == "SYS.XMLTYPE"
+}
+
+func isOracleSTGeometry(column oracleColumnMeta) bool {
+	// Esri's SDE.ST_GEOMETRY is an unregistered Oracle object for go-ora;
+	// SDE.ST_AsText provides the supported CLOB representation for reads.
+	dataType := strings.ToUpper(strings.TrimSpace(column.DataType))
+	if dataType == "SDE.ST_GEOMETRY" {
+		return true
+	}
+	return dataType == "ST_GEOMETRY" && strings.EqualFold(strings.TrimSpace(column.DataTypeOwner), "SDE")
+}
+
+func isOracleSDOGeometry(column oracleColumnMeta) bool {
+	// Oracle Spatial's MDSYS.SDO_GEOMETRY is likewise an unregistered object
+	// type for go-ora and panics on scan; SDO_UTIL.TO_WKTGEOMETRY provides
+	// the supported CLOB (WKT) representation for reads. Most schemas only
+	// see it through the PUBLIC synonym, so DATA_TYPE_OWNER is commonly
+	// "PUBLIC" rather than "MDSYS" and isn't checked here.
+	return strings.ToUpper(strings.TrimSpace(column.DataType)) == "SDO_GEOMETRY"
+}
+
+func isOracleGeometryType(column oracleColumnMeta) bool {
+	return isOracleSTGeometry(column) || isOracleSDOGeometry(column)
 }
 
 func leadingSQLSelectListStart(sqlText string) int {
@@ -4851,7 +5052,7 @@ func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
 	return s.queryRowsWithTimeout(sqlText, args, 0)
 }
 
-func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs int) (*sql.Rows, error) {
+func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs int) (rows *sql.Rows, queryErr error) {
 	if _, err := s.requireDB(); err != nil {
 		return nil, err
 	}
@@ -4874,8 +5075,27 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	s.activeTimer = timer
 	s.activeTimedOut = false
 	s.activeCancelMu.Unlock()
-	var rows *sql.Rows
-	var queryErr error
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cancel()
+			if timer != nil {
+				timer.Stop()
+			}
+			if rows != nil {
+				_ = rows.Close()
+			}
+			s.activeCancelMu.Lock()
+			s.activeCancel = nil
+			s.activeTimer = nil
+			s.activeTimedOut = false
+			if rows != nil {
+				delete(s.activeRows, rows)
+			}
+			s.activeCancelMu.Unlock()
+			rows = nil
+			queryErr = oracleDriverPanicError{value: recovered}
+		}
+	}()
 	if s.manualTx != nil {
 		rows, queryErr = s.manualTx.QueryContext(ctx, sqlText, args...)
 	} else {

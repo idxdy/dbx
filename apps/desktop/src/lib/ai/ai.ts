@@ -100,7 +100,7 @@ export interface AiContext {
   connectionName: string;
   databaseType: DatabaseType;
   database: string;
-  /** Selected schema when it is distinct from the connection database (for example Dameng). */
+  /** Schema selected for metadata loading and agent tool execution. */
   schema?: string;
   currentSql: string;
   lastError?: string;
@@ -179,7 +179,8 @@ export function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage
   ];
 
   const params = actionParams(input.action);
-  const maxTokens = input.config.enableThinking ? Math.max(params.maxTokens, 8192) : params.maxTokens;
+  const baseMaxTokens = input.config.maxOutputTokens ?? params.maxTokens;
+  const maxTokens = input.config.enableThinking ? Math.max(baseMaxTokens, 8192) : baseMaxTokens;
   return { messages, systemPrompt, taskContract, maxTokens };
 }
 
@@ -294,7 +295,7 @@ export function buildSystemPrompt(action: AiAction, context: AiContext, mode: Ai
 
   const isZh = isChineseLocale(currentLocale());
 
-  const lines: string[] = [...buildBasePromptLines(isZh), ...buildModePromptLines(mode, isZh, context.databaseType), ...buildActionPromptLines(action, isZh), ...buildCustomInstructionLines(custom, isZh)];
+  const lines: string[] = [...buildBasePromptLines(isZh), ...buildModePromptLines(mode, isZh, context.databaseType), ...buildActionPromptLines(action, isZh), ...buildRichContentPromptLines(isZh), ...buildCustomInstructionLines(custom, isZh)];
 
   lines.push(attachmentSafetyInstruction(isZh));
 
@@ -367,6 +368,7 @@ function buildVectorSystemPrompt(context: AiContext, mode: AiAssistantMode, cust
     isZh ? `你是 DBX 内置的向量数据库助手。当前连接的是 ${dbLabel(context.databaseType)} 数据库。用中文回复。` : `You are DBX's vector database assistant. Connected to ${dbLabel(context.databaseType)}. Reply in English.`,
     isZh ? "数据存储在集合（collections）中，每条记录包含唯一标识及可选的元数据负载（payload/metadata）。" : "Data is stored in collections. Each record has a unique identifier and optional metadata payload.",
     ...buildVectorModePromptLines(context, mode, isZh),
+    ...buildRichContentPromptLines(isZh),
     ...buildCustomInstructionLines(custom, isZh),
     attachmentSafetyInstruction(isZh),
     "",
@@ -405,6 +407,49 @@ function buildVectorModePromptLines(context: AiContext, mode: AiAssistantMode, i
       : `You are in Ask mode. You may only use list_collections to inspect collection names; do not browse collection data. ${dbLabel(context.databaseType)} uses a REST API query format (METHOD /path + JSON body) that varies by database type. Generate query strings and explanations only; do not imply execution.`,
     currentTimeGuidance,
   ];
+}
+
+/**
+ * Rich Content protocol rules (V1, charts only). Injected into BOTH the normal
+ * `buildSystemPrompt` and `buildVectorSystemPrompt` paths — the vector branch
+ * early-returns inside `buildSystemPrompt`, so touching only the normal branch
+ * would silently leave vector DBs without the protocol hints.
+ *
+ * Keep this compact (≤200 tokens): the chart-json schema is expressed as
+ * minimal JSON examples, not a TypeScript schema. Rules are asymmetric:
+ * - charts are allowed but restrained (only when a visual comparison/trend/
+ *   distribution/share materially improves the answer, at most one per reply);
+ * - HTML is only produced when the user explicitly asks for it (rendering
+ *   lands in PR2).
+ */
+function buildRichContentPromptLines(isZh: boolean): string[] {
+  return isZh
+    ? [
+        [
+          "你可以输出 ```chart-json 代码块来渲染图表（V1 支持 line/bar/pie）。仅在图表能实质改善回答时使用，例如视觉对比、趋势、分布或占比；一条回复最多一个。",
+          "示例（line/bar）：```chart-json",
+          `{"version":1,"type":"line","xAxis":{"values":["Jan","Feb","Mar"]},"series":[{"name":"收入","data":[120,200,150]}]}`,
+          "```",
+          "示例（pie）：```chart-json",
+          `{"version":1,"type":"pie","data":[{"name":"A","value":40},{"name":"B","value":60}]}`,
+          "```",
+          "图表数据必须来自当前可验证的数据上下文（查询结果、附件、用户提供的数据等），不得编造；数据应完整、不加截断符。",
+          "不要输出 ```html 代码块，除非用户明确要求。",
+        ].join("\n"),
+      ]
+    : [
+        [
+          "You may emit a ```chart-json code block to render a chart (V1 supports line/bar/pie). Use it only when a visual comparison, trend, distribution, or share materially improves the answer; at most one chart per reply.",
+          "Example (line/bar): ```chart-json",
+          `{"version":1,"type":"line","xAxis":{"values":["Jan","Feb","Mar"]},"series":[{"name":"Revenue","data":[120,200,150]}]}`,
+          "```",
+          "Example (pie): ```chart-json",
+          `{"version":1,"type":"pie","data":[{"name":"A","value":40},{"name":"B","value":60}]}`,
+          "```",
+          "Chart data must be grounded in actual available data (query results, attachments, provided values) and never invented; keep it complete, no truncation markers.",
+          "Do not emit ```html code blocks unless the user explicitly asks for them.",
+        ].join("\n"),
+      ];
 }
 
 function buildModePromptLines(mode: AiAssistantMode, isZh: boolean, databaseType: DatabaseType): string[] {
@@ -716,8 +761,19 @@ async function loadCandidateSchemas(tab: QueryTab, connection: ConnectionConfig)
   return [database];
 }
 
-function aiDatabaseTypeForConnection(connection: ConnectionConfig): DatabaseType {
+export function aiDatabaseTypeForConnection(connection: ConnectionConfig): DatabaseType {
   return effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
+}
+
+/**
+ * Whether the AI target resolution honors a schema selection for this
+ * connection. Mirrors the `isSchemaAware(aiDatabaseTypeForConnection(...))`
+ * gate inside `resolveAiDatabaseTarget` so UI visibility cannot diverge from
+ * what the AI request actually consumes (e.g. gbase maps to a MySQL-like
+ * effective type that ignores schemas).
+ */
+export function aiSchemaSelectionSupported(connection: ConnectionConfig): boolean {
+  return isSchemaAware(aiDatabaseTypeForConnection(connection));
 }
 
 function aiDatabaseNamespace(tab: QueryTab, connection: ConnectionConfig): string {
@@ -751,7 +807,9 @@ export function resolveAiDatabaseTarget(tab: QueryTab, connection: ConnectionCon
       schema: resolveAiNamespaceSelection(tab, connection).value || undefined,
     };
   }
-  return { database: connection.db_type === "sqlite" ? normalizeSqliteNamespace(database, connection) : database };
+  const normalizedDatabase = connection.db_type === "sqlite" ? normalizeSqliteNamespace(database, connection) : database;
+  const schema = isSchemaAware(aiDatabaseTypeForConnection(connection)) ? tab.schema?.trim() || undefined : undefined;
+  return schema ? { database: normalizedDatabase, schema } : { database: normalizedDatabase };
 }
 
 function prioritizeSchemas(schemas: string[]): string[] {

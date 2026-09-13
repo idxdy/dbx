@@ -1588,6 +1588,7 @@ mod tests {
             read_only: false,
             allow_dangerous_sql: true,
             allowed_connection_ids: Some(vec![connection_id.to_string()]),
+            ..Default::default()
         }
     }
 

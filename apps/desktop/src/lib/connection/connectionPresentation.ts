@@ -161,7 +161,7 @@ export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "d
   }
 }
 
-export function connectionUrlPlaceholder(dbType: DatabaseType): string {
+export function connectionUrlPlaceholder(dbType: DatabaseType, driverProfile?: string): string {
   switch (dbType) {
     case "mysql":
     case "doris":
@@ -258,10 +258,13 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
       return "spanner:///projects/{project}/instances/{instance}/databases/{database}";
 
     case "iris":
-      return "iris://user:password@host:port/namespace";
+      return driverProfile === "cache" ? "cache://user:password@host:port/namespace" : "iris://user:password@host:port/namespace";
 
     case "influxdb":
       return "influxdb://user:password@host:port/database";
+
+    case "influxdb3":
+      return "influxdb3://token@host:8181/database";
 
     case "victoriametrics":
       return "http://user:password@host:port/prometheus";

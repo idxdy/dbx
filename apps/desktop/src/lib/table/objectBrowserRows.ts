@@ -1,5 +1,7 @@
-import type { ObjectInfo, TreeNode, TreeNodeType } from "@/types/database";
+import type { MongoCollectionKind, ObjectBrowserFilter, ObjectInfo, TreeNode, TreeNodeType } from "@/types/database";
+export type { ObjectBrowserFilter } from "@/types/database";
 import { pinnedTreeNodeIdentityMatches, type PinnedTreeNodeIdentity } from "@/lib/app/pinnedItems";
+import { toMongoCollectionKind } from "@/lib/sidebar/mongoCollectionMutation";
 import { buildGroupedObjectTreeNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, compareDatabaseObjectNames, normalizeDatabaseObjectName } from "@/lib/table/tableTree";
 import { parseSlashDelimitedRegexQuery } from "@/lib/common/searchPattern";
 
@@ -9,6 +11,7 @@ export type ObjectBrowserRow = {
   displayName: string;
   schema?: string;
   type: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+  collectionKind?: MongoCollectionKind;
   valid?: boolean | null;
   signature?: string | null;
   comment?: string | null;
@@ -24,7 +27,6 @@ export type ObjectBrowserRow = {
 
 export type ObjectBrowserSortKey = "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
 export type ObjectBrowserSortDirection = "asc" | "desc";
-export type ObjectBrowserFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "triggers" | "events" | "sequences" | "packages" | "types";
 export type ObjectBrowserFilterCounts = Record<ObjectBrowserFilter, number>;
 
 export type ObjectBrowserPinnedTreeNodeContext = {
@@ -187,6 +189,28 @@ export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; databas
 
   markPartitionRows(rows, options.fallbackSchema || options.database);
   return rows;
+}
+
+export function buildMongoObjectBrowserRows(options: { collections: Array<{ name: string; kind?: string | null }>; database: string }): ObjectBrowserRow[] {
+  const seen = new Map<string, number>();
+  return options.collections.flatMap((collection) => {
+    const name = collection.name;
+    if (!name) return [];
+    const collectionKind = toMongoCollectionKind(collection.kind);
+    const type: ObjectBrowserRow["type"] = collectionKind === "view" ? "VIEW" : "TABLE";
+    const baseId = `${options.database}:${name}:${type}:${collectionKind}`;
+    const index = seen.get(baseId) ?? 0;
+    seen.set(baseId, index + 1);
+    return [
+      {
+        id: `${baseId}:${index}`,
+        name,
+        displayName: name,
+        type,
+        collectionKind,
+      },
+    ];
+  });
 }
 
 function routineSignatureForDisplay(type: ObjectBrowserRow["type"], signature: string | null | undefined): string | undefined {

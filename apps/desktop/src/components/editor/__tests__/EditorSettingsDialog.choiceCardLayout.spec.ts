@@ -75,6 +75,16 @@ function expectClassTokens(className: string, tokens: readonly string[]) {
 }
 
 describe("EditorSettingsDialog choice card containment", () => {
+  it("shows the persistent filter-editor preference only for fixed filter views", () => {
+    const key = 't("settings.dataGridKeepFilterEditorExpanded")';
+    const keyIndex = templateSource.indexOf(key);
+    const configurationStart = templateSource.indexOf("<div v-if=\"editDataGridFilterEditorView !== 'quick'\"");
+    expect(keyIndex).toBeGreaterThan(-1);
+    expect(configurationStart).toBeGreaterThan(-1);
+    expect(configurationStart).toBeLessThan(keyIndex);
+    expect(templateSource).not.toContain("dataGridAutoHideFilterBuilder");
+  });
+
   it("overrides the shared Button nowrap contract on two- and three-column cards", () => {
     for (const key of affectedChoiceKeys) {
       const cardClass = classNameFromTag(openingTag(buttonBlockForKey(key), "Button"));
@@ -113,9 +123,18 @@ describe("EditorSettingsDialog choice card containment", () => {
   });
 
   it("preserves intentional single-line truncation for cards with tooltips", () => {
-    for (const key of ["appLayoutSeparatedDescription", "appLayoutClassicDescription", "iconThemeDefaultDescription"] as const) {
+    for (const key of ["appLayoutSeparatedDescription", "appLayoutClassicDescription"] as const) {
       expectClassTokens(classNameFromTag(elementTagForKey(key)), ["truncate"]);
     }
-    expect(dialogSource).toContain('class="text-xs text-muted-foreground truncate">\n                                {{ iconThemeBlackDescriptionText }}');
+  });
+
+  it("keeps large icon theme choices in appearance and debug logs in About", () => {
+    expect(sourceIndexForKey("iconTheme")).toBeLessThan(sourceIndexForKey("debugLoggingEnabled"));
+    expect(templateSource).toContain("data-icon-theme-settings");
+    for (const key of ["iconThemeDefault", "iconThemeBlack"] as const) {
+      const block = buttonBlockForKey(key);
+      expectClassTokens(classNameFromTag(openingTag(block, "Button")), ["settings-choice-card", "h-auto", "min-w-0", "whitespace-normal", "overflow-hidden"]);
+      expect(block).toContain('class="h-12 w-12 shrink-0"');
+    }
   });
 });

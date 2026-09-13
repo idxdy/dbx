@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     visit_relations_mut, Ident, ObjectName, ObjectNamePart, ObjectType, Statement, TableFactor, VisitMut, VisitorMut,
 };
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use sqlparser::dialect::{GenericDialect, MsSqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Condvar, Mutex,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -23,7 +23,7 @@ use crate::database_capabilities;
 use crate::db;
 use crate::db::agent_driver::{AgentCallError, AgentErrorStage, AgentOperationOutcome};
 use crate::models::connection::{ConnectionConfig, DatabaseType};
-use crate::query_execution_sql::{is_write_sql, strip_sql_comments_and_literals};
+use crate::query_execution_sql::{is_oracle_proven_read_only_statement, is_write_sql, strip_sql_comments_and_literals};
 use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable_sql_keyword_for_database};
 use crate::sql_dialect::{resolve_for_db, CAP_TRANSACTIONAL_DDL};
 use crate::sql_risk::{classify_sql_risk_for_database, SqlRisk};
@@ -197,6 +197,18 @@ pub struct ExecuteMultiResult {
     pub error: Option<crate::backend_error::BackendError>,
     #[serde(skip_serializing_if = "is_false")]
     pub server_message: bool,
+    /// Oracle-only manual-transaction UX metadata: true only for a statement
+    /// proven to be an ordinary top-level read. Absent/false for every other
+    /// Oracle statement and every non-Oracle execution. Not part of the
+    /// reusable database-result model (`db::QueryResult`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub manual_transaction_proven_read_only: bool,
+    /// Oracle-only manual-transaction UX metadata: true on the synthetic
+    /// successful result when the manual-execution splitter found zero
+    /// statements (empty/whitespace/comments-only script). Lets the frontend
+    /// treat it as a no-op rather than an unproven statement.
+    #[serde(skip_serializing_if = "is_false")]
+    pub manual_transaction_no_statement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +255,8 @@ impl ExecuteMultiResult {
             statement_index: None,
             error,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 
@@ -256,6 +270,8 @@ impl ExecuteMultiResult {
             statement_index: Some(statement_index),
             error,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 
@@ -271,6 +287,8 @@ impl ExecuteMultiResult {
             statement_index,
             error: Some(error),
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 
@@ -282,6 +300,8 @@ impl ExecuteMultiResult {
             statement_index: Some(statement_index),
             error: None,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 
@@ -304,6 +324,8 @@ impl ExecuteMultiResult {
             statement_index: Some(statement_index),
             error: None,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 
@@ -325,7 +347,19 @@ impl ExecuteMultiResult {
             statement_index: None,
             error: None,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
+    }
+
+    fn with_manual_transaction_proven_read_only(mut self) -> Self {
+        self.manual_transaction_proven_read_only = true;
+        self
+    }
+
+    fn with_manual_transaction_no_statement(mut self) -> Self {
+        self.manual_transaction_no_statement = true;
+        self
     }
 
     pub fn without_error_detail(mut self) -> Self {
@@ -363,6 +397,21 @@ struct ServerLargeValueMarkerValue {
     original_bytes: Option<usize>,
 }
 
+/// Some PostgreSQL-compatible servers (for example KingbaseES instances with
+/// case-insensitive identifiers) fold even quoted column aliases, so the
+/// internal preview marker prefix must be matched ASCII case-insensitively.
+fn strip_large_value_marker_prefix(column: &str) -> Option<&str> {
+    let prefix = crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX;
+    if column.len() < prefix.len() {
+        return None;
+    }
+    let head = column.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    column.get(prefix.len()..)
+}
+
 fn server_large_value_alias(
     suffix: &str,
 ) -> Option<(usize, Option<ServerLargeValuePreviewKind>, Option<&'static str>)> {
@@ -372,16 +421,16 @@ fn server_large_value_alias(
     let (kind, source_index) = suffix.split_once('_')?;
     let source_index = source_index.parse::<usize>().ok()?;
     let (preview_kind, source_type) = match kind {
-        "T" => (ServerLargeValuePreviewKind::Text, None),
-        "B" => (ServerLargeValuePreviewKind::Binary, None),
-        "V" => (ServerLargeValuePreviewKind::Vector, Some("vector")),
-        "J" => (ServerLargeValuePreviewKind::Text, Some("json")),
-        "K" => (ServerLargeValuePreviewKind::Text, Some("jsonb")),
-        "S" => (ServerLargeValuePreviewKind::Text, Some("tsvector")),
-        "C" => (ServerLargeValuePreviewKind::Deferred, Some("clob")),
-        "N" => (ServerLargeValuePreviewKind::Deferred, Some("nclob")),
-        "L" => (ServerLargeValuePreviewKind::Deferred, Some("blob")),
-        "F" => (ServerLargeValuePreviewKind::Deferred, Some("bfile")),
+        "T" | "t" => (ServerLargeValuePreviewKind::Text, None),
+        "B" | "b" => (ServerLargeValuePreviewKind::Binary, None),
+        "V" | "v" => (ServerLargeValuePreviewKind::Vector, Some("vector")),
+        "J" | "j" => (ServerLargeValuePreviewKind::Text, Some("json")),
+        "K" | "k" => (ServerLargeValuePreviewKind::Text, Some("jsonb")),
+        "S" | "s" => (ServerLargeValuePreviewKind::Text, Some("tsvector")),
+        "C" | "c" => (ServerLargeValuePreviewKind::Deferred, Some("clob")),
+        "N" | "n" => (ServerLargeValuePreviewKind::Deferred, Some("nclob")),
+        "L" | "l" => (ServerLargeValuePreviewKind::Deferred, Some("blob")),
+        "F" | "f" => (ServerLargeValuePreviewKind::Deferred, Some("bfile")),
         _ => return None,
     };
     Some((source_index, Some(preview_kind), source_type))
@@ -449,9 +498,8 @@ fn truncate_server_large_value_preview(
 fn server_large_value_markers(result: &db::QueryResult) -> Vec<ServerLargeValueMarker> {
     let mut markers = Vec::new();
     for (result_index, column) in result.columns.iter().enumerate() {
-        let Some((source_index, preview_kind, source_type)) = column
-            .strip_prefix(crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX)
-            .and_then(server_large_value_alias)
+        let Some((source_index, preview_kind, source_type)) =
+            strip_large_value_marker_prefix(column).and_then(server_large_value_alias)
         else {
             continue;
         };
@@ -600,6 +648,8 @@ impl From<db::QueryResult> for ExecuteMultiResult {
             statement_index: None,
             error: None,
             server_message: false,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 }
@@ -613,6 +663,8 @@ impl From<db::sqlserver::SqlServerBatchResult> for ExecuteMultiResult {
             statement_index: None,
             error: None,
             server_message: result.server_message,
+            manual_transaction_proven_read_only: false,
+            manual_transaction_no_statement: false,
         }
     }
 }
@@ -685,10 +737,12 @@ pub async fn check_read_only_for_connection(state: &AppState, pool_key: &str, sq
         let configs = state.configs.read().await;
         crate::connection::config_for_pool_key(pool_key, &configs)
             .filter(|config| config.read_only)
-            .map(|config| (config.name.clone(), config.db_type))
+            .map(|config| (config.id.clone(), config.name.clone(), config.db_type))
     };
-    if let Some((name, database_type)) = connection {
-        crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
+    if let Some((connection_id, name, database_type)) = connection {
+        if !state.write_unlock_windows.is_active(&connection_id).await {
+            crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
+        }
     }
     Ok(())
 }
@@ -703,11 +757,13 @@ pub async fn check_read_only_for_connection_multi(
         let configs = state.configs.read().await;
         crate::connection::config_for_pool_key(pool_key, &configs)
             .filter(|config| config.read_only)
-            .map(|config| (config.name.clone(), config.db_type))
+            .map(|config| (config.id.clone(), config.name.clone(), config.db_type))
     };
-    if let Some((name, database_type)) = connection {
-        for sql in statements {
-            crate::query_execution_sql::check_read_only(sql.as_ref(), &name, database_type)?;
+    if let Some((connection_id, name, database_type)) = connection {
+        if !state.write_unlock_windows.is_active(&connection_id).await {
+            for sql in statements {
+                crate::query_execution_sql::check_read_only(sql.as_ref(), &name, database_type)?;
+            }
         }
     }
     Ok(())
@@ -717,7 +773,14 @@ pub async fn check_read_only_for_connection_multi(
 /// This uses connection_id directly (not pool_key), so it is safe to call at command entry points
 /// before any pool key is constructed.
 pub async fn connection_readonly_name(state: &AppState, connection_id: &str) -> Option<String> {
-    state.configs.read().await.get(connection_id).filter(|c| c.read_only).map(|c| c.name.clone())
+    let name = {
+        let configs = state.configs.read().await;
+        configs.get(connection_id).filter(|c| c.read_only).map(|c| c.name.clone())?
+    };
+    if state.write_unlock_windows.is_active(connection_id).await {
+        return None;
+    }
+    Some(name)
 }
 
 async fn connection_is_mongodb(state: &AppState, connection_id: &str) -> bool {
@@ -769,21 +832,36 @@ async fn connection_database_type_for_pool_key(state: &AppState, pool_key: &str)
 }
 
 fn schema_for_execution_context(db_type: Option<DatabaseType>, schema: Option<&str>) -> Option<&str> {
-    if matches!(db_type, Some(DatabaseType::Iris)) {
+    // SQL Server has no session-level schema switch. Data-grid DML already uses
+    // qualified names, while legacy jTDS can mis-handle schema as catalog.
+    if matches!(db_type, Some(DatabaseType::Iris | DatabaseType::SqlServer)) {
         None
     } else {
         schema
     }
 }
 
+#[cfg(test)]
 fn sql_for_execution_context(db_type: Option<DatabaseType>, sql: &str, schema: Option<&str>) -> String {
+    sql_for_execution_context_with_identifier_quote(db_type, sql, schema, None)
+}
+
+fn sql_for_execution_context_with_identifier_quote(
+    db_type: Option<DatabaseType>,
+    sql: &str,
+    schema: Option<&str>,
+    identifier_quote: Option<&str>,
+) -> String {
     let Some(schema) = schema.map(str::trim).filter(|schema| !schema.is_empty()) else {
         return sql.to_string();
     };
     match db_type {
         Some(DatabaseType::Iris) => qualify_iris_unqualified_dml(sql, schema).unwrap_or_else(|| sql.to_string()),
+        Some(DatabaseType::SqlServer) => {
+            qualify_sqlserver_unqualified_dml(sql, schema).unwrap_or_else(|| sql.to_string())
+        }
         Some(DatabaseType::Kingbase) => {
-            qualify_kingbase_unqualified_relations(sql, schema).unwrap_or_else(|| sql.to_string())
+            qualify_kingbase_unqualified_relations(sql, schema, identifier_quote).unwrap_or_else(|| sql.to_string())
         }
         _ => sql.to_string(),
     }
@@ -802,8 +880,9 @@ fn qualify_iris_unqualified_dml(sql: &str, schema: &str) -> Option<String> {
             continue;
         }
         let cte_names = statement_cte_names(statement);
+        let table_aliases = statement_table_aliases(statement);
         let _ = visit_relations_mut(statement, |name| {
-            if qualify_unqualified_relation_name(name, schema, &cte_names) {
+            if qualify_unqualified_relation_name(name, schema, &cte_names, &table_aliases) {
                 changed = true;
             }
             ControlFlow::<()>::Continue(())
@@ -813,7 +892,36 @@ fn qualify_iris_unqualified_dml(sql: &str, schema: &str) -> Option<String> {
     changed.then(|| statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
 }
 
-fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str) -> Option<String> {
+fn qualify_sqlserver_unqualified_dml(sql: &str, schema: &str) -> Option<String> {
+    let dialect = MsSqlDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql).ok()?;
+    if statements.is_empty() {
+        return None;
+    }
+
+    let mut changed = false;
+    for statement in &mut statements {
+        if !statement_uses_schema_context(statement) {
+            continue;
+        }
+        let cte_names = statement_cte_names(statement);
+        let table_aliases = statement_table_aliases(statement);
+        let mut qualifier = SchemaRelationQualifier {
+            schema,
+            identifier_quote: '[',
+            cte_names: &cte_names,
+            table_aliases: &table_aliases,
+            parameterized_table_depth: 0,
+            changed: false,
+        };
+        let _ = statement.visit(&mut qualifier);
+        changed |= qualifier.changed;
+    }
+
+    changed.then(|| statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
+}
+
+fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str, identifier_quote: Option<&str>) -> Option<String> {
     let dialect = PostgreSqlDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql).ok()?;
     if statements.is_empty() {
@@ -826,8 +934,15 @@ fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str) -> Option<Str
             continue;
         }
         let cte_names = statement_cte_names(statement);
-        let mut qualifier =
-            KingbaseRelationQualifier { schema, cte_names: &cte_names, parameterized_table_depth: 0, changed: false };
+        let table_aliases = statement_table_aliases(statement);
+        let mut qualifier = SchemaRelationQualifier {
+            schema,
+            identifier_quote: identifier_quote_char(identifier_quote),
+            cte_names: &cte_names,
+            table_aliases: &table_aliases,
+            parameterized_table_depth: 0,
+            changed: false,
+        };
         let _ = statement.visit(&mut qualifier);
         changed |= qualifier.changed;
     }
@@ -835,14 +950,16 @@ fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str) -> Option<Str
     changed.then(|| statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
 }
 
-struct KingbaseRelationQualifier<'a> {
+struct SchemaRelationQualifier<'a> {
     schema: &'a str,
+    identifier_quote: char,
     cte_names: &'a HashSet<String>,
+    table_aliases: &'a HashSet<String>,
     parameterized_table_depth: usize,
     changed: bool,
 }
 
-impl VisitorMut for KingbaseRelationQualifier<'_> {
+impl VisitorMut for SchemaRelationQualifier<'_> {
     type Break = ();
 
     fn pre_visit_table_factor(&mut self, table_factor: &mut TableFactor) -> ControlFlow<Self::Break> {
@@ -861,7 +978,13 @@ impl VisitorMut for KingbaseRelationQualifier<'_> {
 
     fn post_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
         if self.parameterized_table_depth == 0
-            && qualify_unqualified_relation_name(relation, self.schema, self.cte_names)
+            && qualify_unqualified_relation_name_with_quote(
+                relation,
+                self.schema,
+                self.cte_names,
+                self.table_aliases,
+                self.identifier_quote,
+            )
         {
             self.changed = true;
         }
@@ -880,17 +1003,47 @@ fn statement_uses_schema_context(statement: &Statement) -> bool {
     )
 }
 
-fn qualify_unqualified_relation_name(name: &mut ObjectName, schema: &str, cte_names: &HashSet<String>) -> bool {
+fn qualify_unqualified_relation_name(
+    name: &mut ObjectName,
+    schema: &str,
+    cte_names: &HashSet<String>,
+    table_aliases: &HashSet<String>,
+) -> bool {
+    qualify_unqualified_relation_name_with_quote(name, schema, cte_names, table_aliases, '"')
+}
+
+fn qualify_unqualified_relation_name_with_quote(
+    name: &mut ObjectName,
+    schema: &str,
+    cte_names: &HashSet<String>,
+    table_aliases: &HashSet<String>,
+    identifier_quote: char,
+) -> bool {
     let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
         return false;
     };
-    if cte_names.contains(&table.value.to_ascii_uppercase()) {
+    let upper_name = table.value.to_ascii_uppercase();
+    if cte_names.contains(&upper_name) || table_aliases.contains(&upper_name) {
+        return false;
+    }
+    if table.value.starts_with('@') || table.value.starts_with('#') {
         return false;
     }
 
     let table = table.clone();
-    name.0 = vec![ObjectNamePart::Identifier(Ident::with_quote('"', schema)), ObjectNamePart::Identifier(table)];
+    name.0 = vec![
+        ObjectNamePart::Identifier(Ident::with_quote(identifier_quote, schema)),
+        ObjectNamePart::Identifier(table),
+    ];
     true
+}
+
+fn identifier_quote_char(identifier_quote: Option<&str>) -> char {
+    match identifier_quote.map(str::trim) {
+        Some("`") => '`',
+        Some("\"") => '"',
+        _ => '"',
+    }
 }
 
 fn statement_cte_names(statement: &Statement) -> HashSet<String> {
@@ -920,8 +1073,32 @@ fn collect_query_cte_names(query: &sqlparser::ast::Query, names: &mut HashSet<St
     }
 }
 
+struct TableAliasCollector<'a> {
+    names: &'a mut HashSet<String>,
+}
+
+impl VisitorMut for TableAliasCollector<'_> {
+    type Break = ();
+
+    fn post_visit_table_factor(&mut self, table_factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { alias: Some(alias), .. } = table_factor {
+            self.names.insert(alias.name.value.to_ascii_uppercase());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// FROM-clause aliases resolve to their table, so a single-part relation that
+/// matches one must never be schema-qualified (e.g. `UPDATE p ... FROM products p`).
+fn statement_table_aliases(statement: &mut Statement) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut collector = TableAliasCollector { names: &mut names };
+    let _ = statement.visit(&mut collector);
+    names
+}
+
 fn qualifies_unqualified_agent_relations(db_type: Option<DatabaseType>) -> bool {
-    matches!(db_type, Some(DatabaseType::Iris | DatabaseType::Kingbase))
+    matches!(db_type, Some(DatabaseType::Iris | DatabaseType::Kingbase | DatabaseType::SqlServer))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1129,7 +1306,7 @@ pub fn is_connection_error(err: &str) -> bool {
         || is_os_connection_error(&lower)
 }
 
-fn is_dbx_query_timeout_error(lower: &str) -> bool {
+pub(crate) fn is_dbx_query_timeout_error(lower: &str) -> bool {
     lower.starts_with("query timed out after ")
 }
 
@@ -1187,7 +1364,9 @@ fn options_for_sequential_statements(
     db_type: Option<DatabaseType>,
 ) -> QueryExecutionOptions {
     let mut statement_options = options.clone();
-    if statement_count <= 1 || db_type != Some(DatabaseType::Kingbase) || statement_options.result_session_id.is_some()
+    if statement_count <= 1
+        || !matches!(db_type, Some(DatabaseType::Kingbase | DatabaseType::Vastbase | DatabaseType::Oracle))
+        || statement_options.result_session_id.is_some()
     {
         return statement_options;
     }
@@ -1229,6 +1408,7 @@ fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> boo
                 | DatabaseType::Weaviate
                 | DatabaseType::ChromaDb
                 | DatabaseType::InfluxDb
+                | DatabaseType::InfluxDb3
                 | DatabaseType::VictoriaMetrics
         )
 }
@@ -1361,15 +1541,33 @@ fn postgres_transaction_statement_error(
 pub(crate) struct StreamProgressClock {
     started_at: tokio::time::Instant,
     last_progress_ms: AtomicU64,
+    #[cfg(test)]
+    marked: std::sync::atomic::AtomicBool,
 }
 
 impl StreamProgressClock {
     pub(crate) fn new() -> Self {
-        Self { started_at: tokio::time::Instant::now(), last_progress_ms: AtomicU64::new(0) }
+        Self {
+            started_at: tokio::time::Instant::now(),
+            last_progress_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            marked: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn mark(&self) {
         self.last_progress_ms.store(self.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+        #[cfg(test)]
+        self.marked.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any progress has been recorded yet. Test-only: production code
+    /// only needs the derived inactivity window. A row read within the first
+    /// millisecond records a zero timestamp, so this cannot be derived from
+    /// `last_progress_ms`.
+    #[cfg(test)]
+    pub(crate) fn marked(&self) -> bool {
+        self.marked.load(Ordering::Relaxed)
     }
 
     fn elapsed_since_progress(&self) -> Duration {
@@ -1567,8 +1765,7 @@ async fn sqlserver_pool_is_current(
     pool_key: &str,
     client: &Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
 ) -> bool {
-    let connections = state.connections.read().await;
-    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
+    matches!(state.pool_handle(pool_key).await, Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(&current, client))
 }
 
 pub fn query_timeout_duration(timeout_secs: Option<u64>) -> Option<Duration> {
@@ -1610,6 +1807,15 @@ async fn configured_operation_budget_for_pool_key(state: &AppState, pool_key: &s
     crate::connection::config_for_pool_key(pool_key, &configs)
         .map(DbOperationBudget::from_connection_config)
         .unwrap_or_else(DbOperationBudget::with_defaults)
+}
+
+/// Override a transaction budget's query timeout from a per-call override (e.g. the MCP
+/// global query-timeout policy). `None` leaves the budget unchanged; `Some(secs)` follows
+/// `resolve_query_timeout` semantics (`Some(0)` clears the limit, meaning unlimited).
+fn apply_query_timeout_override(budget: &mut DbOperationBudget, timeout_secs: Option<u64>) {
+    if let Some(secs) = timeout_secs {
+        budget.query_timeout = resolve_query_timeout(Some(secs));
+    }
 }
 
 fn oceanbase_mysql_session_timeout_sql(config: Option<&ConnectionConfig>, timeout_secs: Option<u64>) -> Option<String> {
@@ -1655,24 +1861,19 @@ async fn do_execute_typed(
     let _activity_touch = state.pool_activity_touch(pool_key);
 
     let query_timeout = resolve_query_timeout(options.timeout_secs);
-    let read_only_connection = {
-        let configs = state.configs.read().await;
-        let config = crate::connection::config_for_pool_key(pool_key, &configs);
-        config.filter(|config| config.read_only).map(|config| (config.name.clone(), config.db_type))
-    };
+    // Re-check at statement start so a write that becomes ready after the
+    // temporary unlock window expires is still blocked, even if an earlier
+    // statement in the same batch is still running.
+    check_read_only_for_connection(state, pool_key, sql).await?;
     let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
-    if let Some((name, database_type)) = read_only_connection {
-        crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
-    }
     let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
     let mysql_catalog_dialect = connection_mysql_catalog_dialect_for_pool_key(state, pool_key).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(pool_key).ok_or("Connection not found")?;
+    let pool = state.pool_handle(pool_key).await.ok_or("Connection not found")?;
 
     let mut typed_agent_error = None;
     #[cfg(feature = "duckdb-sidecar")]
     let mut typed_duckdb_error = None;
-    let result: Result<db::QueryResult, String> = match pool {
+    let result: Result<db::QueryResult, String> = match &pool {
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
@@ -1690,7 +1891,6 @@ async fn do_execute_typed(
             let sql = sql.to_string();
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
-            drop(connections);
             match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
@@ -1712,7 +1912,6 @@ async fn do_execute_typed(
             let bare = *mode == crate::connection::MysqlMode::Bare;
             let max_rows = options.max_rows;
             let max_result_bytes = options.max_result_bytes.filter(|value| *value > 0);
-            drop(connections);
             let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
                 &p,
                 operation_budget.checkout_timeout,
@@ -1777,7 +1976,6 @@ async fn do_execute_typed(
             let prefer_text_protocol = postgres_prefers_text_protocol(pool_db_type);
             let execution_mode = options.execution_mode;
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
-            drop(connections);
             if execution_mode == QueryExecutionMode::PostgresReadOnlyTransaction {
                 db::postgres::execute_query_in_read_only_transaction_with_rollback(
                     &p,
@@ -1817,14 +2015,21 @@ async fn do_execute_typed(
         PoolKind::Sqlite(p) => {
             let p = p.clone();
             let max_rows = options.max_rows;
-            drop(connections);
+            // SQLite execution runs in spawn_blocking, so cancelling only the
+            // awaitable future leaves the pooled connection occupied. Interrupt
+            // the native statement as soon as the shared cancellation registry
+            // receives the request so the same client session can run again.
+            if let Some(execution_id) = options.execution_id.as_deref() {
+                if let Ok(interrupt) = p.with_connection(|conn| Ok(conn.get_interrupt_handle())) {
+                    state.running_queries.register_interrupt(execution_id, move || interrupt.interrupt());
+                }
+            }
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))
                 .await
         }
         PoolKind::Rqlite(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1835,7 +2040,6 @@ async fn do_execute_typed(
         PoolKind::Turso(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1846,7 +2050,6 @@ async fn do_execute_typed(
         PoolKind::CloudflareD1(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1858,7 +2061,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1875,7 +2077,7 @@ async fn do_execute_typed(
             let client = client.clone();
             let max_rows = options.max_rows;
             let execution_mode = options.execution_mode;
-            drop(connections);
+            let sql = sql_for_execution_context_with_identifier_quote(pool_db_type, sql, schema, Some("["));
             let (mut client, lock_wait_ms) =
                 match lock_shared_client_with_wait(&client, cancel_token.clone(), None).await {
                     Ok(value) => value,
@@ -1884,10 +2086,10 @@ async fn do_execute_typed(
             let execution = async {
                 if execution_mode == QueryExecutionMode::Simple {
                     let mut results =
-                        db::sqlserver::execute_simple_batch_with_max_rows(&mut client, sql, max_rows).await?;
+                        db::sqlserver::execute_simple_batch_with_max_rows(&mut client, &sql, max_rows).await?;
                     Ok(results.remove(0))
                 } else {
-                    db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows).await
+                    db::sqlserver::execute_query_with_max_rows(&mut client, &sql, max_rows).await
                 }
             };
             let result = wait_for_query_opt(cancel_token, query_timeout, execution)
@@ -1907,11 +2109,14 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::elasticsearch_driver::execute_rest_query(&client, &sql),
+                db::elasticsearch_driver::execute_rest_query_with_cursor(
+                    &client,
+                    &sql,
+                    options.result_session_id.as_deref(),
+                ),
             )
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
@@ -1924,11 +2129,14 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::easysearch_driver::execute_rest_query(&client, &sql),
+                db::easysearch_driver::execute_rest_query_with_cursor(
+                    &client,
+                    &sql,
+                    options.result_session_id.as_deref(),
+                ),
             )
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
@@ -1941,7 +2149,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1958,7 +2165,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result =
                 wait_for_query_opt(cancel_token, query_timeout, db::vector_driver::execute_rest_query(&client, &sql))
                     .await
@@ -1979,7 +2185,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1992,10 +2197,25 @@ async fn do_execute_typed(
             }
             result
         }
+        PoolKind::InfluxDb3(client) => {
+            let client = client.clone();
+            let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
+            let max_rows = options.max_rows;
+            let result = wait_for_query_opt(
+                cancel_token,
+                query_timeout,
+                db::influxdb3_driver::execute_query(&client, &database, sql, max_rows),
+            )
+            .await
+            .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
         PoolKind::VictoriaMetrics(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -2011,12 +2231,12 @@ async fn do_execute_typed(
         PoolKind::Agent(client) => {
             let client = client.clone();
             let source_client = client.clone();
-            let sql = sql_for_execution_context(pool_db_type, sql, schema);
+            let sql =
+                sql_for_execution_context_with_identifier_quote(pool_db_type, sql, schema, client.identifier_quote());
             let database = database.map(|s| s.to_string());
             let schema = schema_for_execution_context(pool_db_type, schema).map(|s| s.to_string());
             let max_rows = options.max_rows;
             let rpc_timeout = query_timeout;
-            drop(connections);
             if is_canceled(&cancel_token) {
                 return Err(canceled_error().into());
             }
@@ -2075,7 +2295,6 @@ async fn do_execute_typed(
             let database = database.unwrap_or_else(|| config.effective_database().unwrap_or("")).to_string();
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
-            drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, async move {
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = external_driver_fetch_query_page_params(
@@ -2084,14 +2303,17 @@ async fn do_execute_typed(
                         options.page_size.unwrap_or(MAX_ROWS),
                     );
                     session.invoke_with_timeout::<db::QueryResult>("fetchQueryPage", params, plugin_timeout).await
-                } else if options.page_size.is_some() {
-                    let params =
-                        external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref(), &options);
-                    invoke_external_driver_query_page(session.as_ref(), params, plugin_timeout).await
                 } else {
-                    let params =
-                        external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref(), &options);
-                    session.invoke_with_timeout::<db::QueryResult>("executeQuery", params, plugin_timeout).await
+                    invoke_external_driver_query_with_preview_retry(
+                        session.as_ref(),
+                        config.as_ref(),
+                        &sql,
+                        &database,
+                        schema.as_deref(),
+                        &options,
+                        plugin_timeout,
+                    )
+                    .await
                 }
             })
             .await
@@ -2102,7 +2324,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows.unwrap_or(MAX_ROWS);
-            drop(connections);
             // Keep the AWS SDK cold-path future off this already-large query dispatcher stack.
             let execution = Box::pin(db::dynamodb_driver::execute_statement(&client, &sql, max_rows));
             wait_for_query_opt(cancel_token, query_timeout, execution).await
@@ -2176,6 +2397,226 @@ async fn invoke_external_driver_query_page(
     }
 }
 
+async fn invoke_external_driver_query_with_preview_retry(
+    session: &crate::plugins::PluginDriverSession,
+    config: &crate::models::connection::ConnectionConfig,
+    sql: &str,
+    database: &str,
+    schema: Option<&str>,
+    options: &QueryExecutionOptions,
+    plugin_timeout: Option<Duration>,
+) -> Result<db::QueryResult, String> {
+    let result = if options.page_size.is_some() {
+        let params = external_driver_query_params(config, sql, database, schema, options);
+        invoke_external_driver_query_page(session, params, plugin_timeout).await
+    } else {
+        let params = external_driver_query_params(config, sql, database, schema, options);
+        session.invoke_with_timeout::<db::QueryResult>("executeQuery", params, plugin_timeout).await
+    };
+
+    let Err(error) = result else {
+        return result;
+    };
+    if !options.table_data_preview || !is_external_driver_invalid_utf8_error(&error) {
+        return Err(error);
+    }
+    let Some(fallback_sql) = external_driver_preview_fallback_sql(sql) else {
+        return Err(error);
+    };
+
+    log::warn!(
+        "[query][external-driver] JDBC preview failed with invalid UTF-8; retrying without generated left() wrappers"
+    );
+    if options.page_size.is_some() {
+        let params = external_driver_query_params(config, &fallback_sql, database, schema, options);
+        invoke_external_driver_query_page(session, params, plugin_timeout).await
+    } else {
+        let params = external_driver_query_params(config, &fallback_sql, database, schema, options);
+        session.invoke_with_timeout::<db::QueryResult>("executeQuery", params, plugin_timeout).await
+    }
+}
+
+/// PostgreSQL can reject a character preview when legacy data contains an
+/// invalid UTF-8 byte exactly at the `left`/`substring` boundary.  JDBC can
+/// still return the unmodified text value, so table previews may safely retry
+/// without the generated `left(...)` wrappers and let the existing marker
+/// extraction truncate the value client-side.
+fn is_external_driver_invalid_utf8_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("invalid byte sequence for encoding") && normalized.contains("utf8")
+}
+
+fn is_sql_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn sql_keyword_at(bytes: &[u8], index: usize, keyword: &[u8]) -> bool {
+    let end = index.saturating_add(keyword.len());
+    end <= bytes.len()
+        && bytes[index..end].eq_ignore_ascii_case(keyword)
+        && (index == 0 || !is_sql_word_byte(bytes[index - 1]))
+        && (end == bytes.len() || !is_sql_word_byte(bytes[end]))
+}
+
+/// Skip a quoted literal/identifier or SQL comment and return the first byte
+/// after it. This keeps keyword and parenthesis scans from interpreting commas
+/// or `FROM` text embedded in user predicates/literals.
+fn skip_sql_quoted_or_comment(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    let (end_byte, doubled) = match quote {
+        b'\'' => (b'\'', true),
+        b'"' => (b'"', true),
+        b'`' => (b'`', true),
+        b'[' => (b']', true),
+        b'-' if bytes.get(start + 1) == Some(&b'-') => {
+            return Some(
+                bytes[start + 2..].iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |p| start + 2 + p + 1),
+            );
+        }
+        b'/' if bytes.get(start + 1) == Some(&b'*') => {
+            return Some(
+                bytes[start + 2..].windows(2).position(|pair| pair == b"*/").map_or(bytes.len(), |p| start + 2 + p + 2),
+            );
+        }
+        _ => return None,
+    };
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if quote == b'\'' && bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == end_byte {
+            if doubled && bytes.get(index + 1) == Some(&end_byte) {
+                index += 2;
+            } else {
+                return Some(index + 1);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    Some(bytes.len())
+}
+
+fn find_top_level_sql_keyword(sql: &str, start: usize, keyword: &[u8]) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(next) = skip_sql_quoted_or_comment(bytes, index) {
+            index = next;
+            continue;
+        }
+        match byte {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && sql_keyword_at(bytes, index, keyword) => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_preview_left_call(sql: &str, name_start: usize) -> Option<(usize, usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut open = name_start + 4;
+    while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+        open += 1;
+    }
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut comma = None;
+    let mut close = None;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(next) = skip_sql_quoted_or_comment(bytes, index) {
+            index = next;
+            continue;
+        }
+        match byte {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            b',' if depth == 1 => {
+                if comma.is_some() {
+                    return None;
+                }
+                comma = Some(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    let close = close?;
+    let comma = comma?;
+    let first = &sql[open + 1..comma];
+    let second = &sql[comma + 1..close];
+    if first.trim().is_empty() || second.trim().is_empty() || !second.trim().bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let first_start = open + 1 + first.len() - first.trim_start().len();
+    let first_end = open + 1 + first.trim_end().len();
+    Some((close, first_start, first_end))
+}
+
+fn rewrite_external_driver_preview_projection(projection: &str) -> Option<String> {
+    let bytes = projection.as_bytes();
+    let mut replacements = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(next) = skip_sql_quoted_or_comment(bytes, index) {
+            index = next;
+            continue;
+        }
+        if sql_keyword_at(bytes, index, b"left") {
+            let previous = index.checked_sub(1).and_then(|position| bytes.get(position)).copied();
+            if previous != Some(b'.') {
+                if let Some((close, first_start, first_end)) = find_preview_left_call(projection, index) {
+                    replacements.push((index, close + 1, projection[first_start..first_end].to_string()));
+                    index = close + 1;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+    let mut rewritten = projection.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        rewritten.replace_range(start..end, &replacement);
+    }
+    Some(rewritten)
+}
+
+fn external_driver_preview_fallback_sql(sql: &str) -> Option<String> {
+    let select_start = find_top_level_sql_keyword(sql, 0, b"select")?;
+    if !sql[..select_start].trim().is_empty() {
+        return None;
+    }
+    let select_end = select_start + b"select".len();
+    let from_start = find_top_level_sql_keyword(sql, select_end, b"from")?;
+    let projection = &sql[select_end..from_start];
+    if !projection.contains(crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX) {
+        return None;
+    }
+    let rewritten_projection = rewrite_external_driver_preview_projection(projection)?;
+    Some(format!("{}{}{}", &sql[..select_end], rewritten_projection, &sql[from_start..]))
+}
+
 fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     let method = method.to_ascii_lowercase();
@@ -2185,7 +2626,7 @@ fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
             || normalized.contains("method not found"))
 }
 
-fn external_driver_query_params(
+pub(crate) fn external_driver_query_params(
     config: &crate::models::connection::ConnectionConfig,
     sql: &str,
     database: &str,
@@ -2375,8 +2816,8 @@ async fn execute_postgres_drop_database(
 
     check_read_only_for_connection(state, &pool_key, sql).await?;
     let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => pool.clone(),
             Some(_) => return Err("DROP DATABASE reconnect did not create a PostgreSQL connection".to_string()),
             None => return Err("Connection not found".to_string()),
@@ -2435,24 +2876,32 @@ pub async fn close_query_session(
     let pool_database = query_pool_database(database, catalog);
     let pool_key = state.get_or_create_pool_for_session(connection_id, pool_database, client_session_id).await?;
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Connection not found")?;
+    let pool_handle = state.pool_handle(&pool_key).await;
+    let pool = pool_handle.as_ref().ok_or("Connection not found")?;
     match pool {
         PoolKind::Agent(client) => {
             let client = client.clone();
-            drop(connections);
             let mut client = client.lock().await;
             client.close_query_session(session_id).await
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             let params = external_driver_fetch_query_page_params(config.as_ref(), session_id, 1);
             session
                 .invoke::<serde_json::Value>("closeQuerySession", params)
                 .await
                 .map(|value| value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false))
+        }
+        PoolKind::Elasticsearch(client) => {
+            let client = client.clone();
+            db::elasticsearch_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            db::easysearch_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
         }
         _ => Ok(false),
     }
@@ -2591,13 +3040,52 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(pool_key.as_str());
 
-    let is_sqlserver = {
-        let connections = state.connections.read().await;
-        matches!(connections.get(&pool_key), Some(PoolKind::SqlServer(_)))
+    let (is_sqlserver, is_sqlserver_agent) = {
+        match state.pool_handle(&pool_key).await {
+            Some(PoolKind::SqlServer(_)) => (true, false),
+            Some(PoolKind::Agent(_)) if db_type == Some(DatabaseType::SqlServer) => (false, true),
+            _ => (false, false),
+        }
     };
 
+    let execution_plan = query_execution_plan(sql, db_type, is_sqlserver_agent);
+    let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
+    let statements = execution_plan.statements;
+    if statements.is_empty() {
+        return Ok(vec![empty_query_result(0).into()]);
+    }
+
+    // Check the transaction request before database-specific fast paths. Otherwise
+    // a backend such as SQL Server or HTTP SQLite can return successful
+    // auto-commit results while the API has promised a rollbackable batch.
+    // The DDL cap applies only to this opt-in use_transaction contract: a script
+    // that the user asked to run atomically must not silently produce partial
+    // effects. Other callers that share the transaction kernel (schema-diff
+    // deploy, imports) document a mixed-outcome-on-failure behaviour instead, so
+    // they are deliberately not capped here.
+    if options.use_transaction == Some(true) && statements.len() > 1 {
+        if batch_transaction_ddl_is_unrollbackable(db_type, &statements) {
+            return Err(
+                "use_transaction cannot be used with a batch whose DDL cannot be rolled back: DDL statements implicitly commit and cannot be undone. Run the batch without use_transaction (auto-commit, one result per statement) or split the DDL and DML into separate calls."
+                    .to_string()
+                    .into(),
+            );
+        }
+        let result = execute_statements_in_transaction_typed(
+            state,
+            connection_id,
+            database,
+            &statements,
+            schema,
+            options.catalog.as_deref(),
+            options.timeout_secs,
+        )
+        .await?;
+        return Ok(vec![result.into()]);
+    }
+
     if is_sqlserver {
-        return execute_multi_sqlserver(state, &pool_key, sql, cancel_token, options).await.map_err(Into::into);
+        return execute_multi_sqlserver(state, &pool_key, sql, schema, cancel_token, options).await.map_err(Into::into);
     }
 
     let is_http_sqlite = {
@@ -2608,7 +3096,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     };
 
     // HTTP SQLite providers send all statements in one request so the provider
-    // can preserve batch ordering and atomicity.
+    // can preserve batch ordering and atomicity in the default batch mode.
     if is_http_sqlite {
         let table_data_preview = options.table_data_preview;
         return single_statement_multi_result(
@@ -2626,32 +3114,9 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         );
     }
 
-    let statements = db_type.map_or_else(
-        || split_sql_statements(sql),
-        |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
-    );
-    if statements.is_empty() {
-        return Ok(vec![empty_query_result(0).into()]);
-    }
-
-    // When use_transaction is explicitly true and we have multiple statements,
-    // route through the transaction wrapper instead of the sequential auto-commit loop.
-    if options.use_transaction == Some(true) && statements.len() > 1 {
-        let result = execute_statements_in_transaction_typed(
-            state,
-            connection_id,
-            database,
-            &statements,
-            schema,
-            options.catalog.as_deref(),
-        )
-        .await?;
-        return Ok(vec![result.into()]);
-    }
-
     let mysql_pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Mysql(pool, mode)) => Some((pool.clone(), *mode)),
             _ => None,
         }
@@ -2705,10 +3170,9 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         .map_err(Into::into);
     }
 
-    // Kingbase Go keeps one physical connection per Agent session, so an open
-    // result cursor prevents the next statement from acquiring that connection.
-    // Multi-result execution therefore reads a bounded first page for each
-    // Kingbase statement without retaining cursors.
+    // Some Agent drivers cannot execute another statement while a paged result
+    // cursor remains open on the same physical connection. Multi-result execution
+    // therefore reads a bounded first page without retaining those cursors.
     let statement_options = options_for_sequential_statements(&options, statements.len(), db_type);
     let mut results = Vec::with_capacity(statements.len());
     for (statement_index, stmt) in statements.iter().enumerate() {
@@ -2757,7 +3221,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
                     Some(statement_index),
                     backend_error,
                 ));
-                if !should_continue_batch_after_error(options.continue_on_error, action) {
+                if !should_continue_batch_after_error(continue_on_error, action) {
                     break;
                 }
             }
@@ -2765,6 +3229,58 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     }
 
     Ok(results)
+}
+
+/// Split a batch script into the statements the core will execute, using the
+/// same dialect-aware splitter for every caller. SQL Server agent pools split on
+/// `GO` batch separators (`split_sql_batches`); everything else uses the
+/// database-dialect statement splitter. Public so the MCP pre-check can align its
+/// transaction-entry decision with the core's actual script split.
+pub fn query_execution_plan(
+    sql: &str,
+    db_type: Option<DatabaseType>,
+    preserve_sqlserver_batches: bool,
+) -> crate::sql::SqlExecutionPlan {
+    if preserve_sqlserver_batches && db_type == Some(DatabaseType::SqlServer) {
+        return crate::sql::SqlExecutionPlan { statements: split_sql_batches(sql), stop_on_error: false };
+    }
+
+    db_type.map_or_else(
+        || crate::sql::SqlExecutionPlan { statements: split_sql_statements(sql), stop_on_error: false },
+        |db_type| crate::sql::sql_execution_plan_for_database(sql, db_type),
+    )
+}
+
+/// Whether a connection's pool is the SQL Server agent driver, mirroring the
+/// predicate the core uses to select the batch splitter in [`query_execution_plan`].
+/// Reads the existing pool without creating one so callers (the MCP pre-check)
+/// can align their splitter without opening a connection. `false` for non-SQL
+/// Server connections and when no pool is open yet. A SQL Server connection
+/// backed by the legacy agent driver connects as `PoolKind::Agent` and is
+/// detected here; the native driver connects as `PoolKind::SqlServer` and
+/// returns `false`.
+pub async fn connection_pool_is_sqlserver_agent(state: &AppState, connection_id: &str, database: &str) -> bool {
+    let db_type = connection_database_type(state, connection_id).await;
+    if db_type != Some(DatabaseType::SqlServer) {
+        return false;
+    }
+
+    // SQL Server base pool keys are either `connection_id` (no database) or
+    // `connection_id:database`. Peek both without creating a pool.
+    let candidates = match database.trim() {
+        "" => vec![connection_id.to_string()],
+        db => vec![format!("{connection_id}:{db}"), connection_id.to_string()],
+    };
+    for key in candidates {
+        if let Some(pool) = state.pool_handle(&key).await {
+            return match pool {
+                PoolKind::Agent(_) => true,
+                PoolKind::SqlServer(_) => false,
+                _ => false,
+            };
+        }
+    }
+    false
 }
 
 fn single_statement_multi_result(
@@ -3208,6 +3724,7 @@ async fn execute_multi_sqlserver(
     state: &AppState,
     pool_key: &str,
     sql: &str,
+    schema: Option<&str>,
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<Vec<ExecuteMultiResult>, String> {
@@ -3231,13 +3748,12 @@ async fn execute_multi_sqlserver(
             break;
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(pool_key).ok_or("Connection not found")?;
+        let pool_handle = state.pool_handle(pool_key).await;
+        let pool = pool_handle.as_ref().ok_or("Connection not found")?;
         let client = match pool {
             PoolKind::SqlServer(c) => c.clone(),
             _ => return Err("Expected SQL Server connection".to_string()),
         };
-        drop(connections);
 
         let (mut client_guard, lock_wait_ms) =
             match lock_shared_client_with_wait(&client, cancel_token.clone(), query_timeout).await {
@@ -3262,11 +3778,14 @@ async fn execute_multi_sqlserver(
             break;
         }
 
+        let execution_sql =
+            sql_for_execution_context_with_identifier_quote(Some(DatabaseType::SqlServer), batch, schema, Some("["));
         let execution = async {
             if execution_mode == QueryExecutionMode::Simple {
-                db::sqlserver::execute_simple_batch_with_max_rows_metadata(&mut client_guard, batch, max_rows).await
+                db::sqlserver::execute_simple_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows)
+                    .await
             } else {
-                db::sqlserver::execute_batch_with_max_rows_metadata(&mut client_guard, batch, max_rows).await
+                db::sqlserver::execute_batch_with_max_rows_metadata(&mut client_guard, &execution_sql, max_rows).await
             }
         };
         let result = wait_for_result_opt(cancel_token.clone(), query_timeout, execution).await;
@@ -3334,8 +3853,8 @@ pub async fn execute_statements(
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
 
     let agent_client = {
-        let conns = state.connections.read().await;
-        match conns.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Agent(client)) => Some(client.clone()),
             _ => None,
         }
@@ -3347,8 +3866,12 @@ pub async fn execute_statements(
         let execution_schema = schema_for_execution_context(db_type, schema);
         let rewritten_statements;
         let statements = if qualifies_unqualified_agent_relations(db_type) {
-            rewritten_statements =
-                statements.iter().map(|sql| sql_for_execution_context(db_type, sql, schema)).collect::<Vec<_>>();
+            rewritten_statements = statements
+                .iter()
+                .map(|sql| {
+                    sql_for_execution_context_with_identifier_quote(db_type, sql, schema, client.identifier_quote())
+                })
+                .collect::<Vec<_>>();
             rewritten_statements.as_slice()
         } else {
             statements
@@ -3575,6 +4098,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Meilisearch(_)
         | PoolKind::VectorDb(_)
         | PoolKind::InfluxDb(_)
+        | PoolKind::InfluxDb3(_)
         | PoolKind::VictoriaMetrics(_)
         | PoolKind::ExternalDriver { .. } => false,
         #[cfg(feature = "mq-admin")]
@@ -3588,7 +4112,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
 /// - Returns a structured result (never re-executes statements to probe status).
 /// - Comment-only / empty scripts succeed as `committed` with zero statements.
 /// - When the target path cannot guarantee DDL atomicity (MySQL/Oracle DDL
-///   auto-commit, `TxPath::None`, etc.), a failure reports `mixed` and
+///   auto-commit, unsupported batch transaction paths, etc.), a failure reports `mixed` and
 ///   `executed_count` reflects the statements that were issued before the
 ///   error, so the caller can warn the user that partial effects may persist.
 pub async fn execute_schema_diff_deploy(
@@ -3679,10 +4203,8 @@ pub async fn execute_schema_diff_deploy(
             }
         }
     };
-    let has_transactional_path = {
-        let conns = state.connections.read().await;
-        conns.get(&pool_key).is_some_and(pool_kind_has_transactional_path)
-    };
+    let has_transactional_path =
+        { state.pool_handle(&pool_key).await.as_ref().is_some_and(pool_kind_has_transactional_path) };
     let atomicity = classify_schema_diff_atomicity(db_type, &parsed, has_transactional_path);
 
     match execute_statements_in_transaction_on_pool(state, &pool_key, connection_id, database, &parsed, schema, None)
@@ -3732,11 +4254,10 @@ pub async fn execute_schema_diff_deploy(
 
 /// Execute multiple SQL statements within a single transaction.
 /// For pooled drivers (Postgres/MySQL), uses the driver transaction API.
-/// For SQLite and already-single-connection drivers (ClickHouse/SqlServer/Agent),
-/// uses explicit BEGIN/COMMIT/ROLLBACK on the shared connection.
-/// For databases that don't support explicit transactions (Redis, MongoDB, Oracle),
-/// executes statements sequentially without transaction.
-/// If BEGIN fails, returns an error instead of silently falling back to auto-commit.
+/// For SQLite and SQL Server, uses a transaction on the driver's shared connection.
+/// Agent drivers must provide the same rollbackable transaction contract.
+/// Backends without a verified rollbackable path are rejected instead of being
+/// silently executed one statement at a time in auto-commit mode.
 pub async fn execute_statements_in_transaction(
     state: &AppState,
     connection_id: &str,
@@ -3745,7 +4266,7 @@ pub async fn execute_statements_in_transaction(
     schema: Option<&str>,
     catalog: Option<&str>,
 ) -> Result<db::QueryResult, String> {
-    execute_statements_in_transaction_typed(state, connection_id, database, statements, schema, catalog)
+    execute_statements_in_transaction_typed(state, connection_id, database, statements, schema, catalog, None)
         .await
         .map_err(QueryExecutionError::into_legacy_string)
 }
@@ -3758,6 +4279,7 @@ pub async fn execute_statements_in_transaction_typed(
     statements: &[String],
     schema: Option<&str>,
     catalog: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
     let sql_ctx = statements.first().map(|s| s.as_str()).unwrap_or("");
     let pool_database = query_pool_database(database, catalog);
@@ -3774,6 +4296,7 @@ pub async fn execute_statements_in_transaction_typed(
         statements,
         schema,
         catalog,
+        timeout_secs,
     )
     .await
 }
@@ -3797,6 +4320,7 @@ pub async fn execute_statements_in_transaction_on_pool(
         statements,
         schema,
         catalog,
+        None,
     )
     .await
     .map_err(QueryExecutionError::into_legacy_string)
@@ -3811,52 +4335,32 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
     statements: &[String],
     schema: Option<&str>,
     catalog: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
+    let db_type = connection_database_type(state, connection_id).await;
+
     // Read-only check: intercept all transaction paths before dispatching
     check_read_only_for_connection_multi(state, pool_key, statements).await?;
 
     let start = std::time::Instant::now();
-    let db_type = connection_database_type(state, connection_id).await;
     let mysql_catalog_dialect = connection_mysql_catalog_dialect(state, connection_id).await;
-    let operation_budget = configured_operation_budget_for_pool_key(state, pool_key).await;
+    let mut operation_budget = configured_operation_budget_for_pool_key(state, pool_key).await;
+    apply_query_timeout_override(&mut operation_budget, timeout_secs);
 
+    // This is the single capability model for explicit batch transactions.
+    // Do not add a backend here unless its execution path keeps every statement
+    // on one transaction-capable connection and can roll back on failure.
+    // Agent drivers are delegated because their transaction RPC has the same
+    // contract and rejects drivers that cannot provide it.
     // Clone the pool handle within the lock, then drop it before any async work.
-    let path = {
-        let conns = state.connections.read().await;
-        conns.get(pool_key).map(|p| match p {
-            PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
-            PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
-            PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
-            PoolKind::CloudflareD1(client) => TxPath::CloudflareD1(client.clone()),
-            PoolKind::ClickHouse(_) | PoolKind::Rqlite(_) | PoolKind::Turso(_) | PoolKind::SqlServer(_) => {
-                TxPath::Explicit
-            }
-            PoolKind::Agent(client) => TxPath::Agent(client.clone()),
-            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) | PoolKind::Ldap(_) => {
-                TxPath::None
-            }
-            #[cfg(feature = "mq-admin")]
-            PoolKind::Mqtt(_) => TxPath::None,
-            PoolKind::DuckDbWorker(_)
-            | PoolKind::Redis(_)
-            | PoolKind::MongoDb(_)
-            | PoolKind::DynamoDb(_)
-            | PoolKind::Elasticsearch(_)
-            | PoolKind::Easysearch(_)
-            | PoolKind::Meilisearch(_)
-            | PoolKind::VectorDb(_)
-            | PoolKind::InfluxDb(_)
-            | PoolKind::VictoriaMetrics(_)
-            | PoolKind::ExternalDriver { .. } => TxPath::None,
-        })
-    };
+    let path = { state.pool_handle(pool_key).await.as_ref().map(batch_transaction_path) };
 
     let result = match path {
-        Some(TxPath::Pg(pool)) => {
+        Some(BatchTransactionPath::Pg(pool)) => {
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
         }
-        Some(TxPath::Mysql(pool, _bare)) => exec_tx_mysql_inner(
+        Some(BatchTransactionPath::Mysql(pool)) => exec_tx_mysql_inner(
             state,
             pool_key,
             pool,
@@ -3869,37 +4373,37 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
         )
         .await
         .map_err(Into::into),
-        Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await.map_err(Into::into),
-        Some(TxPath::CloudflareD1(client)) => {
-            let sql = statements.join(";\n");
-            wait_for_query_opt(
-                None,
-                operation_budget.query_timeout,
-                db::cloudflare_d1_driver::execute_query_with_max_rows(&client, &sql, None),
-            )
-            .await
-            .map_err(Into::into)
+        Some(BatchTransactionPath::Sqlite(pool)) => {
+            exec_tx_sqlite_inner(pool, statements, start, &operation_budget).await.map_err(Into::into)
         }
-        Some(TxPath::Agent(client)) => {
-            let result = exec_tx_agent_inner(client.clone(), db_type, Some(database), statements, schema, start).await;
+        Some(BatchTransactionPath::Agent(client)) => {
+            let result = exec_tx_agent_inner(
+                client.clone(),
+                db_type,
+                Some(database),
+                statements,
+                schema,
+                start,
+                &operation_budget,
+            )
+            .await;
             if let Err(error) = result.as_ref() {
                 discard_agent_pool_after_typed_error(state, pool_key, &client, error, RecoveryScope::UserOperation)
                     .await;
             }
             return result.map_err(QueryExecutionError::Agent);
         }
-        Some(TxPath::Explicit) => {
+        Some(BatchTransactionPath::Explicit) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
             exec_tx_explicit_inner(state, pool_key, mysql_dialect, Some(database), statements, schema, start)
                 .await
                 .map_err(Into::into)
         }
-        Some(TxPath::None) => {
-            let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
-            exec_tx_none_inner(state, pool_key, mysql_dialect, Some(database), statements, schema, start)
-                .await
-                .map_err(Into::into)
-        }
+        Some(BatchTransactionPath::Unsupported) => Err(
+            "The active backend cannot provide a rollbackable transaction for a batch; run without use_transaction."
+                .to_string()
+                .into(),
+        ),
         None => Err("Connection not found for transaction".to_string().into()),
     };
 
@@ -3910,15 +4414,64 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
     result
 }
 
-/// Owned pool variants for safe dispatch across async boundaries.
-enum TxPath {
+/// Whether an opt-in explicit batch transaction (`use_transaction`) must be
+/// rejected because the backend's DDL statements implicitly commit and cannot be
+/// rolled back. Used by the opt-in batch-transaction entry point (the
+/// `use_transaction` branch of [`execute_multi_core_with_options_for_client_and_progress_typed`])
+/// and by the MCP layer's identical pre-check. It covers every backend whose DDL
+/// is not rollbackable (MySQL-family and Oracle) via the single capability
+/// predicate (`database_supports_transactional_ddl`) without re-listing engines
+/// here. Paths that document a mixed-outcome-on-failure behaviour (schema-diff
+/// deploy, imports) do not call this and keep running-and-reporting.
+pub fn batch_transaction_ddl_is_unrollbackable(db_type: Option<DatabaseType>, statements: &[String]) -> bool {
+    let Some(db_type) = db_type else {
+        return false;
+    };
+    if database_supports_transactional_ddl(db_type) {
+        return false;
+    }
+    statements.iter().any(|statement| matches!(classify_sql_risk_for_database(statement, db_type), Ok(SqlRisk::Ddl)))
+}
+
+/// Owned transaction-capable pool variants for safe dispatch across async boundaries.
+enum BatchTransactionPath {
     Pg(deadpool_postgres::Pool),
-    Mysql(db::mysql::MySqlPool, bool),
+    Mysql(db::mysql::MySqlPool),
     Sqlite(db::sqlite::SqliteHandle),
-    CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
     Agent(Arc<crate::db::agent_driver::PooledAgentClient>),
     Explicit,
-    None,
+    Unsupported,
+}
+
+fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
+    match pool {
+        PoolKind::Postgres(pg) => BatchTransactionPath::Pg(pg.clone()),
+        PoolKind::Mysql(pool, _mode) => BatchTransactionPath::Mysql(pool.clone()),
+        PoolKind::Sqlite(pool) => BatchTransactionPath::Sqlite(pool.clone()),
+        PoolKind::SqlServer(_) => BatchTransactionPath::Explicit,
+        PoolKind::Agent(client) => BatchTransactionPath::Agent(client.clone()),
+        PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => {
+            BatchTransactionPath::Unsupported
+        }
+        #[cfg(feature = "mq-admin")]
+        PoolKind::Mqtt(_) => BatchTransactionPath::Unsupported,
+        PoolKind::DuckDbWorker(_)
+        | PoolKind::Redis(_)
+        | PoolKind::MongoDb(_)
+        | PoolKind::DynamoDb(_)
+        | PoolKind::ClickHouse(_)
+        | PoolKind::Rqlite(_)
+        | PoolKind::Turso(_)
+        | PoolKind::CloudflareD1(_)
+        | PoolKind::Elasticsearch(_)
+        | PoolKind::Easysearch(_)
+        | PoolKind::Meilisearch(_)
+        | PoolKind::VectorDb(_)
+        | PoolKind::InfluxDb(_)
+        | PoolKind::InfluxDb3(_)
+        | PoolKind::VictoriaMetrics(_)
+        | PoolKind::ExternalDriver { .. } => BatchTransactionPath::Unsupported,
+    }
 }
 
 // Each of these acquires a dedicated connection and runs all statements within
@@ -4104,40 +4657,173 @@ async fn exec_tx_sqlite_inner(
     pool: db::sqlite::SqliteHandle,
     statements: &[String],
     start: std::time::Instant,
+    budget: &DbOperationBudget,
 ) -> Result<db::QueryResult, String> {
     let statements = statements.to_vec();
+    let query_timeout = budget.query_timeout;
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
             conn.execute_batch("BEGIN").map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+            // rusqlite's synchronous API blocks for the full duration of a single
+            // statement, so a per-statement-boundary elapsed check alone cannot
+            // interrupt a statement that itself runs past the query budget. Use a
+            // cross-thread watchdog: it sleeps on a condvar for the budget, then
+            // fires `InterruptHandle::interrupt()` (SQLITE_INTERRUPT) which aborts
+            // the currently executing statement mid-flight. The watchdog is disarmed
+            // and joined before COMMIT so a stale interrupt can never land on a
+            // future, unrelated query of this pooled connection.
+            let interrupt = conn.get_interrupt_handle();
+            let armed = Arc::new((Mutex::new(true), Condvar::new()));
+            let watchdog = match query_timeout {
+                Some(timeout) => {
+                    let armed = armed.clone();
+                    Some(std::thread::spawn(move || {
+                        let (lock, cvar) = &*armed;
+                        let mut guard = lock.lock().unwrap();
+                        let mut should_interrupt = false;
+                        if *guard {
+                            // Armed at wait start: wait for the budget or until the
+                            // main thread disarms (notifies) after finishing. A
+                            // spurious wakeup re-waits for the remaining budget, so
+                            // interrupt() only fires when the budget genuinely
+                            // elapsed while still armed.
+                            let wait_start = std::time::Instant::now();
+                            let mut remaining = timeout;
+                            loop {
+                                let (guard2, wait_result) = cvar
+                                    .wait_timeout(guard, remaining)
+                                    .expect("sqlite tx watchdog condvar wait poisoned");
+                                guard = guard2;
+                                if !*guard {
+                                    // Disarmed: the main thread finished first.
+                                    break;
+                                }
+                                if wait_result.timed_out() || wait_start.elapsed() >= timeout {
+                                    // Budget elapsed while still armed: interrupt.
+                                    should_interrupt = true;
+                                    break;
+                                }
+                                remaining = timeout.saturating_sub(wait_start.elapsed());
+                            }
+                        }
+                        if should_interrupt {
+                            interrupt.interrupt();
+                        }
+                    }))
+                }
+                None => None,
+            };
+
+            let mut timeout_error: Option<String> = None;
+            let mut statement_error: Option<String> = None;
             let mut total_affected: u64 = 0;
-            for (i, sql) in statements.iter().enumerate() {
-                match conn.execute_batch(sql) {
-                    Ok(_) => total_affected += conn.changes(),
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Err(query_error_with_omitted_sql_context(
-                            &format!("Statement {} failed: {}", i + 1, e),
-                            sql,
-                        ));
+            let result = (|| {
+                for (i, sql) in statements.iter().enumerate() {
+                    // Defense in depth: the boundary check still runs (it also
+                    // guarantees we never COMMIT past the budget even if the
+                    // watchdog was not armed because the timeout is None).
+                    if let Some(timeout) = query_timeout {
+                        if start.elapsed() >= timeout {
+                            timeout_error = Some(format!("Query timed out after {} seconds", timeout.as_secs()));
+                            return Err(());
+                        }
+                    }
+                    match conn.execute_batch(sql) {
+                        Ok(_) => total_affected += conn.changes(),
+                        Err(e) => {
+                            // The watchdog interrupt aborts the statement with
+                            // SQLITE_INTERRUPT; surface it as a query timeout
+                            // (matching `mysql_query_iter_with_timeout` wording so
+                            // `is_dbx_query_timeout_error` recognizes it). The
+                            // interrupt is detected by the SQLITE_INTERRUPT error
+                            // code, never by matching "interrupt" in the message
+                            // text (user/trigger/constraint text could otherwise
+                            // be misclassified as a timeout).
+                            //
+                            // The SQLITE_INTERRUPT error-code match is only
+                            // consulted when a query budget is set: the watchdog
+                            // (this function's only in-process source of
+                            // SQLITE_INTERRUPT intended to be a timeout) is only
+                            // armed when query_timeout is Some. An EXTERNAL
+                            // interrupt (e.g. the query_cancel mechanism) with no
+                            // budget must surface as a normal statement error, not
+                            // a timeout — misclassifying it panics on
+                            // `query_timeout.unwrap()` below (None) and skips the
+                            // ROLLBACK/disarm below, leaking the open transaction.
+                            let timed_out = query_timeout.is_some_and(|timeout| {
+                                start.elapsed() >= timeout
+                                    || matches!(
+                                        e.sqlite_error_code(),
+                                        Some(rusqlite::ffi::ErrorCode::OperationInterrupted)
+                                    )
+                            });
+                            if timed_out {
+                                timeout_error = Some(format!(
+                                    "Query timed out after {} seconds",
+                                    query_timeout.unwrap_or_default().as_secs()
+                                ));
+                                return Err(());
+                            }
+                            statement_error = Some(query_error_with_omitted_sql_context(
+                                &format!("Statement {} failed: {}", i + 1, e),
+                                sql,
+                            ));
+                            return Err(());
+                        }
                     }
                 }
+                Ok(())
+            })();
+
+            // Disarm and join the watchdog before issuing COMMIT (or ROLLBACK) so
+            // no interrupt can be delivered after the transaction ends.
+            {
+                let (lock, cvar) = &*armed;
+                *lock.lock().unwrap() = false;
+                cvar.notify_all();
             }
-            conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e))?;
-            Ok(db::QueryResult {
-                columns: vec![],
-                column_types: Vec::new(),
-                column_sortables: vec![],
-                spatial_columns: vec![],
-                spatial_values: vec![],
-                rows: vec![],
-                affected_rows: total_affected,
-                execution_time_ms: start.elapsed().as_millis(),
-                truncated: false,
-                session_id: None,
-                has_more: false,
-                elasticsearch_raw_body: None,
-                messages: Vec::new(),
-            })
+            if let Some(watchdog) = watchdog {
+                watchdog.join().expect("sqlite tx watchdog thread joined");
+            }
+
+            match result {
+                Ok(()) => {
+                    // The boundary check above runs at the top of each loop
+                    // iteration only. After the last statement the loop returns
+                    // Ok and COMMIT would run without any elapsed re-check, so a
+                    // statement that started under budget and finished after the
+                    // budget elapsed could still COMMIT. Guard once more here,
+                    // before COMMIT, so we never COMMIT past the budget.
+                    if let Some(timeout) = query_timeout {
+                        if start.elapsed() >= timeout {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            return Err(format!("Query timed out after {} seconds", timeout.as_secs()));
+                        }
+                    }
+                    conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e)).map(|_| db::QueryResult {
+                        columns: vec![],
+                        column_types: Vec::new(),
+                        column_sortables: vec![],
+                        spatial_columns: vec![],
+                        spatial_values: vec![],
+                        rows: vec![],
+                        affected_rows: total_affected,
+                        execution_time_ms: start.elapsed().as_millis(),
+                        truncated: false,
+                        session_id: None,
+                        has_more: false,
+                        elasticsearch_raw_body: None,
+                        messages: Vec::new(),
+                    })
+                }
+                Err(()) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(timeout_error
+                        .or(statement_error)
+                        .unwrap_or_else(|| "Statement execution failed inside the transaction".to_string()))
+                }
+            }
         })
     })
     .await
@@ -4222,65 +4908,23 @@ async fn exec_tx_agent_inner(
     statements: &[String],
     schema: Option<&str>,
     start: std::time::Instant,
+    budget: &DbOperationBudget,
 ) -> Result<db::QueryResult, AgentCallError> {
     let execution_schema = schema_for_execution_context(db_type, schema);
     let rewritten_statements;
     let statements = if qualifies_unqualified_agent_relations(db_type) {
-        rewritten_statements =
-            statements.iter().map(|sql| sql_for_execution_context(db_type, sql, schema)).collect::<Vec<_>>();
+        rewritten_statements = statements
+            .iter()
+            .map(|sql| sql_for_execution_context_with_identifier_quote(db_type, sql, schema, client.identifier_quote()))
+            .collect::<Vec<_>>();
         rewritten_statements.as_slice()
     } else {
         statements
     };
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_transaction_typed(database, statements, execution_schema).await?;
+    let result: db::QueryResult =
+        client.execute_transaction_typed(database, statements, execution_schema, budget.query_timeout).await?;
     Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result })
-}
-
-async fn exec_tx_none_inner(
-    state: &AppState,
-    pool_key: &str,
-    mysql_dialect: db::mysql::MySqlQueryDialect,
-    database: Option<&str>,
-    statements: &[String],
-    schema: Option<&str>,
-    start: std::time::Instant,
-) -> Result<db::QueryResult, String> {
-    let mut total_affected: u64 = 0;
-    for (i, sql) in statements.iter().enumerate() {
-        log::info!("[query][tx-none:statement:start] index={}", i + 1);
-        match do_execute(state, pool_key, mysql_dialect, database, sql, schema, None, QueryExecutionOptions::default())
-            .await
-        {
-            Ok(result) => {
-                total_affected += result.affected_rows;
-                log::info!("[query][tx-none:statement:done] index={} affected_rows={}", i + 1, result.affected_rows);
-            }
-            Err(e) => {
-                log::warn!("Statement {} failed (no transaction support): {}", i + 1, e);
-                return Err(query_error_with_omitted_sql_context(
-                    &format!("Statement {} failed: {}. No transaction support for this database type.", i + 1, e),
-                    sql,
-                ));
-            }
-        }
-    }
-
-    Ok(db::QueryResult {
-        columns: vec![],
-        column_types: Vec::new(),
-        column_sortables: vec![],
-        spatial_columns: vec![],
-        spatial_values: vec![],
-        rows: vec![],
-        affected_rows: total_affected,
-        execution_time_ms: start.elapsed().as_millis(),
-        truncated: false,
-        session_id: None,
-        has_more: false,
-        elasticsearch_raw_body: None,
-        messages: Vec::new(),
-    })
 }
 
 /// Start a manual transaction session, holding a connection from the pool.
@@ -4329,7 +4973,19 @@ fn mysql_transaction_isolation_sql(consistent_snapshot: bool) -> Option<&'static
 }
 
 fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
-    matches!(error, mysql_async::Error::Server(server_error) if server_error.code == 1064)
+    match error {
+        mysql_async::Error::Server(server_error) if server_error.code == 1064 => true,
+        // Doris (and some other MySQL-compatible servers) report unsupported
+        // transaction clauses as ER_UNKNOWN_ERROR (1105) with a parser
+        // diagnostic instead of MySQL's ER_PARSE_ERROR (1064).  Only treat
+        // diagnostics that clearly identify a syntax/parser failure as
+        // retryable; generic 1105 errors may indicate a real server failure.
+        mysql_async::Error::Server(server_error) if server_error.code == 1105 => {
+            let message = server_error.message.to_ascii_lowercase();
+            message.contains("syntax error") && (message.contains("encountered:") || message.contains("expected"))
+        }
+        _ => false,
+    }
 }
 
 async fn begin_transaction_session(
@@ -4355,8 +5011,8 @@ async fn begin_transaction_session(
         ExternalDriver,
     }
     let pool_handle = {
-        let connections = state.connections.read().await;
-        match connections.get(&probe_pool_key).ok_or("Connection not found")? {
+        let pool = state.pool_handle(&probe_pool_key).await.ok_or("Connection not found")?;
+        match &pool {
             PoolKind::Postgres(pg) => TxnPoolHandle::Postgres(pg.clone()),
             PoolKind::Mysql(mp, _) => TxnPoolHandle::Mysql(mp.clone()),
             PoolKind::Agent(_) if !consistent_snapshot => TxnPoolHandle::Agent,
@@ -4404,15 +5060,16 @@ async fn begin_transaction_session(
             if !syntax_errors.is_empty() {
                 return Err(format!("START TRANSACTION failed for all compatible forms: {}", syntax_errors.join("; ")));
             }
-            (TxnConnection::Mysql(conn), probe_pool_key.clone())
+            (TxnConnection::Mysql(Some(conn)), probe_pool_key.clone())
         }
         TxnPoolHandle::Agent => {
+            let db_type = connection_database_type(state, connection_id).await;
             let client_session_id = format!("manual-txn-{}", uuid::Uuid::new_v4());
             let agent_pool_key =
                 state.get_or_create_pool_for_session(connection_id, pool_database, Some(&client_session_id)).await?;
             let client = {
-                let connections = state.connections.read().await;
-                match connections.get(&agent_pool_key) {
+                let pool_handle = state.pool_handle(&agent_pool_key).await;
+                match pool_handle.as_ref() {
                     Some(PoolKind::Agent(client)) => client.clone(),
                     _ => {
                         let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -4422,7 +5079,9 @@ async fn begin_transaction_session(
             };
             let begin_result = {
                 let mut locked = client.lock().await;
-                locked.begin_manual_transaction::<serde_json::Value>(schema).await
+                locked
+                    .begin_manual_transaction::<serde_json::Value>(schema_for_execution_context(db_type, schema))
+                    .await
             };
             if let Err(error) = begin_result {
                 let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -4449,8 +5108,8 @@ async fn begin_transaction_session(
             let external_pool_key =
                 state.get_or_create_pool_for_session(connection_id, pool_database, Some(&client_session_id)).await?;
             let (config, session) = {
-                let connections = state.connections.read().await;
-                match connections.get(&external_pool_key) {
+                let pool_handle = state.pool_handle(&external_pool_key).await;
+                match pool_handle.as_ref() {
                     Some(PoolKind::ExternalDriver { config, session, .. }) => (config.clone(), session.clone()),
                     _ => {
                         let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -4599,6 +5258,12 @@ pub struct ManualTransactionExecutionOptions {
     pub table_data_preview: bool,
     pub page_size: Option<usize>,
     pub result_session_id: Option<String>,
+    /// User-facing SQL to classify (Oracle-only). When present, the core
+    /// classifies each split statement of this SQL rather than the rewritten
+    /// execution SQL, pairing them by count and position so DBX-owned
+    /// read-preserving rewrites (hidden primary keys, sort wrappers,
+    /// pagination) do not change toolbar semantics. Fail-closed on mismatch.
+    pub classification_sql: Option<String>,
 }
 
 pub async fn execute_in_manual_transaction_with_options(
@@ -4626,10 +5291,18 @@ pub async fn execute_in_manual_transaction_with_options(
         |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
     );
     if statements.is_empty() {
-        return Ok(vec![ExecuteMultiResult::success_with_optional_server_large_values(
+        // Oracle-only UX marker: the no-op is Core's decision that the script
+        // (empty/whitespace/comments-only) has no statements, so the frontend
+        // must not treat it as an unproven statement. Every other database
+        // receives the plain empty result.
+        let mut result = ExecuteMultiResult::success_with_optional_server_large_values(
             empty_query_result(0),
             options.table_data_preview,
-        )]);
+        );
+        if db_type == Some(DatabaseType::Oracle) {
+            result = result.with_manual_transaction_no_statement();
+        }
+        return Ok(vec![result]);
     }
     // A result-session cursor can only track one result set, so pagination is
     // single-statement only. Multi-statement scripts predate pagination: keep
@@ -4682,13 +5355,44 @@ pub async fn execute_in_manual_transaction_with_options(
     let row_limit = options.max_rows.unwrap_or(MAX_ROWS).max(1);
     let mut results = Vec::with_capacity(statements.len());
 
+    // Oracle-only classification pairing. The core splits both the execution
+    // SQL and, when present, the user-facing classification SQL with the same
+    // Oracle-aware splitter. A marker is emitted only when both lists have the
+    // same non-zero count and every paired user statement is proven read-only;
+    // any mismatch is fail-closed (no marker). This is deliberately a
+    // trust-boundary count/position pairing, not a SQL-equivalence parser.
+    let classification: Vec<bool> = if db_type == Some(DatabaseType::Oracle) {
+        match options.classification_sql.as_deref() {
+            Some(classification_sql) => {
+                let user_statements =
+                    crate::sql::split_sql_statements_for_database(classification_sql, DatabaseType::Oracle);
+                let paired = user_statements.len() == statements.len() && !user_statements.is_empty();
+                if paired {
+                    user_statements.iter().map(|statement| is_oracle_proven_read_only_statement(statement)).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     let mut conn = connection.lock().await;
     for (i, statement) in statements.iter().enumerate() {
         let result = match &mut *conn {
             TxnConnection::Postgres(conn) => {
                 execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
             }
-            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
+            TxnConnection::Mysql(conn) => {
+                execute_manual_txn_mysql_statement(
+                    conn.as_mut().ok_or_else(|| MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string())?,
+                    statement,
+                    row_limit,
+                )
+                .await
+            }
             TxnConnection::Agent { client, .. } => {
                 execute_manual_txn_agent_statement(
                     client,
@@ -4710,10 +5414,14 @@ pub async fn execute_in_manual_transaction_with_options(
         };
         match result {
             Ok(query_result) => {
-                results.push(ExecuteMultiResult::success_with_optional_server_large_values(
+                let mut executed = ExecuteMultiResult::success_with_optional_server_large_values(
                     query_result,
                     options.table_data_preview,
-                ));
+                );
+                if classification.get(i).copied().unwrap_or(false) {
+                    executed = executed.with_manual_transaction_proven_read_only();
+                }
+                results.push(executed);
             }
             Err(e) => {
                 // Statement failure ends the transaction. If another cleanup path
@@ -4847,45 +5555,56 @@ where
                 Err(error) => Err(error),
             }
         }
-        TxnConnection::Mysql(conn) => match conn.query_iter(sql).await {
-            Ok(mut result) => match result.stream::<mysql_async::Row>().await {
-                Ok(Some(mut stream)) => {
-                    let mut batch = Vec::with_capacity(batch_size);
-                    let mut total_rows = 0_u64;
-                    let mut error = None;
-                    while let Some(row_result) = stream.next().await {
-                        match row_result {
-                            Ok(row) => {
-                                batch.push(
-                                    (0..row.len()).map(|index| db::mysql::mysql_value_to_json(&row, index)).collect(),
-                                );
-                                total_rows += 1;
-                                if batch.len() >= batch_size {
-                                    if let Err(err) = on_batch(std::mem::take(&mut batch)) {
-                                        error = Some(err);
-                                        break;
-                                    }
-                                    batch = Vec::with_capacity(batch_size);
-                                }
-                            }
-                            Err(err) => {
-                                error = Some(format!("Query failed: {err}"));
-                                break;
+        TxnConnection::Mysql(Some(conn)) => {
+            // The query timeout is an inactivity budget reset by every received row,
+            // not a cap on the total duration of a long backup/export stream.
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            let progress_clock_for_rows = progress_clock.clone();
+            let timeout_error = format!(
+                "Query timed out after {} seconds",
+                operation_budget.query_timeout.map_or(0, |timeout| timeout.as_secs())
+            );
+            let stream_future = async {
+                let mut result = conn.query_iter(sql).await.map_err(|error| format!("Query failed: {error}"))?;
+                let Some(mut stream) =
+                    result.stream::<mysql_async::Row>().await.map_err(|error| format!("Query failed: {error}"))?
+                else {
+                    return Err("Empty result set stream".to_string());
+                };
+
+                let mut batch = Vec::with_capacity(batch_size);
+                let mut total_rows = 0_u64;
+                while let Some(row_result) = stream.next().await {
+                    match row_result {
+                        Ok(row) => {
+                            batch.push(
+                                (0..row.len()).map(|index| db::mysql::mysql_value_to_json(&row, index)).collect(),
+                            );
+                            total_rows += 1;
+                            if batch.len() >= batch_size {
+                                on_batch(std::mem::take(&mut batch))?;
+                                batch = Vec::with_capacity(batch_size);
                             }
                         }
+                        Err(err) => return Err(format!("Query failed: {err}")),
                     }
-                    if error.is_none() && !batch.is_empty() {
-                        if let Err(err) = on_batch(batch) {
-                            error = Some(err);
-                        }
-                    }
-                    error.map_or(Ok(total_rows), Err)
+                    progress_clock_for_rows.mark();
                 }
-                Ok(None) => Err("Empty result set stream".to_string()),
-                Err(err) => Err(format!("Query failed: {err}")),
-            },
-            Err(err) => Err(format!("Query failed: {err}")),
-        },
+                if !batch.is_empty() {
+                    on_batch(batch)?;
+                }
+                Ok(total_rows)
+            };
+            await_stream_with_progress_timeout(
+                stream_future,
+                operation_budget.query_timeout,
+                progress_clock,
+                cancel_token.as_ref(),
+                timeout_error,
+            )
+            .await
+        }
+        TxnConnection::Mysql(None) => Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
         TxnConnection::Agent { .. } => {
             Err("Streaming rows inside an agent manual transaction is not supported".to_string())
         }
@@ -4900,9 +5619,12 @@ where
             sessions.remove(txn_session_id)
         };
         if let Some(session) = removed {
-            let rollback_result =
+            let rollback_result = if err == QUERY_CANCELED {
+                discard_mysql_manual_txn_connection(&mut conn, operation_budget.cleanup_timeout).await
+            } else {
                 rollback_manual_txn_connection_with_postgres_timeout(&mut conn, Some(operation_budget.cleanup_timeout))
-                    .await;
+                    .await
+            };
             release_manual_txn_session_pool(state, &session.connection_id, &mut conn).await;
             if let Err(rollback_error) = rollback_result {
                 return Err(format!("{err}. Transaction cleanup failed: {rollback_error}"));
@@ -4946,9 +5668,10 @@ async fn rollback_manual_txn_connection_with_postgres_timeout(
                 conn.execute_typed("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
             }
         }
-        TxnConnection::Mysql(conn) => {
+        TxnConnection::Mysql(Some(conn)) => {
             conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
         }
+        TxnConnection::Mysql(None) => return Ok(()),
         TxnConnection::Agent { client, .. } => {
             let mut locked = client.lock().await;
             match locked.rollback_manual_transaction::<serde_json::Value>().await {
@@ -4976,6 +5699,24 @@ async fn rollback_manual_txn_connection_with_postgres_timeout(
         }
     }
     Ok(())
+}
+
+/// A cancelled MySQL row stream may still have unread result packets.  Do not
+/// send ROLLBACK on that connection: mysql_async only consumes a dropped stream
+/// when the next result set is requested.  Discarding the dedicated connection
+/// makes MySQL roll the transaction back and prevents protocol desynchronization.
+async fn discard_mysql_manual_txn_connection(conn: &mut TxnConnection, timeout: Duration) -> Result<(), String> {
+    let TxnConnection::Mysql(conn) = conn else {
+        return rollback_manual_txn_connection_with_postgres_timeout(conn, Some(timeout)).await;
+    };
+    let Some(conn) = conn.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(timeout, conn.disconnect()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("Failed to discard cancelled MySQL connection: {error}")),
+        Err(_) => Err(format!("Discarding cancelled MySQL connection timed out after {} seconds", timeout.as_secs())),
+    }
 }
 
 async fn release_manual_txn_session_pool(state: &AppState, connection_id: &str, conn: &mut TxnConnection) {
@@ -5044,7 +5785,7 @@ async fn execute_manual_txn_agent_statement(
     page_size: Option<usize>,
     result_session_id: Option<&str>,
 ) -> Result<db::QueryResult, String> {
-    let sql = sql_for_execution_context(db_type, statement, schema);
+    let sql = sql_for_execution_context_with_identifier_quote(db_type, statement, schema, client.identifier_quote());
     let execution_schema = schema_for_execution_context(db_type, schema);
     let options = manual_txn_agent_query_options(row_limit, table_data_preview, page_size, result_session_id);
     let request = manual_txn_agent_query_request(
@@ -5240,9 +5981,10 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         TxnConnection::Postgres(conn) => {
             conn.execute_typed("COMMIT", &[]).await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
-        TxnConnection::Mysql(conn) => {
+        TxnConnection::Mysql(Some(conn)) => {
             conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
+        TxnConnection::Mysql(None) => return Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
         TxnConnection::Agent { client, .. } => {
             let mut locked = client.lock().await;
             locked
@@ -5314,12 +6056,483 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_cancel::RunningTaskMetadata;
 
     #[test]
     fn redshift_queries_prefer_text_protocol() {
         assert!(postgres_prefers_text_protocol(Some(DatabaseType::Redshift)));
         assert!(!postgres_prefers_text_protocol(Some(DatabaseType::Postgres)));
         assert!(!postgres_prefers_text_protocol(None));
+    }
+
+    #[test]
+    fn apply_query_timeout_override_respects_resolve_semantics() {
+        // None leaves the budget unchanged.
+        let mut budget = DbOperationBudget::with_defaults();
+        let original = budget.query_timeout;
+        apply_query_timeout_override(&mut budget, None);
+        assert_eq!(budget.query_timeout, original);
+
+        // Some(5) sets query_timeout to 5s.
+        let mut budget = DbOperationBudget::with_defaults();
+        apply_query_timeout_override(&mut budget, Some(5));
+        assert_eq!(budget.query_timeout, Some(Duration::from_secs(5)));
+
+        // Some(0) clears the limit (unlimited), matching resolve_query_timeout.
+        let mut budget = DbOperationBudget::with_defaults();
+        apply_query_timeout_override(&mut budget, Some(0));
+        assert_eq!(budget.query_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn stream_progress_timeout_survives_steady_progress_past_the_budget() {
+        // The timeout is an inactivity window, not a wall clock: a stream that keeps
+        // marking progress survives well past the budget, as long as each gap between
+        // marks is shorter than the timeout.
+        let clock = Arc::new(StreamProgressClock::new());
+        let clock_for_rows = clock.clone();
+        let result = await_stream_with_progress_timeout(
+            async move {
+                for _ in 0..20 {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    clock_for_rows.mark();
+                }
+                Ok::<_, String>(42)
+            },
+            Some(Duration::from_millis(200)),
+            clock,
+            None,
+            "timed out".to_string(),
+        )
+        .await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn stream_progress_timeout_fires_when_no_progress_arrives() {
+        // A genuine stall — no progress for the whole budget — must still time out.
+        let clock = Arc::new(StreamProgressClock::new());
+        let result = await_stream_with_progress_timeout(
+            async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok::<_, String>(42)
+            },
+            Some(Duration::from_millis(200)),
+            clock,
+            None,
+            "timed out".to_string(),
+        )
+        .await;
+        assert_eq!(result, Err("timed out".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sqlite_transaction_timeout_rolls_back_and_commits_nothing() {
+        use std::sync::mpsc;
+
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        // Deterministic timeout: hold the connection lock from a helper thread so the
+        // transaction's first statement-boundary check is guaranteed to observe
+        // elapsed time >= the 1ms query budget, regardless of machine speed.
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_millis(1));
+        let (lock_held_tx, lock_held_rx) = mpsc::channel();
+        let holder = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                pool.with_connection(|_conn| {
+                    let _ = lock_held_tx.send(());
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                })
+                .expect("helper holds sqlite connection lock");
+            })
+        };
+        lock_held_rx.recv().expect("helper acquired sqlite connection lock");
+
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('one')".to_string(), "INSERT INTO t (val) VALUES ('two')".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction must time out");
+
+        assert!(error.contains("Query timed out after"), "unexpected error: {error}");
+
+        // The transaction was rolled back (or never got past the first statement):
+        // no partial rows may survive.
+        holder.join().expect("helper thread joined");
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_slow_statement_is_interrupted_and_rolled_back() {
+        // A statement that genuinely BLOCKS past the query budget must be aborted
+        // mid-flight by the watchdog (SQLITE_INTERRUPT) rather than running to
+        // completion and then committing. This is the gap the lock-holder test
+        // above does not cover: that one only makes the first statement-boundary
+        // check observe an already-elapsed budget.
+        //
+        // Lock-holder approach verified empirically and REJECTED: holding a write
+        // lock from a second connection and letting the main handle busy-wait is
+        // NOT interrupted by sqlite3_interrupt on the bundled SQLite 3.45.3
+        // (rusqlite 0.32). `pager_wait_on_lock` loops on the busy handler without
+        // re-checking `db->u1.isInterrupted`, so the wait runs out the full busy
+        // timeout (a 60s wait with a 50ms budget confirmed it) instead of failing
+        // fast. So the deterministic proof uses a slow-but-bounded statement whose
+        // VDBE loop re-checks the interrupt flag every iteration (WITH RECURSIVE
+        // row generator) — the watchdog interrupts it mid-flight.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("slow.db");
+        let db_path = db_path.to_str().expect("utf8 temp path");
+
+        let pool = db::sqlite::connect_path_create_if_missing(db_path).await.expect("connect sqlite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_millis(50));
+
+        // Generating 50M rows takes seconds, so this single statement is provably
+        // still running when the 50ms watchdog fires. A busy-wait would not prove
+        // the point (see above); this statement is interrupted mid-flight. It is
+        // the LAST statement of a 2-statement batch so it also exercises the
+        // loop-exit-then-final-guard path: a fast first statement, then a slow
+        // second one that is still running when the budget elapses.
+        let slow_sql = "INSERT INTO t (val) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS \
+                        (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 50000000) SELECT x FROM cnt)";
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('fast')".to_string(), slow_sql.to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction with a slow statement must time out");
+
+        assert!(error.contains("Query timed out after"), "unexpected error: {error}");
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_legitimate_interrupt_text_error_is_not_reported_as_timeout() {
+        // A genuine statement error whose MESSAGE contains "interrupt" (here a
+        // missing column named `interrupted_at`) must NOT be misclassified as a
+        // watchdog timeout. The interrupt is detected by the SQLITE_INTERRUPT
+        // error code only, never by matching the message text. A large 60s budget
+        // guarantees elapsed can never trigger the timeout path, so only the
+        // error-code match could classify it.
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_secs(60));
+
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (interrupted_at) VALUES (1)".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction must fail with the statement error");
+
+        assert!(
+            !error.contains("Query timed out after"),
+            "legitimate 'interrupt'-text error must not be masked as a timeout: {error}"
+        );
+        assert!(error.contains("Statement 1 failed") && error.contains("interrupted_at"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_external_interrupt_without_budget_does_not_panic() {
+        // Regression: with query_timeout = None (MCP policy can set it to 0 =
+        // unlimited; resolve_query_timeout(Some(0)) -> None), an SQLITE_INTERRUPT
+        // arriving from an EXTERNAL source (e.g. the query_cancel mechanism, not
+        // this function's watchdog, which is only armed when query_timeout is
+        // Some) used to be misclassified as a timeout, then `query_timeout.unwrap()`
+        // panicked on None. The panic fired before the watchdog disarm/join and
+        // before ROLLBACK, leaking the watchdog thread and leaving the BEGIN
+        // transaction open on the pooled connection.
+        //
+        // Determinism: the bundled SQLite 3.45.3 clears the interrupt flag at
+        // VDBE step start whenever `nVdbeActive == 0` (sqlite3Step), so a
+        // pre-set interrupt fires only if it lands mid-statement. This was
+        // verified empirically below. So the interrupt is issued from a timer
+        // thread DURING a slow-but-bounded statement whose VDBE loop re-checks
+        // the interrupt flag every iteration (WITH RECURSIVE row generator —
+        // same technique the watchdog test uses; a lock busy-wait would not be
+        // aborted because pager_wait_on_lock does not recheck isInterrupted).
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let interrupt =
+            pool.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get sqlite interrupt handle");
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = None; // external interrupt: no in-process watchdog is armed
+
+        // Arm the timer BEFORE the statement starts and send the go signal first,
+        // so the interrupt can land mid-statement. A single pre-set interrupt
+        // would be cleared (nVdbeActive==0 at step start), so the timer fires in
+        // a short retry loop: as soon as the slow statement is running, the flag
+        // sticks and the VDBE aborts on its next interrupt check. The `done` flag
+        // stops the loop as soon as exec returns so no stray interrupt can hit a
+        // later query, and we join the timer before any further query anyway.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (timer_tx, timer_rx) = std::sync::mpsc::channel();
+        let timer = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                timer_rx.recv().expect("go signal");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !done.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                    interrupt.interrupt(); // external interrupt mid-statement
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        timer_tx.send(()).expect("send go signal");
+
+        // Single slow statement that takes seconds to run, so an interrupt that
+        // lands within milliseconds of its start always hits mid-execution.
+        let slow_sql = "INSERT INTO t (val) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS \
+                        (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10000000) SELECT x FROM cnt)";
+        let error = exec_tx_sqlite_inner(pool.clone(), &[slow_sql.to_string()], std::time::Instant::now(), &budget)
+            .await
+            .expect_err("sqlite transaction must fail with the external interrupt");
+
+        done.store(true, Ordering::Relaxed);
+        timer.join().expect("timer thread joined");
+
+        // Must NOT panic, must NOT be masked as a timeout (no budget), and must
+        // surface as a plain statement error like any other failure.
+        assert!(
+            !error.contains("Query timed out after"),
+            "external interrupt with no budget must not be reported as a timeout: {error}"
+        );
+        assert!(
+            error.contains("Statement 1 failed") && error.contains("interrupted"),
+            "expected a plain interrupted-statement error, got: {error}"
+        );
+
+        // The external interrupt must still roll back the transaction (0 rows),
+        // just like any other statement failure.
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_cancelled_query_can_execute_again_on_same_client_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = Storage::open(&dir.path().join("storage.db")).await.expect("open test storage");
+        let state = Arc::new(AppState::new(storage));
+        let connection_id = "sqlite-cancel-session";
+        let client_session_id = "query-tab-8414";
+        let execution_id = "sqlite-cancel-execution";
+        let db_path = dir.path().join("query.db");
+        std::fs::File::create(&db_path).expect("create SQLite database file");
+        let mut config = test_connection_config(DatabaseType::Sqlite);
+        config.id = connection_id.to_string();
+        config.host = db_path.to_string_lossy().into_owned();
+        config.query_timeout_secs = 0;
+        state.configs.write().await.insert(connection_id.to_string(), config);
+
+        let pool_key = state
+            .get_or_create_pool_for_session(connection_id, Some(""), Some(client_session_id))
+            .await
+            .expect("create SQLite query-tab session pool");
+        let sqlite = match state.pool_handle(&pool_key).await.expect("SQLite pool") {
+            PoolKind::Sqlite(pool) => pool,
+            _ => panic!("expected SQLite pool"),
+        };
+        db::sqlite::execute_query(&sqlite, "CREATE TABLE t (value TEXT)").await.expect("create test table");
+
+        let cleanup_interrupt =
+            sqlite.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get SQLite interrupt handle");
+        let started = Arc::new(AtomicBool::new(false));
+        let started_by_sqlite = started.clone();
+        sqlite
+            .with_connection(|conn| {
+                conn.create_scalar_function(
+                    "dbx_test_query_started",
+                    0,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    move |_ctx| {
+                        started_by_sqlite.store(true, Ordering::SeqCst);
+                        Ok(1_i64)
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+            .expect("register query-start marker");
+
+        let registered = state.running_queries.register_task(
+            execution_id.to_string(),
+            RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
+        );
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            execute_sql_statement_with_options_typed(
+                first_state.as_ref(),
+                connection_id,
+                "",
+                "INSERT INTO t (value) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS (SELECT dbx_test_query_started() UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000000) SELECT x FROM cnt)",
+                None,
+                Some(registered.token()),
+                QueryExecutionOptions {
+                    client_session_id: Some(client_session_id.to_string()),
+                    execution_id: Some(execution_id.to_string()),
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        let started_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !started.load(Ordering::SeqCst) {
+            assert!(!first.is_finished(), "slow SQLite query exited before it started");
+            assert!(std::time::Instant::now() < started_deadline, "slow SQLite query did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(state.running_queries.cancel(execution_id), "query cancellation was not registered");
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("cancelled SQLite query did not return")
+            .expect("join cancelled SQLite query")
+            .expect_err("cancelled SQLite query unexpectedly succeeded");
+        assert!(
+            matches!(first_result, QueryExecutionError::Canceled { .. }),
+            "unexpected cancellation error: {first_result}"
+        );
+
+        let next_execution_id = "sqlite-cancel-execution-next";
+        let next_registered = state.running_queries.register_task(
+            next_execution_id.to_string(),
+            RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
+        );
+        let next_state = state.clone();
+        let mut next = tokio::spawn(async move {
+            execute_sql_statement_with_options_typed(
+                next_state.as_ref(),
+                connection_id,
+                "",
+                "SELECT 1",
+                None,
+                Some(next_registered.token()),
+                QueryExecutionOptions {
+                    client_session_id: Some(client_session_id.to_string()),
+                    execution_id: Some(next_execution_id.to_string()),
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        let next_wait = tokio::time::timeout(Duration::from_secs(2), &mut next).await;
+        let next_timed_out = next_wait.is_err();
+        if next_timed_out {
+            // Keep the regression test bounded even on the unfixed implementation:
+            // the manually retained handle interrupts the still-running blocking
+            // SQLite statement so the test runtime can shut down cleanly.
+            cleanup_interrupt.interrupt();
+        }
+        let next_result = match next_wait {
+            Ok(result) => result.expect("join follow-up SQLite query"),
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), &mut next)
+                .await
+                .expect("follow-up SQLite query did not finish after cleanup interrupt")
+                .expect("join follow-up SQLite query after cleanup"),
+        };
+        assert!(!next_timed_out, "same query-tab SQLite session remained blocked after cancellation");
+        let next_result = next_result.expect("follow-up SELECT 1 failed");
+        assert_eq!(next_result.rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_pre_set_interrupt_is_cleared_before_next_statement() {
+        // Empirical probe for the pre-set-interrupt question: `sqlite3_interrupt`
+        // unconditionally sets the interrupt flag, but bundled SQLite 3.45.3
+        // clears it at VDBE step start whenever `nVdbeActive == 0` (sqlite3Step,
+        // "prevents a call to sqlite3_interrupt from interrupting a statement
+        // that has not yet started"). Verified here: a pre-set interrupt (with
+        // nothing running) is cleared before the NEXT statement begins, so that
+        // statement runs to completion. A regression test therefore cannot rely
+        // on a pre-set interrupt — it must interrupt DURING a running statement
+        // (see sqlite_external_interrupt_without_budget_does_not_panic).
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let interrupt =
+            pool.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get sqlite interrupt handle");
+
+        // Pre-set the interrupt, then run a fast statement on the SAME
+        // connection: the flag is cleared at step start, so the statement
+        // succeeds (it does NOT fail with SQLITE_INTERRUPT).
+        pool.with_connection(|conn| {
+            interrupt.interrupt(); // pre-set, nothing running yet
+            conn.execute_batch("INSERT INTO t (val) VALUES ('one')").map_err(|e| e.to_string())
+        })
+        .expect("pre-set interrupt must be cleared before the statement runs");
+
+        // Same for a transaction: pre-set the interrupt, then the transaction's
+        // first statement must still run and commit.
+        pool.with_connection(|_conn| {
+            interrupt.interrupt(); // pre-set, nothing running yet
+            Ok(())
+        })
+        .expect("pre-set interrupt on idle connection");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = None;
+        let result = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('two')".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect("transaction with a pre-set interrupt must still succeed (flag cleared at step start)");
+        assert_eq!(result.affected_rows, 1);
+
+        let count = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(count.rows[0][0], serde_json::json!(2));
+    }
+
+    #[test]
+    fn execute_multi_result_manual_transaction_markers_serialize_conditionally() {
+        let plain = ExecuteMultiResult::success_with_optional_server_large_values(empty_query_result(0), false);
+        let plain_value = serde_json::to_value(&plain).unwrap();
+        assert!(plain_value.get("manual_transaction_proven_read_only").is_none());
+        assert!(plain_value.get("manual_transaction_no_statement").is_none());
+
+        let proven = plain.clone().with_manual_transaction_proven_read_only();
+        let proven_value = serde_json::to_value(&proven).unwrap();
+        assert_eq!(proven_value.get("manual_transaction_proven_read_only"), Some(&serde_json::Value::Bool(true)));
+        assert!(proven_value.get("manual_transaction_no_statement").is_none());
+
+        let no_statement = plain.with_manual_transaction_no_statement();
+        let no_statement_value = serde_json::to_value(&no_statement).unwrap();
+        assert_eq!(no_statement_value.get("manual_transaction_no_statement"), Some(&serde_json::Value::Bool(true)));
+        assert!(no_statement_value.get("manual_transaction_proven_read_only").is_none());
     }
 
     #[test]
@@ -5635,6 +6848,7 @@ for line in sys.stdin:
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -5662,6 +6876,8 @@ for line in sys.stdin:
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             ldap_security_protocol: String::new(),
             ldap_principal: String::new(),
@@ -5707,7 +6923,11 @@ for line in sys.stdin:
         let client = db::dynamodb_driver::connect(&config, host, config.port).unwrap();
         db::dynamodb_driver::test_connection(&client, Duration::from_secs(5)).await.unwrap();
         state.configs.write().await.insert(config.id.clone(), config.clone());
-        state.connections.write().await.insert(config.id.clone(), PoolKind::DynamoDb(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(config.id.clone(), PoolKind::DynamoDb(client));
+            })
+            .await;
 
         let results = execute_multi_core_with_options_for_client_and_progress_typed(
             &state,
@@ -5727,6 +6947,119 @@ for line in sys.stdin:
         let serialized = serde_json::to_string(&results).unwrap();
         assert!(!serialized.is_empty());
 
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn sqlserver_agent_echo_state(
+    ) -> (AppState, std::path::PathBuf, std::sync::Arc<crate::db::agent_driver::AgentRuntimeClient>) {
+        let dir = std::env::temp_dir().join(format!("dbx-query-sqlserver-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("agent.py");
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+    elif req['method'] == 'execute_query':
+        result = {
+            'columns': ['sql'], 'column_types': ['nvarchar'], 'column_sortables': [],
+            'rows': [[req['params']['sql']]], 'affected_rows': 0, 'execution_time_ms': 1,
+            'truncated': False, 'session_id': None, 'has_more': False
+        }
+    elif req['method'] in ('execute_batch', 'execute_transaction'):
+        if req['params'].get('schema') is not None:
+            print(json.dumps({
+                'jsonrpc': '2.0', 'id': req['id'],
+                'error': {'code': -1, 'message': 'legacy SQL Server schema switch attempted'}
+            }), flush=True)
+            continue
+        result = {
+            'columns': [], 'column_types': [], 'column_sortables': [], 'rows': [],
+            'affected_rows': 1, 'execution_time_ms': 1, 'truncated': False,
+            'session_id': None, 'has_more': False
+        }
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = crate::db::agent_driver::AgentRuntimeClient::spawn(
+            crate::db::agent_driver::AgentLaunchSpec::new(python)
+                .with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        runtime.increment_session_count();
+
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::SqlServer));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "conn-1".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
+                        runtime.clone(),
+                        "session-1".to_string(),
+                    )),
+                );
+            })
+            .await;
+
+        (state, dir, runtime)
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_sends_table_variable_script_as_one_batch() {
+        let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+        let sql = "DECLARE @TargetTables TABLE (TableName NVARCHAR(128));\n\
+                   INSERT INTO @TargetTables VALUES ('Bill_Record');\n\
+                   SELECT TableName FROM @TargetTables;";
+
+        let results = execute_multi_core_with_options_for_client_and_progress_typed(
+            &state,
+            "conn-1",
+            "",
+            sql,
+            None,
+            None,
+            QueryExecutionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result.rows, vec![vec![serde_json::Value::String(sql.to_string())]]);
+
+        runtime.kill();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_write_paths_do_not_request_schema_switch() {
+        let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+        let statements = ["UPDATE [dbo].[users] SET [active] = 1 WHERE [id] = 7".to_string()];
+
+        let batch = execute_statements(&state, "conn-1", "", &statements, Some("dbo"), None).await.unwrap();
+        let transaction =
+            execute_statements_in_transaction_on_pool(&state, "conn-1", "conn-1", "", &statements, Some("dbo"), None)
+                .await
+                .unwrap();
+
+        assert_eq!(batch.affected_rows, 1);
+        assert_eq!(transaction.affected_rows, 1);
+
+        runtime.kill();
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5786,13 +7119,17 @@ for line in sys.stdin:
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::Dameng));
-        state.connections.write().await.insert(
-            "conn-1".to_string(),
-            PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
-                runtime.clone(),
-                "session-1".to_string(),
-            )),
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "conn-1".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
+                        runtime.clone(),
+                        "session-1".to_string(),
+                    )),
+                );
+            })
+            .await;
 
         (state, dir, runtime)
     }
@@ -5804,7 +7141,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -5842,7 +7179,11 @@ for line in sys.stdin:
         let state = AppState::new(storage);
         let connection_id = "sqlite-cancel";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
-        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
         state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
@@ -5926,7 +7267,7 @@ for line in sys.stdin:
         .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -5943,7 +7284,7 @@ for line in sys.stdin:
                 .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -5957,7 +7298,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(!runtime.is_failed());
 
         runtime.kill();
@@ -6018,7 +7359,11 @@ for line in sys.stdin:
         let state = AppState::new(storage);
         let connection_id = "sqlite-batch";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
-        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
         state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
 
         let sql = if failure_first {
@@ -6057,6 +7402,79 @@ for line in sys.stdin:
         assert_eq!(!table_check.rows.is_empty(), continue_on_error);
     }
 
+    #[tokio::test]
+    async fn transactional_sqlite_batch_rolls_back_when_a_later_statement_fails() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-transaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "sqlite-transaction";
+        let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
+
+        let error = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "CREATE TABLE rolled_back_table (id INTEGER); INSERT INTO missing_table VALUES (1);",
+            None,
+            None,
+            QueryExecutionOptions { use_transaction: Some(true), ..Default::default() },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("missing_table"), "unexpected transaction error: {error}");
+
+        let table_check = execute_sql_statement(
+            &state,
+            connection_id,
+            "",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rolled_back_table'",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(table_check.rows.is_empty(), "the failed batch must roll back its preceding DDL");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_rejects_an_unsupported_backend_before_execution() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-unsupported-transaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "message-queue-transaction";
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::MessageQueue);
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Redis));
+
+        let error = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "INSERT INTO first_statement VALUES (1); INSERT INTO second_statement VALUES (2);",
+            None,
+            None,
+            QueryExecutionOptions { use_transaction: Some(true), ..Default::default() },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("cannot provide a rollbackable transaction"), "unexpected transaction error: {error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn agent_execute_batch_unsupported_detects_case_insensitive_method_errors() {
         assert!(is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_batch"));
@@ -6068,6 +7486,98 @@ for line in sys.stdin:
     fn agent_execute_batch_unsupported_ignores_unrelated_errors() {
         assert!(!is_agent_execute_batch_unsupported("ORA-00955: name is already used by an existing object"));
         assert!(!is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_query"));
+    }
+
+    #[test]
+    fn batch_transaction_ddl_is_unrollbackable_covers_oracle_and_mysql_family() {
+        let ddl = vec!["CREATE TABLE test_table (id INT)".to_string()];
+        let dml = vec!["INSERT INTO test_table VALUES (1)".to_string()];
+
+        // MySQL-family and Oracle DDL implicitly commit; explicit transactions
+        // over such DDL cannot be rolled back, so use_transaction is rejected.
+        for db in [DatabaseType::Mysql, DatabaseType::Goldendb, DatabaseType::Oracle] {
+            assert!(batch_transaction_ddl_is_unrollbackable(Some(db), &ddl), "expected {db:?} to reject DDL");
+        }
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Mysql), &dml));
+        // Postgres and SQLite have transactional DDL and must both be allowed.
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Postgres), &ddl));
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Sqlite), &ddl));
+        // An unknown db type cannot be verified — do not risk rejecting valid DDL batches.
+        assert!(!batch_transaction_ddl_is_unrollbackable(None, &ddl));
+    }
+
+    #[tokio::test]
+    async fn connection_pool_is_sqlserver_agent_detects_agent_and_native_pools() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-sqlserver-agent-flag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+
+        // Non-SQL-Server connections never use the SQL Server agent splitter.
+        state.configs.write().await.insert("pg".to_string(), test_connection_config(DatabaseType::Postgres));
+        assert!(!connection_pool_is_sqlserver_agent(&state, "pg", "").await);
+
+        // SQL Server with no pool yet defaults to the native (non-agent) splitter.
+        state.configs.write().await.insert("mssql".to_string(), test_connection_config(DatabaseType::SqlServer));
+        assert!(!connection_pool_is_sqlserver_agent(&state, "mssql", "").await);
+
+        // A SQL Server connection backed by the agent driver is detected, so the
+        // MCP pre-check uses the same GO-batch splitter as the core.
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(
+                    "mssql".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
+                );
+            })
+            .await;
+        assert!(connection_pool_is_sqlserver_agent(&state, "mssql", "").await);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn transaction_kernel_dispatches_by_backend_capability_not_ddl_content() {
+        // Regression for the maintainer review: the unrollbackable-DDL cap now lives
+        // only in the opt-in use_transaction entry point. The shared transaction
+        // kernel dispatches on the backend's transaction capability, so the
+        // use_transaction error never leaks to callers that share the kernel but do
+        // not set it (schema-diff deploy, imports), which document a mixed outcome
+        // on failure for DDL that cannot be rolled back.
+        let dir = std::env::temp_dir().join(format!("dbx-query-tx-predispatch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "message-queue-tx-ddl";
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::MessageQueue);
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Redis));
+
+        let error = execute_statements_in_transaction_on_pool(
+            &state,
+            connection_id,
+            connection_id,
+            "",
+            &["CREATE TABLE t (id INT)".to_string()],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.contains("cannot provide a rollbackable transaction"),
+            "expected a backend-capability reject, got: {error}"
+        );
+        assert!(
+            !error.contains("whose DDL cannot be rolled back"),
+            "the opt-in use_transaction DDL cap leaked into the shared transaction kernel: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -6104,6 +7614,51 @@ for line in sys.stdin:
     #[tokio::test]
     async fn sqlite_batch_continues_when_a_middle_statement_fails_and_enabled() {
         assert_sqlite_batch_error_behavior(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn gaussdb_on_error_stop_overrides_continue_on_error() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-gaussdb-on-error-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "gaussdb-on-error-stop";
+        let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Gaussdb));
+
+        let results = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "\\set ON_ERROR_STOP on\nINSERT INTO missing_table VALUES (1); CREATE TABLE must_not_run (id INTEGER);",
+            None,
+            None,
+            QueryExecutionOptions { continue_on_error: true, ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].columns, vec!["Error"]);
+        let table_check = execute_sql_statement(
+            &state,
+            connection_id,
+            "",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'must_not_run'",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(table_check.rows.is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -6775,6 +8330,33 @@ for line in sys.stdin:
         assert_eq!(serialized.get("server_message"), Some(&serde_json::Value::Bool(true)));
     }
 
+    #[test]
+    fn sqlserver_agent_execution_plan_preserves_table_variable_batch() {
+        let sql = "DECLARE @TargetTables TABLE (TableName NVARCHAR(128));\n\
+                   INSERT INTO @TargetTables VALUES ('Bill_Record');\n\
+                   SELECT TableName FROM @TargetTables;";
+
+        let plan = query_execution_plan(sql, Some(DatabaseType::SqlServer), true);
+
+        assert_eq!(plan.statements, vec![sql]);
+    }
+
+    #[test]
+    fn sqlserver_agent_execution_plan_splits_only_on_go() {
+        let sql = "DECLARE @x TABLE (id INT);\nINSERT INTO @x VALUES (1);\nGO\nSELECT 2;";
+
+        let plan = query_execution_plan(sql, Some(DatabaseType::SqlServer), true);
+
+        assert_eq!(plan.statements, vec!["DECLARE @x TABLE (id INT);\nINSERT INTO @x VALUES (1);", "SELECT 2;"]);
+    }
+
+    #[test]
+    fn ordinary_agent_execution_plan_still_splits_semicolon_statements() {
+        let plan = query_execution_plan("SELECT 1; SELECT 2;", Some(DatabaseType::Dameng), false);
+
+        assert_eq!(plan.statements, vec!["SELECT 1", "SELECT 2"]);
+    }
+
     // Regression test for #6097: SQL Server queries share a single mutex-guarded
     // connection (see PoolKind::SqlServer), so a fast query can queue for seconds
     // behind another operation (e.g. autocomplete/schema metadata) holding that
@@ -6863,7 +8445,9 @@ for line in sys.stdin:
         );
         assert_eq!(
             backend_error.detail(),
-            Some("Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
+            Some(
+                "Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
+            )
         );
     }
 
@@ -7004,6 +8588,159 @@ for line in sys.stdin:
         ));
     }
 
+    #[test]
+    fn external_driver_preview_fallback_rewrites_generated_postgres_projections() {
+        let sql = concat!(
+            "SELECT \"id\", left(\"description\", 140) AS \"description\", ",
+            "left(\"metadata\"::text, 141) AS \"metadata\", ",
+            "'left(\"literal\", 1)' AS \"note\", ",
+            "'T:139' AS \"__DBX_LARGE_VALUE_BYTES_T_1\" FROM \"job_details\" WHERE left(note, 1) = 'x' LIMIT 100"
+        );
+        assert_eq!(
+            external_driver_preview_fallback_sql(sql).as_deref(),
+            Some(
+                "SELECT \"id\", \"description\" AS \"description\", \"metadata\"::text AS \"metadata\", 'left(\"literal\", 1)' AS \"note\", 'T:139' AS \"__DBX_LARGE_VALUE_BYTES_T_1\" FROM \"job_details\" WHERE left(note, 1) = 'x' LIMIT 100"
+            )
+        );
+    }
+
+    #[test]
+    fn external_driver_preview_fallback_handles_nested_commas_without_touching_literals() {
+        let sql = concat!(
+            "SELECT left(coalesce(\"description\", concat('a,b', \"fallback\")), 140) AS \"description\", ",
+            "'FROM left(\"literal\", 1)' AS \"note\", ",
+            "'T:140' AS \"__DBX_LARGE_VALUE_BYTES_T_0\" FROM \"job_details\""
+        );
+        assert_eq!(
+            external_driver_preview_fallback_sql(sql).as_deref(),
+            Some(
+                "SELECT coalesce(\"description\", concat('a,b', \"fallback\")) AS \"description\", 'FROM left(\"literal\", 1)' AS \"note\", 'T:140' AS \"__DBX_LARGE_VALUE_BYTES_T_0\" FROM \"job_details\""
+            )
+        );
+    }
+
+    #[test]
+    fn external_driver_preview_fallback_requires_generated_marker_and_select_shape() {
+        assert!(external_driver_preview_fallback_sql("SELECT left(value, 10) FROM t").is_none());
+        assert!(external_driver_preview_fallback_sql(
+            "WITH rows AS (SELECT left(value, 10) AS value FROM t) SELECT value FROM rows"
+        )
+        .is_none());
+        assert!(external_driver_preview_fallback_sql(
+            "SELECT left(value, 10) AS value FROM t WHERE note = '__DBX_LARGE_VALUE_BYTES_T_0'"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn external_driver_invalid_utf8_error_detection_is_narrow() {
+        assert!(is_external_driver_invalid_utf8_error("ERROR: invalid byte sequence for encoding \"UTF8\": 0xe2"));
+        assert!(is_external_driver_invalid_utf8_error(
+            "org.postgresql.util.PSQLException: ERROR: invalid byte sequence for encoding \"UTF8\": 0xe2"
+        ));
+        assert!(!is_external_driver_invalid_utf8_error("ERROR: invalid byte sequence for encoding \"LATIN1\": 0xe2"));
+        assert!(!is_external_driver_invalid_utf8_error("Incorrect syntax near SELECT"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_driver_preview_retry_preserves_marker_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-jdbc-preview-retry-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeQueryPage\"'*)\n      echo executeQueryPage >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding \\\"UTF8\\\": 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n    *'\"method\":\"executeQuery\"'*)\n      echo executeQuery >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding \\\"UTF8\\\": 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n  esac\ndone\n",
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "preview-retry".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+            },
+            path: dir.clone(),
+        };
+        let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
+            .await
+            .expect("preview retry plugin should start");
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.id = "jdbc-preview".to_string();
+        config.connection_string = Some("jdbc:test".to_string());
+        let marker = format!("{}T_1", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX);
+        let sql = format!(
+            "SELECT \"id\", left(\"description\", 140) AS \"description\", 'T:3' AS \"{marker}\" FROM \"job_details\""
+        );
+        let options = QueryExecutionOptions {
+            max_rows: Some(100),
+            page_size: Some(100),
+            table_data_preview: true,
+            ..Default::default()
+        };
+        let mut result = invoke_external_driver_query_with_preview_retry(
+            &session,
+            &config,
+            &sql,
+            "",
+            None,
+            &options,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("preview retry should return the unwrapped value");
+        let cells = extract_server_large_value_markers(&mut result);
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1), serde_json::json!("abc...")]]);
+        assert_eq!(
+            cells,
+            vec![db::LargeValueCell {
+                row_index: 0,
+                column_index: 1,
+                original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
+            }]
+        );
+
+        let options = QueryExecutionOptions { max_rows: Some(100), table_data_preview: true, ..Default::default() };
+        let mut result = invoke_external_driver_query_with_preview_retry(
+            &session,
+            &config,
+            &sql,
+            "",
+            None,
+            &options,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("non-paged preview retry should return the unwrapped value");
+        let cells = extract_server_large_value_markers(&mut result);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(1), serde_json::json!("abc...")]]);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
+
+        session.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_driver_manual_transaction_executes_commits_and_releases_session_pool() {
@@ -7068,14 +8805,18 @@ for line in sys.stdin:
         let client_session_id = "manual-txn-test";
         let pool_key = "jdbc-conn:session:manual-txn-test";
         let config = Arc::new(config);
-        state.connections.write().await.insert(
-            pool_key.to_string(),
-            PoolKind::ExternalDriver {
-                driver_id: "jdbc".to_string(),
-                config: config.clone(),
-                session: session.clone(),
-            },
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    pool_key.to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: config.clone(),
+                        session: session.clone(),
+                    },
+                );
+            })
+            .await;
         let cleanup_guard =
             state.workload_session_pool_cleanup_guard("jdbc-conn", Some("dbx_test"), client_session_id).await.unwrap();
         state.transaction_sessions.write().await.insert(
@@ -7101,7 +8842,7 @@ for line in sys.stdin:
             execute_in_manual_transaction(&state, "txn-test", "SELECT 42", "dbx_test", None, Some(10)).await.unwrap();
         assert_eq!(results[0].rows, vec![vec![serde_json::json!(42)]]);
         commit_manual_transaction(&state, "txn-test").await.unwrap();
-        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(state.pool_handle(pool_key).await.is_none());
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
             "beginManualTransaction\nexecuteInManualTransaction\ncommitManualTransaction\n"
@@ -7431,7 +9172,9 @@ for line in sys.stdin:
 
         assert_eq!(
             error.detail(),
-            Some("Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
+            Some(
+                "Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
+            )
         );
     }
 
@@ -7630,6 +9373,7 @@ for line in sys.stdin:
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -7657,6 +9401,8 @@ for line in sys.stdin:
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             ldap_security_protocol: String::new(),
             ldap_principal: String::new(),
@@ -7740,8 +9486,9 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn iris_execution_context_omits_schema() {
+    fn agent_execution_context_omits_unsupported_schema_switches() {
         assert_eq!(schema_for_execution_context(Some(DatabaseType::Iris), Some("SQLUser")), None);
+        assert_eq!(schema_for_execution_context(Some(DatabaseType::SqlServer), Some("dbo")), None);
         assert_eq!(schema_for_execution_context(Some(DatabaseType::Oracle), Some("APP")), Some("APP"));
         assert_eq!(schema_for_execution_context(None, Some("APP")), Some("APP"));
     }
@@ -7811,6 +9558,69 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn sqlserver_execution_context_qualifies_unqualified_dml_tables() {
+        assert_eq!(
+            sql_for_execution_context(Some(DatabaseType::SqlServer), "SELECT TOP 1 * FROM products", Some("core")),
+            "SELECT TOP 1 * FROM [core].products"
+        );
+
+        let qualified_join = sql_for_execution_context(
+            Some(DatabaseType::SqlServer),
+            "SELECT p.id FROM products p JOIN customers c ON c.id = p.customer_id",
+            Some("sales"),
+        );
+        assert!(qualified_join.contains("FROM [sales].products p"), "{qualified_join}");
+        assert!(qualified_join.contains("JOIN [sales].customers c"), "{qualified_join}");
+
+        assert_eq!(
+            sql_for_execution_context(
+                Some(DatabaseType::SqlServer),
+                "UPDATE products SET status = 'done' WHERE id IN (SELECT product_id FROM audit_products)",
+                Some("core")
+            ),
+            "UPDATE [core].products SET status = 'done' WHERE id IN (SELECT product_id FROM [core].audit_products)"
+        );
+    }
+
+    #[test]
+    fn sqlserver_execution_context_skips_update_target_aliases() {
+        let qualified = sql_for_execution_context(
+            Some(DatabaseType::SqlServer),
+            "UPDATE p SET p.status = 'done' FROM products p JOIN customers c ON c.id = p.customer_id",
+            Some("core"),
+        );
+        assert!(qualified.starts_with("UPDATE p SET"), "{qualified}");
+        assert!(qualified.contains("FROM [core].products p"), "{qualified}");
+        assert!(qualified.contains("JOIN [core].customers c ON c.id = p.customer_id"), "{qualified}");
+        assert!(!qualified.contains("UPDATE [core].p"), "{qualified}");
+        assert!(!qualified.contains("[core].c ON"), "{qualified}");
+    }
+
+    #[test]
+    fn sqlserver_execution_context_preserves_ctes_qualified_tables_and_temp_tables() {
+        assert_eq!(
+            sql_for_execution_context(
+                Some(DatabaseType::SqlServer),
+                "WITH recent AS (SELECT * FROM products) SELECT * FROM recent",
+                Some("core")
+            ),
+            "WITH recent AS (SELECT * FROM [core].products) SELECT * FROM recent"
+        );
+        assert_eq!(
+            sql_for_execution_context(
+                Some(DatabaseType::SqlServer),
+                "SELECT * FROM [archive].products UNION ALL SELECT * FROM #staged_products",
+                Some("core")
+            ),
+            "SELECT * FROM [archive].products UNION ALL SELECT * FROM #staged_products"
+        );
+        assert_eq!(
+            sql_for_execution_context(Some(DatabaseType::SqlServer), "CREATE TABLE products (id INT)", Some("core")),
+            "CREATE TABLE products (id INT)"
+        );
+    }
+
+    #[test]
     fn kingbase_execution_context_qualifies_only_unqualified_relations() {
         assert_eq!(
             sql_for_execution_context(Some(DatabaseType::Kingbase), "SELECT * FROM sys_user", Some("app")),
@@ -7856,6 +9666,37 @@ for line in sys.stdin:
         assert_eq!(
             sql_for_execution_context(Some(DatabaseType::Kingbase), "SELECT * FROM", Some("APP")),
             "SELECT * FROM"
+        );
+    }
+
+    #[test]
+    fn kingbase_execution_context_uses_driver_identifier_quote() {
+        assert_eq!(
+            sql_for_execution_context_with_identifier_quote(
+                Some(DatabaseType::Kingbase),
+                "SELECT * FROM sys_user",
+                Some("audit-schema"),
+                Some("`"),
+            ),
+            "SELECT * FROM `audit-schema`.sys_user"
+        );
+        assert_eq!(
+            sql_for_execution_context_with_identifier_quote(
+                Some(DatabaseType::Kingbase),
+                "SELECT * FROM sys_user",
+                Some("audit-schema"),
+                Some("\""),
+            ),
+            "SELECT * FROM \"audit-schema\".sys_user"
+        );
+        assert_eq!(
+            sql_for_execution_context_with_identifier_quote(
+                Some(DatabaseType::Kingbase),
+                "SELECT * FROM sys_user",
+                Some("audit-schema"),
+                Some("unsupported"),
+            ),
+            "SELECT * FROM \"audit-schema\".sys_user"
         );
     }
 
@@ -8112,12 +9953,14 @@ for line in sys.stdin:
             ..Default::default()
         };
 
-        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Kingbase));
+        for db_type in [DatabaseType::Kingbase, DatabaseType::Vastbase, DatabaseType::Oracle] {
+            let adjusted = options_for_sequential_statements(&options, 2, Some(db_type));
 
-        assert_eq!(adjusted.page_size, None);
-        assert_eq!(adjusted.max_rows, Some(100));
-        assert_eq!(adjusted.fetch_size, Some(100));
-        assert_eq!(adjusted.timeout_secs, Some(30));
+            assert_eq!(adjusted.page_size, None);
+            assert_eq!(adjusted.max_rows, Some(100));
+            assert_eq!(adjusted.fetch_size, Some(100));
+            assert_eq!(adjusted.timeout_secs, Some(30));
+        }
     }
 
     #[test]
@@ -8153,7 +9996,7 @@ for line in sys.stdin:
     fn other_databases_keep_multi_statement_cursor_options() {
         let options = QueryExecutionOptions { max_rows: Some(100_000), page_size: Some(100), ..Default::default() };
 
-        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Oracle));
+        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Dameng));
 
         assert_eq!(adjusted.page_size, Some(100));
         assert_eq!(adjusted.max_rows, Some(100_000));
@@ -8274,6 +10117,72 @@ for line in sys.stdin:
                 column_index: 1,
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_lowercased_server_large_value_markers_from_case_folding_servers() {
+        // KingbaseES instances with case-insensitive identifiers return even
+        // quoted marker aliases folded to lowercase; the markers must still be
+        // consumed and stripped instead of leaking into the data grid.
+        let mut result = db::QueryResult {
+            columns: vec![
+                "id".to_string(),
+                "payload".to_string(),
+                "__dbx_large_value_bytes_t_1".to_string(),
+                "note".to_string(),
+                "__dbx_large_value_bytes_t_2".to_string(),
+            ],
+            column_types: vec![
+                "integer".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+            ],
+            column_sortables: vec![true; 5],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!("长文本预览内容"),
+                    serde_json::json!("T:4"),
+                    serde_json::json!("abcdefgh"),
+                    serde_json::json!("T:4"),
+                ],
+                vec![
+                    serde_json::json!(2),
+                    serde_json::json!("短值"),
+                    serde_json::json!("T:4"),
+                    serde_json::json!("b"),
+                    serde_json::json!("T:4"),
+                ],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        };
+
+        let cells = extract_server_large_value_markers(&mut result);
+
+        assert_eq!(result.columns, vec!["id", "payload", "note"]);
+        assert_eq!(result.column_types, vec!["integer", "text", "text"]);
+        assert_eq!(
+            result.rows[0],
+            vec![serde_json::json!(1), serde_json::json!("长文本预..."), serde_json::json!("abcd...")]
+        );
+        assert_eq!(result.rows[1], vec![serde_json::json!(2), serde_json::json!("短值"), serde_json::json!("b")]);
+        assert_eq!(
+            cells,
+            vec![
+                db::LargeValueCell { row_index: 0, column_index: 1, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
+                db::LargeValueCell { row_index: 0, column_index: 2, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
+            ]
         );
     }
 
@@ -8479,5 +10388,22 @@ for line in sys.stdin:
 
         assert!(mysql_error_is_syntax_error(&syntax_error));
         assert!(!mysql_error_is_syntax_error(&permission_error));
+    }
+
+    #[test]
+    fn mysql_backup_transaction_falls_back_for_doris_parser_syntax_errors() {
+        let doris_syntax_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1105,
+            message: "Syntax error in line 1: START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY ^ Encountered: COMMA Expected: EOF".to_string(),
+            state: "HY000".to_string(),
+        });
+        let generic_unknown_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1105,
+            message: "Unknown error".to_string(),
+            state: "HY000".to_string(),
+        });
+
+        assert!(mysql_error_is_syntax_error(&doris_syntax_error));
+        assert!(!mysql_error_is_syntax_error(&generic_unknown_error));
     }
 }

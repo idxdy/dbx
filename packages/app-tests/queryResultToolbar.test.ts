@@ -4,8 +4,12 @@ import { test } from "vitest";
 import { compileScript, compileTemplate, parse } from "vue/compiler-sfc";
 
 const contentAreaPath = "apps/desktop/src/components/layout/ContentArea.vue";
+const resultSetNavigatorPath = "apps/desktop/src/components/layout/ResultSetNavigator.vue";
 const appPath = "apps/desktop/src/App.vue";
 const dataGridPath = "apps/desktop/src/components/grid/DataGrid.vue";
+const dataGridExportMenuPath = "apps/desktop/src/components/grid/DataGridExportMenu.vue";
+const dataGridToolbarPath = "apps/desktop/src/components/grid/DataGridToolbar.vue";
+const editorToolbarPath = "apps/desktop/src/components/layout/EditorToolbar.vue";
 const viewSwitcherPath = "apps/desktop/src/components/layout/QueryResultViewSwitcher.vue";
 const toolbarActionsPath = "apps/desktop/src/components/layout/QueryResultToolbarActions.vue";
 
@@ -25,18 +29,22 @@ function assertSfcCompiles(path: string): void {
 }
 
 test("query result toolbar SFCs compile", () => {
-  for (const path of [contentAreaPath, dataGridPath, viewSwitcherPath, toolbarActionsPath]) assertSfcCompiles(path);
+  for (const path of [contentAreaPath, dataGridPath, dataGridExportMenuPath, dataGridToolbarPath, editorToolbarPath, viewSwitcherPath, toolbarActionsPath]) assertSfcCompiles(path);
 });
 
-test("ContentArea keeps DISTINCT inserts separate from result-row deletes", () => {
+test("ContentArea keeps query-result insert and delete capabilities separate", () => {
   const contentArea = source(contentAreaPath);
 
   assert.match(contentArea, /:allow-insert-rows="activeTab\.queryAnalysis\?\.allowInsert \?\? activeTab\.queryAnalysis\?\.allowInsertDelete !== false"/);
-  assert.match(contentArea, /:allow-delete-rows="activeTab\.queryAnalysis\?\.allowInsertDelete !== false"/);
+  assert.match(contentArea, /:allow-delete-rows="activeTab\.queryAnalysis\?\.allowDelete \?\? activeTab\.queryAnalysis\?\.allowInsertDelete !== false"/);
 });
 
 test("query result toolbar reuses the production icon contract", () => {
   const contentArea = source(contentAreaPath);
+  const dataGrid = source(dataGridPath);
+  const dataGridExportMenu = source(dataGridExportMenuPath);
+  const dataGridToolbar = source(dataGridToolbarPath);
+  const editorToolbar = source(editorToolbarPath);
   const viewSwitcher = source(viewSwitcherPath);
   const toolbarActions = source(toolbarActionsPath);
 
@@ -44,7 +52,12 @@ test("query result toolbar reuses the production icon contract", () => {
   assert.match(contentArea, /<Wrench class="h-4 w-4"/);
   assert.match(contentArea, /<ChevronDown class="h-3\.5 w-3\.5"/);
   assert.match(viewSwitcher, /import \{ BarChart3, ListChecks, MessageSquareText \} from "@lucide\/vue"/);
-  assert.match(toolbarActions, /import \{ GitBranch, Loader2, Upload \} from "@lucide\/vue"/);
+  assert.match(toolbarActions, /import \{ GitBranch, Gauge, Loader2, Upload \} from "@lucide\/vue"/);
+  assert.match(editorToolbar, /@click="emit\('importResultArchive'\)"[\s\S]{0,100}<Download/);
+  assert.match(toolbarActions, /@click="emit\('exportArchive'\)"[\s\S]{0,200}<Upload v-else/);
+  assert.match(dataGrid, /return \{ label: t\("grid\.export"\), icon: Upload, children: items \};/);
+  assert.match(dataGridExportMenu, /:trigger-icon="Upload"/);
+  assert.match(dataGridToolbar, /<Upload class="data-grid-topbar-action-icon h-3 w-3"/);
   assert.match(viewSwitcher, /inline-flex h-4 items-center leading-none/);
   assert.match(toolbarActions, /block h-3\.5 w-3\.5 self-center/);
   assert.doesNotMatch(viewSwitcher + toolbarActions, /<svg\b|<symbol\b|<use\b/);
@@ -54,7 +67,7 @@ test("ContentArea exposes retained result runs as switchable tabs or a compact l
   const contentArea = source(contentAreaPath);
   const runScrollerStart = contentArea.indexOf('ref="resultTabsScrollerRef"');
   const listSelectorStart = contentArea.indexOf('<div v-else-if="showResultRunSelector"', runScrollerStart);
-  const fixedResultSetStart = contentArea.indexOf("data-result-set-tabs-region", listSelectorStart);
+  const fixedResultSetStart = contentArea.indexOf("<ResultSetNavigator", listSelectorStart);
 
   assert.match(contentArea, /showResultRunTabs = computed\(\(\) => resultRuns\.value\.length > 0 && resultRunDisplayMode\.value === "tabs"\)/);
   assert.match(contentArea, /showResultRunSelector = computed\(\(\) => resultRuns\.value\.length > 0 && resultRunDisplayMode\.value === "list"\)/);
@@ -73,6 +86,7 @@ test("ContentArea exposes retained result runs as switchable tabs or a compact l
   assert.ok(runScrollerStart >= 0);
   assert.ok(listSelectorStart > runScrollerStart);
   assert.ok(fixedResultSetStart > listSelectorStart);
+  assert.match(source(resultSetNavigatorPath), /data-result-set-tabs-region/);
   assert.doesNotMatch(contentArea.slice(runScrollerStart, listSelectorStart), /visibleResultItems/);
   assert.match(contentArea, /resultAutoSave \? 'bg-primary\/10 text-primary[\s\S]*: 'text-muted-foreground hover:bg-accent hover:text-foreground'/);
   assert.doesNotMatch(contentArea, /queryResultAutoRefresh|QUERY_RESULT_AUTO_REFRESH|nextResultToolbarLayout/);
@@ -169,6 +183,38 @@ test("standalone result views use the same compact toolbar breakpoint", () => {
   assert.match(dataGrid, /isDataGridToolbarCompact\(dataGridTopbarWidth\.value, dataGridViewportWidth\.value, DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH\)/);
 });
 
+test("embedded result toolbar progressively compacts when editing actions overflow its available width", () => {
+  const dataGrid = source(dataGridPath);
+  const toolbar = source(dataGridToolbarPath);
+
+  assert.match(dataGrid, /dataGridTopbarMutationObserver = new MutationObserver\(updateDataGridTopbarWidth\)/);
+  assert.match(dataGrid, /dataGridTopbarMutationObserver\.observe\(topbar, \{ childList: true, characterData: true, subtree: true \}\)/);
+  assert.match(dataGrid, /topbar\.scrollWidth > topbar\.clientWidth \+ 1/);
+  assert.match(dataGrid, /dataGridTopbarOverflowCompact\.value = true/);
+  assert.match(dataGrid, /dataGridTopbarOverflowActionCount\.value = compactDataGridToolbarActionCount\.value \+ 1/);
+  assert.match(dataGrid, /dataGridTopbarWidth\.value >= dataGridTopbarExpandedRequiredWidth\.value/);
+  assert.match(dataGrid, /:compact-action-count="compactDataGridToolbarActionCount"/);
+  assert.match(toolbar, /DATA_GRID_TOOLBAR_ACTION_COLLAPSE_ORDER\.filter/);
+  assert.match(toolbar, /<slot name="navigation" :compact="actionIsCompact\('navigation'\)"/);
+});
+
+test("embedded result toolbar remeasures after the SQL preview action is removed", () => {
+  const dataGrid = source(dataGridPath);
+
+  assert.match(dataGrid, /if \(previousVisible && !visible\) resetDataGridTopbarOverflowCompact\(\)/);
+  assert.match(dataGrid, /dataGridTopbarOverflowCompact\.value = false/);
+  assert.match(dataGrid, /dataGridTopbarOverflowActionCount\.value = 0/);
+  assert.match(dataGrid, /function scheduleDataGridTopbarRecheck\(\)/);
+  assert.match(dataGrid, /clearDataGridTopbarRecheckTimer\(\)/);
+});
+
+test("embedded result toolbar remeasures after save and rollback actions are removed", () => {
+  const dataGrid = source(dataGridPath);
+
+  assert.match(dataGrid, /\(\) => saveToolbarState\.value\.showActions,/);
+  assert.match(dataGrid, /if \(previousShowActions && !showActions\) resetDataGridTopbarOverflowCompact\(\)/);
+});
+
 test("embedded and standalone result toolbars share the same fixed height", () => {
   const contentArea = source(contentAreaPath);
   const dataGrid = source(dataGridPath);
@@ -204,5 +250,5 @@ test("DataGrid marks toolbar refresh separately from current-result reloads", ()
 test("Elasticsearch JSON refresh preserves multi-result query groups", () => {
   const contentArea = source(contentAreaPath);
 
-  assert.match(contentArea, /if \(activeElasticsearchJsonResponse\.value\) \{[\s\S]*?emit\("reload", activeResultSql\.value, undefined, undefined, undefined, undefined, undefined, "refresh"\);/);
+  assert.match(contentArea, /if \(activeElasticsearchJsonResponse\.value\) \{[\s\S]*?emit\("reload", props\.activeTab\.id, activeResultSql\.value, undefined, undefined, undefined, undefined, undefined, "refresh"\);/);
 });

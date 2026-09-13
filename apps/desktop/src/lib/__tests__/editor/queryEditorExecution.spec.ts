@@ -1,21 +1,42 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { createQueryEditorExecutionViewportOwnership, isQueryEditorPositionVisible } from "@/lib/editor/queryEditorExecutionViewport";
+import { createQueryEditorExecutionViewportOwnership, isQueryEditorPositionVisible } from "../../editor/queryEditorExecutionViewport";
 
 const queryEditorSource = readFileSync(new URL("../../../components/editor/QueryEditor.vue", import.meta.url), "utf8");
 const contentAreaSource = readFileSync(new URL("../../../components/layout/ContentArea.vue", import.meta.url), "utf8");
+const editorToolbarSource = readFileSync(new URL("../../../components/layout/EditorToolbar.vue", import.meta.url), "utf8");
+const editorGroupSource = readFileSync(new URL("../../../components/layout/EditorGroup.vue", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../../../App.vue", import.meta.url), "utf8");
 const sqlExecutionSource = readFileSync(new URL("../../../composables/useSqlExecution.ts", import.meta.url), "utf8");
 const queryStoreSource = readFileSync(new URL("../../../stores/queryStore.ts", import.meta.url), "utf8");
 
 describe("QueryEditor execution routing", () => {
   it("routes the execution shortcut through the shared execution-mode contract while bypassing the picker", () => {
-    expect(queryEditorSource).toContain("binding(shortcuts.executeSql, () => requestExecute({ bypassPicker: true }))");
+    expect(queryEditorSource).toContain("createQueryEditorExecutionShortcutBindings(shortcuts.executeSql");
     expect(queryEditorSource).not.toContain("forceCurrent");
   });
 
+  it("guards both CodeMirror execution bindings and the app-level fallback during IME composition", () => {
+    expect(queryEditorSource).toContain("createQueryEditorExecutionShortcutBindings(shortcuts.executeSql");
+    expect(queryEditorSource).toContain("createQueryEditorExecutionShortcutBindings(shortcuts.executeSqlInNewResultTab");
+    expect(queryEditorSource).toContain("isEditorComposing");
+    expect(queryEditorSource).toContain("function shouldBlockExecutionShortcut(event?: KeyboardEvent");
+    expect(queryEditorSource).toContain("postCompositionKeyGuard.blocks(event)");
+    expect(contentAreaSource).toContain("function shouldBlockQueryEditorExecutionShortcut(event: KeyboardEvent)");
+    expect(contentAreaSource).toContain("queryEditorRef.value?.shouldBlockExecutionShortcut?.(event)");
+    expect(appSource).toContain("if (!contentAreaRef.value?.shouldBlockQueryEditorExecutionShortcut?.(e)) requestActiveEditorExecuteInNewResultTab();");
+    expect(appSource).toContain("if (!contentAreaRef.value?.shouldBlockQueryEditorExecutionShortcut?.(e)) requestActiveEditorExecute();");
+  });
+
+  it("keeps toolbar, context-menu, and gutter execution outside the shortcut guard", () => {
+    expect(queryEditorSource).toContain("function executeFromContextMenu()");
+    expect(queryEditorSource).toContain("requestExecute();\n  focusEditor();");
+    expect(queryEditorSource).toContain("function executeSqlStatementFromGutter");
+    expect(queryEditorSource).toContain("emitExecutionRequest({ ...sqlExecutionSnapshotForRange(currentView, statementRange), editorViewportRequestId })");
+  });
+
   it("routes the new-result-tab shortcut through the same target selection contract", () => {
-    expect(queryEditorSource).toContain("binding(shortcuts.executeSqlInNewResultTab, requestExecuteInNewResultTab)");
+    expect(queryEditorSource).toContain("createQueryEditorExecutionShortcutBindings(shortcuts.executeSqlInNewResultTab");
     expect(queryEditorSource).toContain('emit("executeInNewResultTab", source)');
     expect(queryEditorSource).toContain("requestExecute({ bypassPicker: true, openInNewResultTab: true })");
     expect(contentAreaSource).toContain('const showResultRunTabs = computed(() => resultRuns.value.length > 0 && resultRunDisplayMode.value === "tabs")');
@@ -29,6 +50,28 @@ describe("QueryEditor execution routing", () => {
 
     expect(selectionBranch).toBeGreaterThan(-1);
     expect(executeModeBranch).toBeGreaterThan(selectionBranch);
+  });
+
+  it("captures the toolbar selection before the click event can change focus", () => {
+    expect(queryEditorSource).toContain("function captureExecutionSnapshot(): SqlExecutionSnapshot | undefined");
+    expect(queryEditorSource).toContain("return sqlExecutionSnapshotFromView(currentView);");
+    expect(contentAreaSource).toContain("function captureQueryEditorExecutionSnapshot()");
+    expect(contentAreaSource).toContain("queryEditorRef.value?.captureExecutionSnapshot();");
+    expect(appSource).toContain("const pendingToolbarExecutionSnapshot = ref<SqlExecutionSnapshot & { tabId?: string }>();");
+    expect(appSource).toContain("pendingToolbarExecutionSnapshot.value = snapshot ? { ...snapshot, tabId: activeTab.value?.id } : undefined;");
+    expect(appSource).toContain('if (source === "pointer")');
+    expect(appSource).toContain("pendingToolbarExecutionSnapshot.value = undefined;");
+    expect(appSource).toContain("void tryExecute(snapshot, { tabId: snapshot.tabId ?? activeTab.value?.id });");
+    expect(appSource).toContain('@execute="(tabId: string, override?: SqlExecutionOverride) => tryExecute(override, { tabId })"');
+    // Per-group toolbars call back into App-owned orchestration via injection.
+    expect(appSource).toContain("provide(EDITOR_TOOLBAR_ACTIONS, {");
+    expect(appSource).toContain("captureExecutionSnapshot: captureActiveEditorExecutionSnapshot,");
+    expect(appSource).toContain("toolbarExecute: requestActiveEditorExecute,");
+    expect(editorGroupSource).toContain('@execute-pointer-down="toolbar.captureExecutionSnapshot()"');
+    expect(editorGroupSource).toContain('@toolbar-execute="toolbar.toolbarExecute($event)"');
+    expect(editorToolbarSource).toContain("function onExecutePointerDown(event: MouseEvent)");
+    expect(editorToolbarSource).toContain('emit("toolbarExecute", event.detail > 0 ? "pointer" : "keyboard")');
+    expect(editorToolbarSource).not.toContain('emit("execute", event.detail > 0 ? "pointer" : "keyboard")');
   });
 
   it("uses the opt-in blank-line fallback and otherwise reports the missing cursor statement", () => {
@@ -57,8 +100,11 @@ describe("QueryEditor execution routing", () => {
 
   it("claims gutter viewport ownership only after the matching execution starts", () => {
     expect(appSource).toContain("acceptQueryEditorExecutionViewport(editorViewportRequestId)");
+    expect(appSource).toContain("onExecutionCancelled: (editorViewportRequestId) => contentAreaRef.value?.cancelQueryEditorExecutionViewport(editorViewportRequestId)");
     expect(contentAreaSource).toContain("acceptGutterExecutionViewport(requestId)");
+    expect(contentAreaSource).toContain("cancelGutterExecutionViewport(requestId)");
     expect(sqlExecutionSource).toContain("onExecutionStarted: () => deps.onExecutionStarted?.(options.editorViewportRequestId!)");
+    expect(sqlExecutionSource).toContain("onExecutionCancelled?: (editorViewportRequestId: number) => void;");
     expect(queryStoreSource.indexOf("tab.isExecuting = true")).toBeLessThan(queryStoreSource.indexOf("options?.onExecutionStarted?.()"));
   });
 
@@ -79,6 +125,18 @@ describe("QueryEditor execution routing", () => {
     expect(queryEditorSource).toContain("changes: { from: line.to, to: line.to, insert: insertion }");
     expect(queryEditorSource).toContain("const cursor = line.to + insertion.length");
     expect(queryEditorSource).not.toMatch(/key:\s*"Enter"[\s\S]{0,180}shift:\s*codeMirrorInsertNewlineKeepIndent/);
+  });
+
+  it("routes custom SQL shortcuts through selection-aware execution with dual keymap and DOM handlers", () => {
+    expect(queryEditorSource).toContain("function runSqlShortcutAction(");
+    expect(queryEditorSource).toContain("resolveSqlShortcutTemplate(action.sql, selected)");
+    expect(queryEditorSource).toContain("enabledSqlShortcutActions(settingsStore.editorSettings.sqlShortcuts)");
+    expect(queryEditorSource).toContain("isCharacterProducingShortcut(action.shortcut)");
+    expect(queryEditorSource).toContain("createQueryEditorSqlShortcutDomHandler(");
+    expect(queryEditorSource).toContain("shouldBlockExecutionShortcut(event, currentView)");
+    expect(queryEditorSource).toContain("if (props.readOnly) return true;");
+    expect(queryEditorSource).toContain("settingsStore.editorSettings.sqlShortcuts");
+    expect(queryEditorSource).toContain("runKeymapComp.reconfigure(runKeymapExtension(editorViewModule.keymap))");
   });
 });
 
@@ -113,7 +171,7 @@ describe("QueryEditor execution viewport ownership", () => {
     const ownership = createQueryEditorExecutionViewportOwnership();
     const cancelledRequestId = ownership.beginRequest();
 
-    ownership.cancelPendingRequest();
+    expect(ownership.cancelPendingRequest(cancelledRequestId)).toBe(true);
 
     expect(ownership.acceptRequest(cancelledRequestId)).toBe(false);
     expect(ownership.consumeCompletionPreservation()).toBe(false);

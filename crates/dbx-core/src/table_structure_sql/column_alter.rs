@@ -14,7 +14,7 @@ use super::util::{
 use crate::table_structure_sql::ColumnExtra;
 
 pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> TableStructureSqlResult {
-    let capabilities = capabilities_for(options.database_type);
+    let capabilities = capabilities_for(options.database_type, options.driver_profile.as_deref());
     let dialect = capabilities.dialect;
     let table = qualified_table(dialect, options.schema.as_deref(), &options.table_name);
     let database_label = database_label(options.database_type);
@@ -739,7 +739,12 @@ pub(super) fn build_sqlserver_existing_column_sql(
     // SQL Server default constraints are separate objects that can block ALTER COLUMN.
     // Preserve the exact constraint name and expression when the default itself is unchanged.
     if has_column_definition_change && has_old_default && !has_default_change {
-        statements.push(build_sqlserver_alter_column_preserving_default_sql(table, &current_name, column));
+        statements.push(build_sqlserver_alter_column_preserving_default_sql(
+            table,
+            &current_name,
+            &column_data_type(dialect, column),
+            column.is_nullable,
+        ));
     } else {
         if has_column_definition_change && has_old_default {
             statements.push(build_sqlserver_drop_default_constraint_sql(table, &current_name));
@@ -760,15 +765,10 @@ pub(super) fn build_sqlserver_existing_column_sql(
             statements.push(build_sqlserver_drop_default_constraint_sql(table, &current_name));
         }
         if !default_value.is_empty() {
-            let short_table =
-                table.split('.').next_back().unwrap_or(table).trim_matches(|c: char| c == '[' || c == ']');
-            let constraint_name = format!(
-                "DF_{short_table}_{col_name}",
-                short_table = short_table,
-                col_name = current_name.trim_matches(|c: char| c == '[' || c == ']')
-            );
+            let constraint_name = format!("DF_{}_{}", table_name.trim(), current_name.trim());
             statements.push(format!(
-                "ALTER TABLE {table} ADD CONSTRAINT [{constraint_name}] DEFAULT {} FOR {};",
+                "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT {} FOR {};",
+                quote_ident(dialect, &constraint_name),
                 format_default_for_sql(StructureDialect::SqlServer, &column.data_type, &default_value),
                 quote_ident(dialect, &current_name)
             ));
@@ -789,10 +789,11 @@ pub(super) fn build_sqlserver_existing_column_sql(
     statements
 }
 
-fn build_sqlserver_alter_column_preserving_default_sql(
+pub(crate) fn build_sqlserver_alter_column_preserving_default_sql(
     table: &str,
     column_name: &str,
-    column: &EditableStructureColumn,
+    data_type: &str,
+    is_nullable: bool,
 ) -> String {
     let dialect = StructureDialect::SqlServer;
     let sql_var = sqlserver_default_constraint_sql_var(table, column_name);
@@ -802,7 +803,7 @@ fn build_sqlserver_alter_column_preserving_default_sql(
     let column_literal = column_name.replace('\'', "''");
     let quoted_column = quote_ident(dialect, column_name);
     let quoted_column_literal = quoted_column.replace('\'', "''");
-    let null_clause = if column.is_nullable { "NULL" } else { "NOT NULL" };
+    let null_clause = if is_nullable { "NULL" } else { "NOT NULL" };
 
     format!(
         "DECLARE {sql_var} NVARCHAR(MAX), {name_var} sysname, {definition_var} NVARCHAR(MAX); \
@@ -812,11 +813,11 @@ fn build_sqlserver_alter_column_preserving_default_sql(
          IF {name_var} IS NOT NULL BEGIN SET {sql_var} = N'ALTER TABLE {table_literal} DROP CONSTRAINT ' + QUOTENAME({name_var}); EXEC sp_executesql {sql_var}; END; \
          ALTER TABLE {table} ALTER COLUMN {quoted_column} {data_type} {null_clause}; \
          IF {name_var} IS NOT NULL BEGIN SET {sql_var} = N'ALTER TABLE {table_literal} ADD CONSTRAINT ' + QUOTENAME({name_var}) + N' DEFAULT ' + {definition_var} + N' FOR {quoted_column_literal}'; EXEC sp_executesql {sql_var}; END;",
-        data_type = column_data_type(dialect, column),
+        data_type = data_type,
     )
 }
 
-fn build_sqlserver_drop_default_constraint_sql(table: &str, column_name: &str) -> String {
+pub(crate) fn build_sqlserver_drop_default_constraint_sql(table: &str, column_name: &str) -> String {
     let sql_var = sqlserver_default_constraint_sql_var(table, column_name);
     let table_literal = table.replace('\'', "''");
     let column_literal = column_name.replace('\'', "''");
@@ -983,10 +984,23 @@ pub(super) fn build_sqlite_existing_column_sql(
         return Vec::new();
     };
     let mut statements = Vec::new();
+    // Tri-state: an unset auto_increment flag inherits the original value; only an
+    // explicit toggle (SQLite cannot add or drop AUTOINCREMENT without a rebuild)
+    // counts as an unsupported change.
+    let original_auto_increment = original.extra.as_deref().is_some_and(|extra| {
+        let lower = extra.to_ascii_lowercase();
+        lower.contains("auto_increment")
+            || lower.contains("autoincrement")
+            || lower.contains("identity")
+            || lower.contains("serial")
+    });
+    let auto_increment_changed =
+        column.extra.as_ref().and_then(|e| e.auto_increment).is_some_and(|value| value != original_auto_increment);
     let unsupported_change = column.data_type.trim() != original.data_type.trim()
         || column.is_nullable != original.is_nullable
         || normalize_default(Some(&column.default_value)) != original_default(column)
-        || clean(&column.comment) != original_comment(column);
+        || clean(&column.comment) != original_comment(column)
+        || auto_increment_changed;
     if column.name != original.name {
         statements.push(format!(
             "ALTER TABLE {table} RENAME COLUMN {} TO {};",

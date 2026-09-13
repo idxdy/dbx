@@ -11,9 +11,34 @@ describe("sqlFormatter", () => {
     expect(sqlFormatterSource).not.toContain("(?<=");
   });
 
-  it("disables SQL formatting for VictoriaMetrics queries", () => {
+  it("disables SQL formatting for Redis and VictoriaMetrics queries", () => {
+    expect(canFormatSqlForDatabaseType("redis")).toBe(false);
     expect(canFormatSqlForDatabaseType("victoriametrics")).toBe(false);
     expect(canFormatSqlForDatabaseType("mysql")).toBe(true);
+  });
+
+  it("preserves source empty lines only when configured", async () => {
+    const sql = "-- tstt\n\nSELECT * FROM AUX_TABLE AS au LIMIT 100;";
+    const consecutiveEmptyLines = "-- section\n\n\nSELECT 1;";
+    const queriesWithEmptyLine = "SELECT 1;\n\nSELECT 2;";
+    const queriesWithTwoEmptyLines = "SELECT 1;\n\n\nSELECT 2;";
+
+    const defaultFormatted = await formatSqlForEditing(sql, "generic");
+    const preserved = await formatSqlForEditing(sql, "generic", { preserveEmptyLines: true });
+    const preservedConsecutive = await formatSqlForEditing(consecutiveEmptyLines, "generic", { preserveEmptyLines: true });
+    const preservedQueriesNoSpacing = await formatSqlForEditing(queriesWithEmptyLine, "generic", { preserveEmptyLines: true, linesBetweenQueries: 0 });
+    const preservedQueries = await formatSqlForEditing(queriesWithEmptyLine, "generic", { preserveEmptyLines: true, linesBetweenQueries: 1 });
+    const preservedQueriesWideSpacing = await formatSqlForEditing(queriesWithEmptyLine, "generic", { preserveEmptyLines: true, linesBetweenQueries: 2 });
+    const preservedQueriesWithTwoEmptyLines = await formatSqlForEditing(queriesWithTwoEmptyLines, "generic", { preserveEmptyLines: true, linesBetweenQueries: 1 });
+
+    expect(defaultFormatted).toContain("-- tstt\nSELECT");
+    expect(preserved).toContain("-- tstt\n\nSELECT");
+    expect(preservedConsecutive).toContain("-- section\n\n\nSELECT");
+    expect(preservedQueriesNoSpacing).toBe("SELECT\n  1;\n\nSELECT\n  2;");
+    expect(preservedQueries).toBe("SELECT\n  1;\n\nSELECT\n  2;");
+    expect(preservedQueriesWideSpacing).toBe("SELECT\n  1;\n\n\nSELECT\n  2;");
+    expect(preservedQueriesWithTwoEmptyLines).toBe("SELECT\n  1;\n\n\nSELECT\n  2;");
+    expect(preserved).not.toContain("__DBX_PRESERVE_EMPTY_LINE_");
   });
 
   it("maps PostgreSQL-compatible database types to the postgres formatter dialect", () => {
@@ -34,6 +59,96 @@ describe("sqlFormatter", () => {
 
   it("maps DuckDB to its scoped formatter dialect", () => {
     expect(sqlFormatDialectForDbType("duckdb")).toBe("duckdb");
+  });
+
+  it("maps Oracle and OceanBase Oracle mode to the PL/SQL formatter dialect", () => {
+    expect(sqlFormatDialectForDbType("oracle")).toBe("oracle");
+    // OceanBase Oracle mode speaks Oracle SQL — issue #7540: it must reuse the
+    // Oracle dialect so view DDL previews are formatted instead of one line.
+    expect(sqlFormatDialectForDbType("oceanbase-oracle")).toBe("oracle");
+  });
+
+  it("formats an OceanBase Oracle single-line view DDL into readable multi-line SQL (issue #7540)", async () => {
+    const singleLine = `CREATE OR REPLACE VIEW "APP"."ACTIVE_USERS" AS SELECT ID, NAME FROM USERS WHERE STATUS = 'ACTIVE'`;
+    const formatted = await formatSqlForDisplay(singleLine, sqlFormatDialectForDbType("oceanbase-oracle"));
+
+    expect(formatted).not.toBe(singleLine);
+    expect(formatted.split("\n").length).toBeGreaterThan(1);
+    expect(formatted).toContain("CREATE OR REPLACE VIEW");
+    expect(formatted).toMatch(/\bSELECT\b/);
+    expect(formatted).toMatch(/\bFROM\b/);
+    expect(formatted).toMatch(/\bWHERE\b/);
+    // String literals and quoted identifiers must survive formatting untouched.
+    expect(formatted).toContain("'ACTIVE'");
+    expect(formatted).toContain('"ACTIVE_USERS"');
+  });
+
+  it("formats a bare OceanBase Oracle view source wrapped as CREATE VIEW (issue #7540)", async () => {
+    // Mirrors the backend build_view_ddl_sql output for a fallback ALL_VIEWS.TEXT
+    // body: `CREATE VIEW <name> AS <single-line SELECT>`.
+    const wrapped = `CREATE VIEW "APP"."ACTIVE_USERS" AS
+SELECT ID, NAME FROM USERS WHERE STATUS = 'ACTIVE';`;
+    const formatted = await formatSqlForDisplay(wrapped, sqlFormatDialectForDbType("oceanbase-oracle"));
+
+    expect(formatted.split("\n").length).toBeGreaterThan(2);
+    expect(formatted).toMatch(/\bSELECT\b/);
+    expect(formatted).toMatch(/\bFROM\b/);
+    expect(formatted).toMatch(/\bWHERE\b/);
+    expect(formatted).toContain("'ACTIVE'");
+  });
+
+  it("does not split string literals when formatting an OceanBase Oracle view (issue #7540)", async () => {
+    const singleLine = `CREATE OR REPLACE VIEW "APP"."V" AS SELECT 'SELECT X FROM Y' AS TXT FROM DUAL`;
+    const formatted = await formatSqlForDisplay(singleLine, sqlFormatDialectForDbType("oceanbase-oracle"));
+
+    expect(formatted).toContain("'SELECT X FROM Y'");
+  });
+
+  it("leaves an already multi-line OceanBase Oracle view DDL semantically intact (issue #7540)", async () => {
+    const multiLine = `CREATE OR REPLACE VIEW "APP"."ACTIVE_USERS" AS
+SELECT
+  ID,
+  NAME
+FROM USERS
+WHERE STATUS = 'ACTIVE';`;
+    const formatted = await formatSqlForDisplay(multiLine, sqlFormatDialectForDbType("oceanbase-oracle"));
+
+    expect(formatted).toContain('"ACTIVE_USERS"');
+    expect(formatted).toContain("'ACTIVE'");
+    expect(formatted).toMatch(/\bID\b/);
+    expect(formatted).toMatch(/\bNAME\b/);
+    expect(formatted).toMatch(/\bWHERE\b/);
+  });
+
+  it("keeps issue #7138 Oracle hierarchy clauses intact", async () => {
+    const sql = "SELECT ctt.U_DM FROM cte_test ctt START WITH ctt.SU_DM IN ('16','17','18','19') CONNECT BY PRIOR ctt.U_DM = HY.SU_DM;";
+
+    await expect(formatSqlForEditing(sql, sqlFormatDialectForDbType("oracle"))).resolves.toBe(`SELECT
+  ctt.U_DM
+FROM
+  cte_test ctt
+START WITH ctt.SU_DM IN ('16', '17', '18', '19')
+CONNECT BY PRIOR ctt.U_DM = HY.SU_DM;`);
+  });
+
+  it("formats valid Oracle hierarchy clauses with the same alias", async () => {
+    const sql = "SELECT ctt.U_DM FROM cte_test ctt START WITH ctt.SU_DM = '16' CONNECT BY PRIOR ctt.U_DM = ctt.SU_DM;";
+
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("oracle"));
+
+    expect(formatted).toContain("FROM\n  cte_test ctt\nSTART WITH ctt.SU_DM = '16'");
+    expect(formatted).toContain("\nCONNECT BY PRIOR ctt.U_DM = ctt.SU_DM;");
+  });
+
+  it("formats ordinary Oracle SQL and anonymous PL/SQL", async () => {
+    await expect(formatSqlForEditing("select employee_id from employees where department_id = 10;", sqlFormatDialectForDbType("oracle"))).resolves.toBe("SELECT\n  employee_id\nFROM\n  employees\nWHERE\n  department_id = 10;");
+    await expect(formatSqlForEditing("declare v_count number := 1; begin v_count := v_count + 1; end;", sqlFormatDialectForDbType("oracle"))).resolves.toBe("DECLARE v_count number := 1;\n\nBEGIN v_count := v_count + 1;\n\nEND;");
+  });
+
+  it("keeps incomplete Oracle editor SQL unchanged", async () => {
+    const sql = "select *\nfrom dbname.\n;";
+
+    await expect(formatSqlForEditing(sql, sqlFormatDialectForDbType("oracle"))).resolves.toBe(sql);
   });
 
   it("keeps DuckDB prefix aliases out of formatted named parameters", async () => {

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{
     is_schema_aware, profile_for, qualified_table_name, quote_table_data_identifier, quote_table_identifier,
-    uses_connection_identifier_quote,
+    uses_connection_identifier_quote, DdlDialectProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,35 +415,28 @@ pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
         &options.table_name,
         options.identifier_quote.as_deref(),
     );
+    // IoTDB is the one engine whose drop target is a derived path pattern rather than the
+    // qualified name, so it cannot be expressed as a profile template.
     if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
         return format!("DELETE TIMESERIES {};", iotdb_timeseries_pattern(&table));
-    } else if matches!(options.database_type, Some(DatabaseType::InfluxDb)) {
-        return format!("DROP MEASUREMENT {};", table);
     }
-    // CASCADE is valid for PostgreSQL-family dialects; keep default RESTRICT behavior elsewhere.
     let cascade = if options.cascade.unwrap_or(false) && supports_drop_table_cascade(options.database_type) {
         " CASCADE"
     } else {
         ""
     };
-    format!("DROP TABLE {table}{cascade};")
+    // Unknown database type: fall back to the ANSI shape rather than guessing a profile.
+    let Some(database_type) = options.database_type else {
+        return format!("DROP TABLE {table}{cascade};");
+    };
+    DdlDialectProfile::render_template(
+        profile_for(database_type).drop_table_template,
+        &[("table", &table), ("cascade", cascade)],
+    )
 }
 
 fn supports_drop_table_cascade(database_type: Option<DatabaseType>) -> bool {
-    matches!(
-        database_type,
-        Some(
-            DatabaseType::Postgres
-                | DatabaseType::Redshift
-                | DatabaseType::Gaussdb
-                | DatabaseType::Kwdb
-                | DatabaseType::Kingbase
-                | DatabaseType::Highgo
-                | DatabaseType::Uxdb
-                | DatabaseType::Vastbase
-                | DatabaseType::OpenGauss
-        )
-    )
+    database_type.is_some_and(|database_type| profile_for(database_type).drop_table_supports_cascade)
 }
 
 pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
@@ -536,10 +529,16 @@ pub fn build_empty_table_sql(options: TableAdminSqlOptions) -> String {
         Some(DatabaseType::Bigquery | DatabaseType::Spanner) => format!("DELETE FROM {table} WHERE TRUE;"),
         Some(
             DatabaseType::Cassandra
-            | DatabaseType::Hive
-            | DatabaseType::Kyuubi
-            | DatabaseType::Kylin
-            | DatabaseType::Questdb,
+                | DatabaseType::Hive
+                | DatabaseType::Kyuubi
+                | DatabaseType::Argo
+                | DatabaseType::Kylin
+                | DatabaseType::Questdb
+                // StarRocks and Doris reject a WHERE-less DELETE (StarRocks analyzer:
+                // "Where clause is not set"), and both officially support TRUNCATE TABLE
+                // as the way to clear a whole table.
+                | DatabaseType::Doris
+                | DatabaseType::StarRocks,
         ) => {
             format!("TRUNCATE TABLE {table};")
         }
@@ -717,7 +716,10 @@ pub fn build_create_schema_sql(options: SchemaNameSqlOptions) -> Result<String, 
 
 pub fn build_drop_schema_sql(options: SchemaNameSqlOptions) -> String {
     let schema = quote_table_identifier(options.database_type, &options.name);
-    if matches!(
+    if options.database_type == Some(DatabaseType::OceanbaseOracle) {
+        // OceanBase Oracle mode models schemas as users, so dropping one drops the user.
+        format!("DROP USER {schema} CASCADE;")
+    } else if matches!(
         options.database_type,
         Some(DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::Kwdb | DatabaseType::Dameng)
     ) {
@@ -736,20 +738,22 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
     );
     let target =
         qualified_duplicate_target_name(options.database_type, options.schema.as_deref(), &options.target_name);
-    let structure_sql =
-        if matches!(options.database_type, Some(DatabaseType::Mysql | DatabaseType::Kyuubi | DatabaseType::Impala)) {
-            format!("CREATE TABLE {target} LIKE {source};")
-        } else if options.database_type == Some(DatabaseType::Questdb) {
-            format!("CREATE TABLE {target} (LIKE {source});")
-        } else if options.database_type.is_some_and(is_postgres_like_structure_copy) {
-            format!("CREATE TABLE {target} (LIKE {source} INCLUDING ALL);")
-        } else if options.database_type == Some(DatabaseType::SqlServer) {
-            format!("SELECT TOP 0 * INTO {target} FROM {source};")
-        } else if options.database_type.is_some_and(uses_false_predicate_duplicate_structure) {
-            format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0")
-        } else {
-            format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 0;")
-        };
+    let structure_sql = if matches!(
+        options.database_type,
+        Some(DatabaseType::Mysql | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo)
+    ) {
+        format!("CREATE TABLE {target} LIKE {source};")
+    } else if options.database_type == Some(DatabaseType::Questdb) {
+        format!("CREATE TABLE {target} (LIKE {source});")
+    } else if options.database_type.is_some_and(is_postgres_like_structure_copy) {
+        format!("CREATE TABLE {target} (LIKE {source} INCLUDING ALL);")
+    } else if options.database_type == Some(DatabaseType::SqlServer) {
+        format!("SELECT TOP 0 * INTO {target} FROM {source};")
+    } else if options.database_type.is_some_and(uses_false_predicate_duplicate_structure) {
+        format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0")
+    } else {
+        format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 0;")
+    };
 
     let mut comment_sql = Vec::new();
     if let Some(database_type) =
@@ -797,11 +801,24 @@ pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
     let Some(columns) = options.columns.filter(|columns| !columns.is_empty()) else {
         return format!("INSERT INTO {target} SELECT * FROM {source};");
     };
-    let column_list = columns
+    let source_column_list = columns
         .iter()
         .map(|column| quote_table_identifier(options.database_type, column))
         .collect::<Vec<_>>()
         .join(", ");
+    // The unquoted Oracle clone DDL creates the target columns case-folded while the source
+    // keeps its exact stored spelling, so the INSERT target list must reference the folded
+    // forms and the SELECT list keeps reading the source exactly.
+    let target_column_list = if options.normalize_new_target_name && options.database_type == Some(DatabaseType::Oracle)
+    {
+        columns
+            .iter()
+            .map(|column| crate::table_structure_sql::oracle_new_object_reference(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        source_column_list.clone()
+    };
     let postgres_override = if options.postgres_overriding_system_value
         && matches!(options.database_type, Some(DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::Kwdb))
     {
@@ -809,8 +826,9 @@ pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
     } else {
         ""
     };
-    let insert_sql =
-        format!("INSERT INTO {target} ({column_list}){postgres_override} SELECT {column_list} FROM {source};");
+    let insert_sql = format!(
+        "INSERT INTO {target} ({target_column_list}){postgres_override} SELECT {source_column_list} FROM {source};"
+    );
     if options.sqlserver_identity_insert && options.database_type == Some(DatabaseType::SqlServer) {
         return format!("SET IDENTITY_INSERT {target} ON;\n{insert_sql}\nSET IDENTITY_INSERT {target} OFF;");
     }
@@ -987,7 +1005,11 @@ fn is_postgres_like_rename(database_type: DatabaseType) -> bool {
 
 fn is_oracle_like_rename(database_type: DatabaseType) -> bool {
     // 神通 Oscar 实测支持 `ALTER TABLE old RENAME TO new`（PG 风格，与 Dameng/Oracle 一致）。
-    matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Oscar)
+    // OceanBase Oracle 模式同样接受该语法。
+    matches!(
+        database_type,
+        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Oscar
+    )
 }
 
 fn is_postgres_like_structure_copy(database_type: DatabaseType) -> bool {
@@ -1073,10 +1095,14 @@ fn qualified_name_with_quote(
 }
 
 fn qualified_duplicate_target_name(database_type: Option<DatabaseType>, schema: Option<&str>, name: &str) -> String {
-    if database_type != Some(DatabaseType::Dameng) {
-        return qualified_name(database_type, schema, name);
-    }
-    let target = profile_for(DatabaseType::Dameng).quote_ident(name);
+    // Both duplicate-target normalizations emit the spelling a freshly created clone resolves
+    // to: Oracle's clone DDL creates plain identifiers unquoted (uppercase fold), and Dameng's
+    // clone keeps the same fold convention through its profile.  Every other type stays exact.
+    let target = match database_type {
+        Some(DatabaseType::Oracle) => crate::table_structure_sql::oracle_new_object_reference(name),
+        Some(DatabaseType::Dameng) => profile_for(DatabaseType::Dameng).quote_ident(name),
+        _ => return qualified_name(database_type, schema, name),
+    };
     if schema.is_some_and(|schema| !schema.is_empty()) {
         format!("{}.{}", quote_rename_identifier(database_type, schema.unwrap()), target)
     } else {
@@ -1757,6 +1783,72 @@ mod tests {
             }),
             "TRUNCATE TABLE `table_sample`;"
         );
+        // StarRocks and Doris require a WHERE clause on DELETE (StarRocks analyzer:
+        // "Where clause is not set"), so clearing a table must emit the same
+        // TRUNCATE TABLE statement the truncate action already produces.
+        for database_type in [DatabaseType::Doris, DatabaseType::StarRocks] {
+            assert_eq!(
+                build_empty_table_sql(TableAdminSqlOptions {
+                    database_type: Some(database_type),
+                    schema: None,
+                    table_name: "events".to_string(),
+                    cascade: None,
+                    identifier_quote: None,
+                }),
+                "TRUNCATE TABLE `events`;"
+            );
+        }
+    }
+
+    /// `build_drop_table_sql` renders `DdlDialectProfile::drop_table_template`, so the six
+    /// profile families plus DuckDB (which resolves to `conservative_ansi`, not the SQLite
+    /// family) must all produce a valid statement.
+    #[test]
+    fn builds_drop_table_sql_per_profile_family() {
+        let drop_sql = |database_type: DatabaseType, schema: Option<&str>, cascade: Option<bool>| {
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(database_type),
+                schema: schema.map(str::to_string),
+                table_name: "events".to_string(),
+                cascade,
+                identifier_quote: None,
+            })
+        };
+
+        assert_eq!(drop_sql(DatabaseType::Mysql, None, None), "DROP TABLE `events`;");
+        assert_eq!(drop_sql(DatabaseType::Postgres, Some("public"), None), "DROP TABLE \"public\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, Some("APP"), None), "DROP TABLE \"APP\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::SqlServer, Some("dbo"), None), "DROP TABLE [dbo].[events];");
+        assert_eq!(drop_sql(DatabaseType::Sqlite, None, None), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, None), "DROP TABLE \"events\";");
+        // No database type: the ANSI shape, with the default double-quote from
+        // `qualified_name_with_quote`, and no CASCADE.
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: None,
+                schema: None,
+                table_name: "events".to_string(),
+                cascade: Some(true),
+                identifier_quote: None,
+            }),
+            "DROP TABLE \"events\";"
+        );
+
+        // CASCADE stays limited to the PostgreSQL-family profiles. Oracle spells it
+        // `CASCADE CONSTRAINTS` and is deliberately excluded; Firebird, Vertica and Exasol
+        // share the PostgreSQL profile but opt out.
+        assert_eq!(
+            drop_sql(DatabaseType::Postgres, Some("public"), Some(true)),
+            "DROP TABLE \"public\".\"events\" CASCADE;"
+        );
+        assert_eq!(drop_sql(DatabaseType::OpenGauss, None, Some(true)), "DROP TABLE \"events\" CASCADE;");
+        assert_eq!(drop_sql(DatabaseType::Firebird, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Vertica, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, Some(true)), "DROP TABLE \"events\";");
+
+        // InfluxDB drops a measurement; the profile template carries the whole shape.
+        assert_eq!(drop_sql(DatabaseType::InfluxDb, None, None), "DROP MEASUREMENT \"events\";");
     }
 
     #[test]
@@ -1894,6 +1986,34 @@ mod tests {
                 name: "analytics".to_string(),
             }),
             "DROP SCHEMA \"analytics\" CASCADE;"
+        );
+        assert_eq!(
+            build_drop_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                name: "analytics".to_string(),
+            }),
+            "DROP SCHEMA \"analytics\" CASCADE;"
+        );
+        assert_eq!(
+            build_drop_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                name: "analytics".to_string(),
+            }),
+            "DROP SCHEMA `analytics`;"
+        );
+        assert_eq!(
+            build_drop_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                name: "analytics".to_string(),
+            }),
+            "DROP USER \"analytics\" CASCADE;"
+        );
+        assert_eq!(
+            build_drop_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                name: "ana\"lytics".to_string(),
+            }),
+            "DROP USER \"ana\"\"lytics\" CASCADE;"
         );
     }
 
@@ -2086,7 +2206,7 @@ mod tests {
                 column_comments: vec![],
                 identifier_quote: None,
             }),
-            "CREATE TABLE \"HR\".\"USERS_COPY\" AS SELECT * FROM \"HR\".\"USERS\" WHERE 1=0"
+            "CREATE TABLE \"HR\".USERS_COPY AS SELECT * FROM \"HR\".\"USERS\" WHERE 1=0"
         );
         let dameng_sql = build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
             database_type: Some(DatabaseType::Dameng),
@@ -2286,6 +2406,95 @@ mod tests {
             }),
             "INSERT INTO \"APP\".\"users_copy\" SELECT * FROM \"APP\".\"users\";"
         );
+        assert_eq!(
+            build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Oracle),
+                schema: Some("APP".to_string()),
+                source_name: "orders".to_string(),
+                target_name: "orders_copy".to_string(),
+                columns: Some(vec!["user_id".to_string(), "userName".to_string(), "order total".to_string()]),
+                postgres_overriding_system_value: false,
+                sqlserver_identity_insert: false,
+                normalize_new_target_name: true,
+                identifier_quote: None,
+            }),
+            "INSERT INTO \"APP\".orders_copy (user_id, userName, \"order total\") SELECT \"user_id\", \"userName\", \"order total\" FROM \"APP\".\"orders\";"
+        );
+        assert_eq!(
+            build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Oracle),
+                schema: Some("APP".to_string()),
+                source_name: "orders".to_string(),
+                target_name: "orders_copy".to_string(),
+                columns: Some(vec!["user_id".to_string()]),
+                postgres_overriding_system_value: false,
+                sqlserver_identity_insert: false,
+                normalize_new_target_name: false,
+                identifier_quote: None,
+            }),
+            "INSERT INTO \"APP\".\"orders_copy\" (\"user_id\") SELECT \"user_id\" FROM \"APP\".\"orders\";"
+        );
+    }
+
+    #[test]
+    fn oracle_clone_data_copy_matches_unquoted_create_identifiers() {
+        // Clone-with-data regression: a lowercase user-typed target and quoted-lowercase source
+        // columns. The clone DDL creates plain identifiers unquoted (Oracle stores them folded),
+        // so the data-copy INSERT must reference the created spellings while the SELECT keeps
+        // the exact quoted spelling of the existing source.
+        let column = |name: &str| crate::table_structure_sql::EditableStructureColumn {
+            id: name.to_string(),
+            name: name.to_string(),
+            data_type: "NUMBER".to_string(),
+            is_nullable: true,
+            default_value: String::new(),
+            comment: String::new(),
+            is_primary_key: false,
+            extra: None,
+            original: None,
+            original_position: None,
+            marked_for_drop: false,
+            character_set: String::new(),
+            collation: String::new(),
+        };
+        let create =
+            crate::table_structure_sql::build_create_table_sql(crate::table_structure_sql::TableStructureSqlOptions {
+                database_type: Some(DatabaseType::Oracle),
+                driver_profile: None,
+                schema: Some("APP".to_string()),
+                table_name: "orders_copy".to_string(),
+                columns: vec![column("user_id"), column("userName")],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                triggers: Vec::new(),
+                table_comment: None,
+                original_table_comment: None,
+                mysql_engine: None,
+                partitioned: false,
+                is_gaussdb_m_mode: false,
+                table_collation: None,
+            });
+        assert_eq!(create.warnings, Vec::<String>::new());
+        assert_eq!(
+            create.statements[0],
+            "CREATE TABLE \"APP\".orders_copy (\n  user_id NUMBER,\n  userName NUMBER\n);"
+        );
+
+        let copy = build_copy_table_data_sql(CopyTableDataSqlOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            source_name: "orders".to_string(),
+            target_name: "orders_copy".to_string(),
+            columns: Some(vec!["user_id".to_string(), "userName".to_string()]),
+            postgres_overriding_system_value: false,
+            sqlserver_identity_insert: false,
+            normalize_new_target_name: true,
+            identifier_quote: None,
+        });
+        assert_eq!(
+            copy,
+            "INSERT INTO \"APP\".orders_copy (user_id, userName) SELECT \"user_id\", \"userName\" FROM \"APP\".\"orders\";"
+        );
     }
 
     #[test]
@@ -2452,6 +2661,20 @@ mod tests {
             })
             .unwrap(),
             "ALTER VIEW \"SYSDBA\".\"ACTIVE_USERS\" RENAME TO \"ENABLED_USERS\";"
+        );
+        // OceanBase in Oracle mode accepts the same statement; without it the transfer
+        // rename-then-drop path has no way to back up a target table.
+        assert!(supports_object_rename(Some(DatabaseType::OceanbaseOracle), DatabaseObjectType::Table));
+        assert_eq!(
+            build_rename_object_sql(RenameObjectSqlOptions {
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                object_type: DatabaseObjectType::Table,
+                schema: Some("APP".to_string()),
+                old_name: "ORDERS".to_string(),
+                new_name: "ORDERS__DBX_BAK".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE \"APP\".\"ORDERS\" RENAME TO \"ORDERS__DBX_BAK\";"
         );
     }
 

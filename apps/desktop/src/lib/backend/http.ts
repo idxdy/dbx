@@ -4,6 +4,7 @@ import type {
   DatabaseConnectionInfo,
   DatabaseInfo,
   DatabaseStorageInfo,
+  XuguTablespaceInfo,
   SqlServerCompletionContext,
   SchemaInfo,
   LinkedServerInfo,
@@ -21,6 +22,7 @@ import type {
   ColumnInfo,
   SqlServerColumnMetadata,
   IndexInfo,
+  ReferenceKeyInfo,
   ForeignKeyInfo,
   TriggerInfo,
   ConstraintInfo,
@@ -46,6 +48,7 @@ import type {
   SshConfigHostEntry,
   TunnelProfile,
 } from "@/types/database";
+import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
@@ -60,6 +63,7 @@ import type {
   AiCompletionRequest,
   AiStreamChunk,
   AiConversation,
+  AiRun,
   AiModelInfo,
   DriverStoreUsage,
   DriverRuntimeSummary,
@@ -73,6 +77,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  DownloadedUpdate,
   UpdateDownloadSource,
   RedisCollectionPage,
   RedisDatabaseInfo,
@@ -81,6 +86,7 @@ import type {
   RedisStreamPage,
   RedisStreamPendingPage,
   RedisValue,
+  RedisKeysExpiryResult,
   RedisScanResult,
   RedisCommandResult,
   RedisSlowlogEntry,
@@ -116,6 +122,7 @@ import type {
   HistoryConnectionOption,
   SqlFileRequest,
   SqlFilePreview,
+  SqlFileTable,
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
@@ -125,6 +132,14 @@ import type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  MongoImportPreviewRequest,
+  MongoImportPreview,
+  MongoImportRequest,
+  MongoImportProgress,
+  MongoImportSummary,
+  MongoExportRequest,
+  MongoExportProgress,
+  MongoExportSummary,
   DatabaseBackupSnapshot,
   DatabaseExportRequest,
   ExportProgress,
@@ -145,8 +160,11 @@ import type {
   PromptTemplate,
   SshPromptResolution,
   MeilisearchIndexOverview,
+  ElasticsearchIndexMetadataKind,
+  ElasticsearchDeleteByQueryResult,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
@@ -160,6 +178,7 @@ import type {
   DataGridSaveStatementOptions,
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGrid/dataGridSql";
+import type { DmlChangePreviewSqlOptions, DmlChangePreviewSqlResult } from "@/lib/sql/dmlChangePreview";
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
 import type { BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
@@ -236,6 +255,7 @@ import type {
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
+import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 import { normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
 import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 
@@ -368,6 +388,10 @@ export async function testConnection(config: ConnectionConfig): Promise<string> 
   return post("/api/connection/test", { config });
 }
 
+export async function testSshTunnel(config: ConnectionConfig): Promise<string> {
+  return post("/api/connection/test-ssh-tunnel", { config });
+}
+
 export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
   const response = await fetch(apiUrl("/api/connection/test-info"), {
     method: "POST",
@@ -395,6 +419,20 @@ export async function saveConnectionDatabaseInfo(connectionId: string, databaseI
     connectionId,
     databaseInfo,
   });
+}
+
+export async function unlockConnectionWrites(connectionId: string, durationSecs: number): Promise<number> {
+  const state = await post<{ remainingMs: number }>("/api/connection/write-unlock", { connectionId, durationSecs });
+  return state.remainingMs;
+}
+
+export async function lockConnectionWrites(connectionId: string): Promise<void> {
+  return post("/api/connection/write-unlock/lock", { connectionId });
+}
+
+export async function connectionWriteUnlockState(connectionId: string): Promise<number> {
+  const state = await post<{ remainingMs: number }>("/api/connection/write-unlock/state", { connectionId });
+  return state.remainingMs;
 }
 
 export async function connectionFinalProxyPort(config: ConnectionConfig): Promise<number> {
@@ -739,7 +777,7 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
 }
 
-export async function deleteDatabaseBackupFiles(_paths: string[]): Promise<number> {
+export async function deleteDatabaseBackupFiles(_paths: string[], _allowedRoots: string[] = []): Promise<number> {
   throw new Error("Database backup file management is only available in the desktop app.");
 }
 
@@ -749,6 +787,10 @@ export async function isSqliteDatabaseFile(_path: string): Promise<boolean> {
 
 export async function backupSqliteDatabase(_connectionId: string, _destinationPath: string): Promise<void> {
   throw new Error("SQLite backup is only available in the desktop app.");
+}
+
+export async function restoreSqliteDatabase(_connectionId: string, _sourcePath: string): Promise<void> {
+  throw new Error("Remote SQLite restore is only available in the desktop app.");
 }
 
 export async function syncSavedSqlDirectory(_request: SavedSqlSyncRequest): Promise<void> {
@@ -772,6 +814,10 @@ export async function listDatabaseStorage(connectionId: string, databases: strin
     connection_id: connectionId,
     databases,
   });
+}
+
+export async function listXuguTablespaces(connectionId: string, database?: string): Promise<XuguTablespaceInfo[]> {
+  return get(`/api/schema/xugu/tablespaces?${qs({ connection_id: connectionId, database })}`);
 }
 
 export async function getSqlServerCompletionContext(connectionId: string, database: string): Promise<SqlServerCompletionContext> {
@@ -831,8 +877,8 @@ export async function getTableComment(_connectionId: string, _database: string, 
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
-export async function getMysqlTableAutoIncrement(_connectionId: string, _database: string, _table: string): Promise<string | null> {
-  throw new Error("MySQL AUTO_INCREMENT metadata is not available in the web backend");
+export async function getMysqlTableAutoIncrement(connectionId: string, database: string, table: string): Promise<string | null> {
+  return get(`/api/schema/mysql/auto-increment?${qs({ connection_id: connectionId, database, table })}`);
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string, tableNameFilter?: TableNameFilter): Promise<ObjectInfo[]> {
@@ -903,6 +949,10 @@ export async function listIndexes(connectionId: string, database: string, schema
 
 export async function listReferenceKeyColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<string[]> {
   return get(`/api/schema/reference-key-columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
+}
+
+export async function listReferenceKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ReferenceKeyInfo[]> {
+  return get(`/api/schema/reference-keys?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
 export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ForeignKeyInfo[]> {
@@ -1252,7 +1302,7 @@ export async function beginManualTransaction(_connectionId: string, _database: s
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
-export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number, _tableDataPreview?: boolean, _pageSize?: number, _resultSessionId?: string): Promise<QueryResult[]> {
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number, _tableDataPreview?: boolean, _pageSize?: number, _resultSessionId?: string, _classificationSql?: string): Promise<QueryResult[]> {
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
@@ -1496,6 +1546,10 @@ export async function buildDataGridCopyInsertStatement(options: DataGridCopyInse
   return result ?? undefined;
 }
 
+export async function buildDmlChangePreviewSql(options: DmlChangePreviewSqlOptions): Promise<DmlChangePreviewSqlResult> {
+  return post("/api/query/build-dml-change-preview-sql", { options });
+}
+
 export async function buildDataGridContextFilterCondition(options: DataGridContextFilterConditionOptions): Promise<string | undefined> {
   const result = await post<string | null>("/api/query/build-data-grid-context-filter-condition", { options });
   return result ?? undefined;
@@ -1590,13 +1644,16 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
       if (line.startsWith("data:")) {
         const data = line.slice(5).trim();
         if (data && data !== "[DONE]") {
+          let chunk: AiStreamChunk;
           try {
-            const chunk: AiStreamChunk = JSON.parse(data);
-            onChunk(chunk);
-            if (chunk.done) return;
+            chunk = JSON.parse(data);
           } catch {
             // skip malformed JSON
+            continue;
           }
+          if (chunk.error) throw new Error(chunk.error);
+          onChunk(chunk);
+          if (chunk.done) return;
         }
       }
     }
@@ -1687,18 +1744,23 @@ export async function aiAgentStream(
       if (line.startsWith("data:")) {
         const data = line.slice(5).trim();
         if (data && data !== "[DONE]") {
+          let parsed: unknown;
           try {
-            const parsed = JSON.parse(data);
-            if (!isAgentEvent(parsed)) {
-              console.warn("[aiAgentStream] Skipping invalid agent event:", data);
-              continue;
-            }
-            onEvent(parsed);
-            if (parsed.type === "agent_end" || parsed.type === "error") {
-              result = data;
-            }
+            parsed = JSON.parse(data);
           } catch {
             // skip malformed JSON
+            continue;
+          }
+          if (!isAgentEvent(parsed)) {
+            console.warn("[aiAgentStream] Skipping invalid agent event:", data);
+            continue;
+          }
+          onEvent(parsed);
+          if (parsed.type === "error") {
+            throw new Error(parsed.message);
+          }
+          if (parsed.type === "agent_end") {
+            result = data;
           }
         }
       }
@@ -1774,8 +1836,41 @@ export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configu
   if (!res.ok) throw await backendResponseError(res);
 }
 
+export async function loadMcpHttpServerSettings(): Promise<import("@/lib/backend/tauri").McpHttpServerSettings> {
+  return { enabled: false, host: "127.0.0.1", port: 5225, path: "/mcp", allowRemote: false, allowedHosts: [], allowedOrigins: [] };
+}
+
+export async function saveMcpHttpServerSettings(_settings: import("@/lib/backend/tauri").McpHttpServerSettings): Promise<import("@/lib/backend/tauri").McpHttpServerStatus> {
+  throw new Error("The MCP HTTP server is available only in DBX Desktop");
+}
+
+export async function mcpHttpServerStatus(): Promise<import("@/lib/backend/tauri").McpHttpServerStatus> {
+  return { enabled: false, running: false, endpoint: null, accessToken: null, lastError: null, recentLogs: [] };
+}
+
+export async function rotateMcpHttpServerToken(): Promise<import("@/lib/backend/tauri").McpHttpServerStatus> {
+  throw new Error("The MCP HTTP server is available only in DBX Desktop");
+}
+
+export async function loadWebMcpHttpStatus(): Promise<import("@/lib/backend/tauri").WebMcpHttpStatus> {
+  return get("/api/app-settings/mcp-http-status");
+}
+
 export async function loadMaxAgentTurns(): Promise<number> {
   return get("/api/app-settings/max-agent-turns");
+}
+
+export async function loadSqlFileUploadMaxBytes(): Promise<number> {
+  return get("/api/app-settings/sql-file-upload-max-bytes");
+}
+
+export async function saveSqlFileUploadMaxMb(sqlFileUploadMaxMb: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/sql-file-upload-max-bytes"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sqlFileUploadMaxMb }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
 }
 
 export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
@@ -1800,10 +1895,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
   if (!res.ok) throw await backendResponseError(res);
 }
 
-export interface OpenTabsStatePayload {
-  tabs: unknown[];
-  activeTabId: string | null;
-}
+export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 
 export async function loadEditorSettings(): Promise<unknown | null> {
   return loadBrowserAppState("editor_settings");
@@ -1811,6 +1904,28 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   await saveBrowserAppState("editor_settings", settings);
+}
+
+// Background images are desktop-only: the web backend has no local data dir.
+export interface BackgroundImageInfo {
+  storedPath: string;
+  fileName: string;
+}
+
+export async function saveBackgroundImage(_sourcePath: string): Promise<BackgroundImageInfo> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function clearBackgroundImage(_storedPath: string): Promise<void> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function readBackgroundImage(_storedPath: string): Promise<string> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function checkBackgroundImage(_storedPath: string): Promise<boolean> {
+  throw new Error("Background images are only supported in the desktop app");
 }
 
 export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> {
@@ -1821,6 +1936,10 @@ export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> 
     ? {
         tabs: payload.tabs,
         activeTabId: typeof payload.activeTabId === "string" ? payload.activeTabId : null,
+        ...(payload.groups !== undefined ? { groups: payload.groups } : {}),
+        ...(typeof payload.focusedGroupId === "string" ? { focusedGroupId: payload.focusedGroupId } : {}),
+        ...(payload.orientation === "vertical" || payload.orientation === "horizontal" ? { orientation: payload.orientation } : {}),
+        ...(Array.isArray(payload.sizes) ? { sizes: payload.sizes } : {}),
       }
     : null;
 }
@@ -1828,6 +1947,20 @@ export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> 
 export async function saveOpenTabsState(payload: OpenTabsStatePayload): Promise<void> {
   await saveBrowserAppState("open_tabs", payload);
 }
+
+export async function saveDetachedTabHandoff(_tabId: string, _handoff: DetachedTabHandoff): Promise<void> {}
+
+export async function loadDetachedTabHandoff(_tabId: string): Promise<DetachedTabHandoff | null> {
+  return null;
+}
+
+export async function listDetachedTabHandoffs(): Promise<DetachedTabHandoff[]> {
+  return [];
+}
+
+export async function deleteDetachedTabHandoff(_tabId: string): Promise<void> {}
+
+export async function approveDetachedWindowClose(): Promise<void> {}
 
 export async function loadSavedSqlEditorPositions(): Promise<unknown[] | null> {
   const value = await loadBrowserAppState("saved_sql_editor_positions");
@@ -2067,6 +2200,21 @@ export async function deleteAiConversation(id: string): Promise<void> {
   return del(`/api/ai/conversation/${id}`);
 }
 
+// Background AI runs are a Desktop-only capability in this release. Keep the
+// symbols for backend-module parity without changing Web's request-bound SSE
+// lifecycle or adding a partially functional persistence API.
+export async function saveAiRun(_run: AiRun): Promise<void> {
+  throw new Error("Background AI runs are only available in DBX Desktop");
+}
+
+export async function saveAiRunState(_conversation: AiConversation, _run: AiRun): Promise<void> {
+  throw new Error("Background AI runs are only available in DBX Desktop");
+}
+
+export async function loadAiRuns(): Promise<AiRun[]> {
+  return [];
+}
+
 // ---------------------------------------------------------------------------
 // Prompt Templates
 // ---------------------------------------------------------------------------
@@ -2115,6 +2263,10 @@ export async function executeSqlFile(request: SqlFileRequest): Promise<void> {
   return post("/api/sql-file/execute", { request });
 }
 
+export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
+  return post("/api/sql-file/tables", { filePath });
+}
+
 export async function executeSqlFiles(request: SqlFileRequest, filePaths: string[]): Promise<void> {
   return post("/api/sql-file/execute", { request, filePaths });
 }
@@ -2147,11 +2299,11 @@ export async function pendingOpenAiConfigLinks(): Promise<string[]> {
   return [];
 }
 
-export async function readExternalSqlFile(_path: string): Promise<string> {
+export async function readExternalSqlFile(_path: string, _maxSizeBytes?: number): Promise<string> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
-export async function readExternalSqlFileSnapshot(_path: string): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
+export async function readExternalSqlFileSnapshot(_path: string, _maxSizeBytes?: number): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
@@ -2163,7 +2315,7 @@ export async function writeExternalSqlFile(_path: string, _content: string, _opt
   throw new Error("Saving external SQL file paths is only available in the desktop app");
 }
 
-export async function saveExternalSqlFile(_defaultFileName: string, _content: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
+export async function saveExternalSqlFile(_defaultFileName: string, _content: string, _filterExtension?: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
   throw new Error("Saving SQL files locally is only available in the desktop app");
 }
 
@@ -2174,8 +2326,20 @@ export interface SqlFileEntry {
   children: SqlFileEntry[];
 }
 
-export async function listSqlFilesInFolder(_folderPath: string): Promise<SqlFileEntry[]> {
+export async function listSqlFilesInFolder(_folderPath: string, _fileFilter?: string): Promise<SqlFileEntry[]> {
   throw new Error("Listing SQL files in a folder is only available in the desktop app");
+}
+
+export async function createSqlFileInFolder(_rootPath: string, _directoryPath: string, _fileName: string): Promise<string> {
+  throw new Error("Managing SQL files in folders is only available in the desktop app");
+}
+
+export async function renameSqlFileInFolder(_rootPath: string, _filePath: string, _fileName: string): Promise<string> {
+  throw new Error("Managing SQL files in folders is only available in the desktop app");
+}
+
+export async function deleteSqlFileInFolder(_rootPath: string, _filePath: string): Promise<void> {
+  throw new Error("Managing SQL files in folders is only available in the desktop app");
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,11 +2477,127 @@ export async function releaseTableImportSource(sourceRef: string): Promise<boole
   return result.released;
 }
 
+export async function previewMongodbImportFile(fileOrPath: string | File | MongoImportPreviewRequest, options: Partial<MongoImportPreviewRequest> = {}): Promise<MongoImportPreview> {
+  if (typeof fileOrPath === "object" && !(fileOrPath instanceof File)) {
+    throw new Error("previewMongodbImportFile in web mode requires a File object for upload previews");
+  }
+  if (typeof fileOrPath === "string") {
+    if (!options.sourceRef) {
+      throw new Error("previewMongodbImportFile in web mode requires a File object for new uploads");
+    }
+    const res = await fetch(apiUrl("/api/mongo/import/preview-source"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceRef: options.sourceRef,
+        format: options.format,
+        parseOptions: options.parseOptions,
+        previewLimit: options.previewLimit,
+      }),
+    });
+    if (!res.ok) throw await backendResponseError(res);
+    return res.json();
+  }
+  const formData = new FormData();
+  formData.append("file", fileOrPath);
+  if (options.format) formData.append("format", options.format);
+  if (options.parseOptions) formData.append("parseOptions", JSON.stringify(options.parseOptions));
+  if (options.previewLimit != null) formData.append("previewLimit", String(options.previewLimit));
+  const res = await fetch(apiUrl("/api/mongo/import/preview"), {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return res.json();
+}
+
+export async function importMongodbFile(request: MongoImportRequest, onProgress: (progress: MongoImportProgress) => void): Promise<MongoImportSummary> {
+  const res = await fetch(apiUrl("/api/mongo/import/execute"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(apiUrl(`/api/mongo/import/progress/${request.importId}`));
+    es.onmessage = (e) => {
+      const progress: MongoImportProgress = JSON.parse(e.data);
+      onProgress(progress);
+      if (progress.status === "done") {
+        es.close();
+        resolve({
+          importId: progress.importId,
+          rowsInserted: progress.rowsInserted,
+          rowsFailed: progress.rowsFailed,
+          batchesCommitted: progress.batchesCommitted,
+          elapsedMs: progress.elapsedMs,
+        });
+      } else if (progress.status === "error" || progress.status === "cancelled") {
+        es.close();
+        reject(new Error(progress.errorMessage || "MongoDB import failed"));
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      reject(new Error("MongoDB import SSE connection failed"));
+    };
+  });
+}
+
+export async function cancelMongodbImport(importId: string): Promise<boolean> {
+  return post("/api/mongo/import/cancel", { importId });
+}
+
+export async function releaseMongodbImportSource(sourceRef: string): Promise<boolean> {
+  const result = await post<{ released: boolean }>("/api/mongo/import/source/release", { sourceRef });
+  return result.released;
+}
+
+export async function exportMongodbQuery(request: MongoExportRequest, onProgress: (progress: MongoExportProgress) => void): Promise<MongoExportSummary> {
+  const res = await fetch(apiUrl("/api/mongo/export"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(apiUrl(`/api/mongo/export/progress/${request.exportId}`));
+    es.onmessage = (e) => {
+      const progress: MongoExportProgress = JSON.parse(e.data);
+      onProgress(progress);
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
+        es.close();
+        if (progress.status === "done") {
+          const a = document.createElement("a");
+          a.href = apiUrl(`/api/mongo/export/download/${request.exportId}`);
+          a.click();
+          resolve({
+            exportId: progress.exportId,
+            documentsExported: progress.documentsRead,
+            filePath: request.filePath,
+            elapsedMs: progress.elapsedMs,
+          });
+        } else {
+          reject(new Error(progress.errorMessage || "MongoDB export failed"));
+        }
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      reject(new Error("MongoDB export SSE connection failed"));
+    };
+  });
+}
+
+export async function cancelMongodbExport(exportId: string): Promise<boolean> {
+  return post("/api/mongo/export/cancel", { exportId });
+}
+
 // ---------------------------------------------------------------------------
 // Database Export
 // ---------------------------------------------------------------------------
 
-export async function beginDatabaseBackupSnapshot(_connectionId: string, _database: string): Promise<DatabaseBackupSnapshot> {
+export async function beginDatabaseBackupSnapshot(_connectionId: string, _database: string, _exportId?: string): Promise<DatabaseBackupSnapshot> {
   throw new Error("Consistent database backup snapshots are only available in the desktop app.");
 }
 
@@ -2361,6 +2641,14 @@ function downloadDatabaseExportFile(exportId: string): void {
 
 export async function cancelDatabaseExport(exportId: string): Promise<void> {
   await post("/api/export/database/cancel", { exportId });
+}
+
+export async function clearDatabaseExportCancellation(_exportId: string): Promise<void> {
+  // The web exporter owns and clears its cancellation marker on completion.
+}
+
+export async function databaseExportDestinationNeedsConfirmation(_directory: string): Promise<boolean> {
+  throw new Error("Scheduled database backups are only available in the desktop app.");
 }
 
 export async function recordDatabaseExportDestination(_directory: string): Promise<void> {
@@ -2481,9 +2769,9 @@ export async function cancelQueryResultExport(exportId: string, executionId?: st
   });
 }
 
-export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
+export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all"): Promise<void> {
   const { formatCsv } = await import("@/lib/export/exportFormats");
-  const content = formatCsv(columns, rows as (string | number | boolean | null)[][]);
+  const content = formatCsv(columns, rows as (string | number | boolean | null)[][], csvQuoteMode);
   const fileName = filePath.split(/[\\/]/).pop() || "export.csv";
   const blob = new Blob(["\uFEFF", content], {
     type: "text/csv;charset=utf-8",
@@ -2511,7 +2799,21 @@ function downloadTextFile(filePath: string, fallbackFileName: string, content: s
   URL.revokeObjectURL(url);
 }
 
-export async function exportQueryResultXlsx(filePath: string, sheetName: string | undefined, columns: string[], columnTypes: string[], columnComments: readonly (string | null)[] | undefined, rows: readonly (readonly XlsxCellValue[])[], numericColumnRightAlign?: boolean): Promise<void> {
+export async function exportQueryResultXlsx(
+  filePath: string,
+  sheetName: string | undefined,
+  columns: string[],
+  columnTypes: string[],
+  columnComments: readonly (string | null)[] | undefined,
+  rows: readonly (readonly XlsxCellValue[])[],
+  numericColumnRightAlign?: boolean,
+  autoFilter?: boolean,
+  // Accepted for signature parity with the Tauri backend but unused: the web
+  // builder writes every cell as `inlineStr`, so a temporal value keeps the
+  // text the grid already formatted (milliseconds included) and never goes
+  // through a `numFmt` display pattern.
+  _dateTimeFormat?: string,
+): Promise<void> {
   const { buildXlsxWorkbook } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbook({
     sheetName: sheetName || "Export",
@@ -2520,6 +2822,7 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
     columnComments,
     rows,
     numericColumnRightAlign,
+    autoFilter,
   });
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
   const blob = new Blob([new Uint8Array(workbook)], {
@@ -2542,10 +2845,13 @@ export async function exportQueryResultsXlsx(
     columnComments?: readonly (string | null)[];
     rows: readonly (readonly XlsxCellValue[])[];
     numericColumnRightAlign?: boolean;
+    autoFilter?: boolean;
   }[],
+  autoFilter?: boolean,
+  _dateTimeFormat?: string,
 ): Promise<void> {
   const { buildXlsxWorkbookMulti } = await import("@/lib/export/xlsxExport");
-  const workbook = buildXlsxWorkbookMulti(worksheets);
+  const workbook = buildXlsxWorkbookMulti(autoFilter === undefined ? worksheets : worksheets.map((worksheet) => ({ ...worksheet, autoFilter })));
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
   const blob = new Blob([new Uint8Array(workbook)], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2845,6 +3151,17 @@ export async function redisHashDel(connectionId: string, db: number, keyRaw: str
   return post("/api/redis/hash-del", { connectionId, db, keyRaw, field });
 }
 
+export async function redisHashFieldUpdate(connectionId: string, db: number, keyRaw: string, oldField: string, newField: string, value: string): Promise<void> {
+  return post("/api/redis/hash-field-update", {
+    connectionId,
+    db,
+    keyRaw,
+    oldField,
+    newField,
+    value,
+  });
+}
+
 export async function redisHashFieldSetTtl(connectionId: string, db: number, keyRaw: string, field: string, ttl: number): Promise<void> {
   return post("/api/redis/hash-field-set-ttl", { connectionId, db, keyRaw, field, ttl });
 }
@@ -2930,6 +3247,14 @@ export async function redisSetExpireAt(connectionId: string, db: number, keyRaw:
   });
 }
 
+export async function redisSetKeysTtl(connectionId: string, db: number, keyRaws: string[], ttl: number): Promise<RedisKeysExpiryResult> {
+  return post("/api/redis/set-keys-ttl", { connectionId, db, keyRaws, ttl });
+}
+
+export async function redisSetKeysExpireAt(connectionId: string, db: number, keyRaws: string[], expireAt: number): Promise<RedisKeysExpiryResult> {
+  return post("/api/redis/set-keys-expire-at", { connectionId, db, keyRaws, expireAt });
+}
+
 export async function redisDeleteKeys(connectionId: string, db: number, keyRaws: string[]): Promise<number> {
   return post("/api/redis/delete-keys", { connectionId, db, keyRaws });
 }
@@ -2969,8 +3294,8 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
-  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`));
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -3843,7 +4168,7 @@ export async function mongoCloneCollection(connectionId: string, database: strin
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
-  return collections.map((c) => c.name);
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
 }
 
 /** Lists every Meilisearch index visible to the current connection credentials. */
@@ -3897,7 +4222,20 @@ export async function mongoFindOne(connectionId: string, database: string, colle
   });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, cursor?: string): Promise<DocumentQueryResult> {
+export async function documentFindDocuments(
+  connectionId: string,
+  database: string,
+  collection: string,
+  skip: number,
+  limit: number,
+  filter?: string,
+  projection?: string,
+  sort?: string,
+  collation?: string,
+  executionId?: string,
+  cursor?: string,
+  cursorPagination?: boolean,
+): Promise<DocumentQueryResult> {
   return post("/api/document-store/find-documents", {
     connectionId,
     database,
@@ -3909,6 +4247,7 @@ export async function documentFindDocuments(connectionId: string, database: stri
     sort,
     collation,
     cursor,
+    cursorPagination,
     executionId,
   });
 }
@@ -3932,6 +4271,21 @@ export async function elasticsearchCountDocuments(connectionId: string, index: s
     index,
     filter,
     executionId,
+  });
+}
+
+export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, any>> {
+  return post("/api/document-store/elasticsearch/index-metadata", {
+    connectionId,
+    index,
+    kind,
+  });
+}
+
+export async function elasticsearchDeleteAllDocuments(connectionId: string, index: string): Promise<ElasticsearchDeleteByQueryResult> {
+  return post("/api/document-store/elasticsearch/documents/delete-all", {
+    connectionId,
+    index,
   });
 }
 
@@ -4434,13 +4788,19 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion: string, _attemptId: string, _releaseNotes?: string): Promise<DownloadedUpdate> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
 
 export async function cancelUpdateDownload(): Promise<void> {}
 
-export async function installDownloadedUpdate(): Promise<void> {
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return null;
+}
+
+export async function discardDownloadedUpdate(_cacheId: string): Promise<void> {}
+
+export async function installDownloadedUpdate(_cacheId: string, _expectedVersion: string): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 
@@ -4457,6 +4817,7 @@ export async function getAppSupportInfo(): Promise<AppSupportInfo> {
     osName: navigator.platform || "web",
     osVersion: null,
     arch: "",
+    userAgent: collectBrowserSupportInfo(),
   };
 }
 

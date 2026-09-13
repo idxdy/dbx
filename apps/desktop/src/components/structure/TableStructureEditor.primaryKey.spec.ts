@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   executeQuery: vi.fn(),
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
+  previewSqliteTableStructureChange: vi.fn(),
   buildMysqlAutoIncrementSql: vi.fn(),
   updateEditorSettings: vi.fn(),
   loadObjectDdl: vi.fn(),
@@ -24,6 +25,12 @@ const mocks = vi.hoisted(() => ({
   getTablePartitionStatus: vi.fn(),
   getTableOwner: vi.fn(),
   buildTableOwnerChangeSql: vi.fn(),
+  editorSettings: {
+    structureEditorDensity: "compact",
+    sqlFormatter: {},
+    tableColumnTemplateFields: [],
+    generateSqlQuoteIdentifiers: true,
+  },
   toast: vi.fn(),
 }));
 
@@ -40,6 +47,7 @@ vi.mock("@lucide/vue", async () => {
     Copy: Icon,
     Database: Icon,
     Info: Icon,
+    Keyboard: Icon,
     KeyRound: Icon,
     ListChevronsUpDown: Icon,
     Loader2: Icon,
@@ -211,11 +219,11 @@ vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({ tableStructureRe
 vi.mock("@/stores/historyStore", () => ({ useHistoryStore: () => ({ add: vi.fn() }) }));
 vi.mock("@/stores/settingsStore", () => ({
   useSettingsStore: () => ({
-    editorSettings: { structureEditorDensity: "compact", sqlFormatter: {}, tableColumnTemplateFields: [] },
+    editorSettings: mocks.editorSettings,
     updateEditorSettings: mocks.updateEditorSettings,
   }),
 }));
-vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false } }) }));
+vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false }, themePalette: { value: "default" } }) }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql) }));
 vi.mock("@/lib/metadata/objectDdlCache", () => ({
@@ -228,6 +236,7 @@ vi.mock("@/lib/backend/api", () => ({
   executeQuery: mocks.executeQuery,
   listDataTypes: mocks.listDataTypes,
   buildTableStructureChangeSql: mocks.buildTableStructureChangeSql,
+  previewSqliteTableStructureChange: mocks.previewSqliteTableStructureChange,
   buildMysqlAutoIncrementSql: mocks.buildMysqlAutoIncrementSql,
   buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
   getTablePartitionStatus: mocks.getTablePartitionStatus,
@@ -300,7 +309,7 @@ async function mountEditor(databaseType: "sqlserver" | "postgres" | "sqlite" | "
   return root;
 }
 
-async function mountLoadingEditor(initialTab: "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl", owner = "app_user") {
+async function mountLoadingEditor(initialTab: "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl", owner = "app_user", tableComment = "") {
   mocks.connection.db_type = "postgres";
   mocks.connection.name = "postgres";
   mocks.connection.driver_label = "postgres";
@@ -308,7 +317,7 @@ async function mountLoadingEditor(initialTab: "columns" | "indexes" | "foreignKe
   mocks.listDataTypes.mockResolvedValue([]);
   mocks.buildTableStructureChangeSql.mockResolvedValue({ statements: [], warnings: [] });
   mocks.loadObjectDdl.mockResolvedValue({ ddl: "CREATE TABLE users (id bigint)", cacheStatus: "remote" });
-  mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({ value: facet === "comment" ? "" : facet === "owner" ? owner : [], cacheStatus: "remote" }));
+  mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({ value: facet === "comment" ? tableComment : facet === "owner" ? owner : [], cacheStatus: "remote" }));
 
   const root = document.createElement("div");
   document.body.append(root);
@@ -351,6 +360,8 @@ function buttonWithText(root: HTMLElement, text: string): HTMLButtonElement {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.editorSettings.generateSqlQuoteIdentifiers = true;
+  mocks.previewSqliteTableStructureChange.mockResolvedValue({ statements: [], warnings: [], schemaRevision: "sqlite-revision" });
   mocks.loadObjectDdl.mockResolvedValue({ ddl: "CREATE TABLE users (id bigint)", cacheStatus: "remote" });
   mocks.invalidateObjectDdl.mockResolvedValue(undefined);
   mocks.invalidateObjectMetadataCache.mockResolvedValue(undefined);
@@ -571,6 +582,32 @@ describe("TableStructureEditor primary key editing", () => {
     expect(buttonWithText(root, "structureEditor.apply").disabled).toBe(false);
   });
 
+  it.each([
+    ["postgres", "public"],
+    ["sqlite", "main"],
+  ] as const)("omits safe identifier quotes from generated %s SQL when quoting is disabled", async (databaseType, schema) => {
+    mocks.editorSettings.generateSqlQuoteIdentifiers = false;
+    const root = await mountEditor(databaseType);
+    mocks.buildTableStructureChangeSql.mockResolvedValueOnce({ statements: [`ALTER TABLE "${schema}"."demo_table" ADD "abc" VARCHAR(20) DEFAULT 'quoted value'`], warnings: [] });
+
+    buttonWithText(root, "structureEditor.addColumn").click();
+
+    await vi.waitFor(() => expect(root.textContent).toContain(`ALTER TABLE ${schema}.demo_table ADD abc VARCHAR(20) DEFAULT 'quoted value'`));
+    expect(root.textContent).not.toContain(`"${schema}"."demo_table"`);
+  });
+
+  it("keeps SQLite rebuild SQL aligned with the guarded apply plan", async () => {
+    mocks.editorSettings.generateSqlQuoteIdentifiers = false;
+    const root = await mountEditor("sqlite");
+    const preview = `ALTER TABLE "main"."demo_table" RENAME COLUMN "old_name" TO "new_name"`;
+    mocks.previewSqliteTableStructureChange.mockResolvedValueOnce({ statements: [preview], warnings: [], schemaRevision: "sqlite-revision" });
+
+    root.querySelector<HTMLButtonElement>('[data-searchable-select="true"]')?.click();
+
+    await vi.waitFor(() => expect(mocks.previewSqliteTableStructureChange).toHaveBeenCalled());
+    expect(root.textContent).toContain(preview);
+  });
+
   it("debounces SQL preview generation while editing a column name", async () => {
     vi.useFakeTimers();
     const root = await mountEditor("dameng");
@@ -629,6 +666,131 @@ describe("TableStructureEditor data type options", () => {
   });
 });
 
+describe("TableStructureEditor action column", () => {
+  it("moves delayed shortcut hints onto the add, copy, and delete controls", async () => {
+    const root = await mountEditor("dameng");
+
+    expect(root.textContent).not.toContain("settings.shortcutsTab");
+    expect(root.querySelector("[data-field-shortcut-hints]")).toBeNull();
+
+    const addTooltip = root.querySelector<HTMLElement>("[data-add-column-shortcut-tooltip]");
+    const copyTooltip = root.querySelector<HTMLElement>("[data-copy-column-shortcut-tooltip]");
+    const deleteTooltip = root.querySelector<HTMLElement>("[data-delete-column-shortcut-tooltip]");
+    expect(addTooltip?.getAttribute("delay-duration")).toBe("500");
+    expect(copyTooltip?.getAttribute("delay-duration")).toBe("500");
+    expect(deleteTooltip?.getAttribute("delay-duration")).toBe("500");
+    expect(root.querySelector("[data-add-column-shortcut-content]")?.textContent).toBe("Shift+Enter");
+    expect(root.querySelector("[data-copy-column-shortcut-content]")?.textContent).toBe("⌘/Ctrl+D");
+    expect(root.querySelector("[data-delete-column-shortcut-content]")?.textContent?.trim()).toBe("⌘/Ctrl+Del");
+    expect(root.querySelector("[data-add-column-shortcut-content]")?.textContent).not.toContain("structureEditor.addColumn");
+    expect(root.querySelector("[data-copy-column-shortcut-content]")?.textContent).not.toContain("structureEditor.copyColumn");
+    expect(copyTooltip?.querySelector("button")?.hasAttribute("title")).toBe(false);
+    expect(deleteTooltip?.querySelector("button")?.hasAttribute("title")).toBe(false);
+  });
+
+  it("adds a field below the focused input on Shift+Enter", async () => {
+    const root = await mountEditor("dameng");
+    const sourceInput = root.querySelector<HTMLInputElement>('[data-column-row-index="0"] [data-column-name-input]');
+    if (!sourceInput) throw new Error("Missing source column name input");
+
+    sourceInput.focus();
+    sourceInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", shiftKey: true }));
+
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull());
+    const addedInput = root.querySelector<HTMLInputElement>('[data-column-row-index="1"] [data-column-name-input]');
+    expect(addedInput?.value).toBe("");
+    expect(document.activeElement).toBe(addedInput);
+  });
+
+  it("copies the field below the focused input on Mod+D", async () => {
+    const root = await mountEditor("dameng");
+    const sourceInput = root.querySelector<HTMLInputElement>('[data-column-row-index="0"] [data-column-name-input]');
+    if (!sourceInput) throw new Error("Missing source column name input");
+
+    sourceInput.focus();
+    sourceInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "d", ctrlKey: true }));
+
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull());
+    const copiedInput = root.querySelector<HTMLInputElement>('[data-column-row-index="1"] [data-column-name-input]');
+    expect(copiedInput?.value).toBe(sourceInput.value);
+    expect(document.activeElement).toBe(copiedInput);
+  });
+
+  it.each([
+    { label: "Ctrl+Delete", event: { key: "Delete", ctrlKey: true } },
+    { label: "Cmd+Delete", event: { key: "Backspace", metaKey: true } },
+  ])("removes a focused unsaved field on $label", async ({ event }) => {
+    const root = await mountEditor("dameng");
+    buttonWithText(root, "structureEditor.addColumn").click();
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull());
+    const addedInput = root.querySelector<HTMLInputElement>('[data-column-row-index="1"] [data-column-name-input]');
+    if (!addedInput) throw new Error("Missing added column name input");
+
+    addedInput.focus();
+    addedInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...event }));
+
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).toBeNull());
+    expect(root.querySelector('[data-column-row-index="0"]')).not.toBeNull();
+  });
+
+  it("marks a focused persisted field for deletion on Mod+Delete", async () => {
+    const root = await mountEditor("dameng");
+    const sourceInput = root.querySelector<HTMLInputElement>('[data-column-row-index="0"] [data-column-name-input]');
+    if (!sourceInput) throw new Error("Missing source column name input");
+
+    sourceInput.focus();
+    sourceInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Delete", ctrlKey: true }));
+
+    await vi.waitFor(() => expect(root.querySelector('button[aria-label="structureEditor.restore"]')).not.toBeNull());
+  });
+
+  it("keeps Ctrl+Backspace available for editing field text", async () => {
+    const root = await mountEditor("dameng");
+    buttonWithText(root, "structureEditor.addColumn").click();
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull());
+    const addedInput = root.querySelector<HTMLInputElement>('[data-column-row-index="1"] [data-column-name-input]');
+    if (!addedInput) throw new Error("Missing added column name input");
+
+    addedInput.focus();
+    addedInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Backspace", ctrlKey: true }));
+
+    await nextTick();
+    expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull();
+  });
+
+  it("keeps Cmd+Backspace available for editing non-empty field text", async () => {
+    const root = await mountEditor("dameng");
+    buttonWithText(root, "structureEditor.addColumn").click();
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull());
+    const addedInput = root.querySelector<HTMLInputElement>('[data-column-row-index="1"] [data-column-name-input]');
+    if (!addedInput) throw new Error("Missing added column name input");
+
+    addedInput.value = "name";
+    addedInput.focus();
+    addedInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Backspace", metaKey: true }));
+
+    await nextTick();
+    expect(root.querySelector('[data-column-row-index="1"]')).not.toBeNull();
+  });
+
+  it("widens the ordinal indicator for a two-digit primary-key row", async () => {
+    const root = await mountEditor("dameng");
+    const addColumn = buttonWithText(root, "structureEditor.addColumn");
+    for (let index = 0; index < 9; index += 1) {
+      addColumn.click();
+      await nextTick();
+    }
+
+    const primaryKey = columnCheckbox(root, "structureEditor.primaryKey", 9);
+    primaryKey.checked = true;
+    primaryKey.dispatchEvent(new Event("change", { bubbles: true }));
+    await nextTick();
+
+    const actionIndicator = root.querySelector<HTMLElement>('[data-column-row-index="9"] td:first-child > div > div:first-child');
+    expect(Number.parseFloat(actionIndicator?.style.width ?? "0")).toBeGreaterThan(28);
+  });
+});
+
 describe("TableStructureEditor local column order notice", () => {
   it.each(["sqlserver", "postgres", "sqlite", "oracle", "dameng", "duckdb", "informix"] as const)("does not show the reorder notice when adding a %s column", async (databaseType) => {
     const root = await mountEditor(databaseType);
@@ -676,12 +838,81 @@ describe("TableStructureEditor horizontal scrolling", () => {
 });
 
 describe("TableStructureEditor metadata loading", () => {
-  it("opens the initial DDL tab while loading only the table owner", async () => {
-    await mountLoadingEditor("ddl");
+  it("opens the initial DDL tab with its always-visible table comment", async () => {
+    const root = await mountLoadingEditor("ddl", "app_user", "Application users");
 
     await vi.waitFor(() => expect(mocks.loadObjectDdl).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(mocks.loadObjectMetadataFacet).toHaveBeenCalledTimes(1));
-    expect(mocks.loadObjectMetadataFacet.mock.calls.map((call) => call[1])).toEqual(["owner"]);
+    await vi.waitFor(() => expect(mocks.loadObjectMetadataFacet).toHaveBeenCalledTimes(2));
+    expect(mocks.loadObjectMetadataFacet.mock.calls.map((call) => call[1]).sort()).toEqual(["comment", "owner"]);
+    expect(root.querySelector<HTMLInputElement>('input[placeholder="structureEditor.tableCommentPlaceholder"]')?.value).toBe("Application users");
+  });
+
+  it.each([
+    ["backfills a clean draft", "", "", "Application users"],
+    ["preserves a dirty draft", "Local edit", "Old comment", "Local edit"],
+  ])("%s when restored DDL metadata loads the table comment", async (_case, tableComment, originalTableComment, expectedComment) => {
+    mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({ value: facet === "comment" ? "Application users" : facet === "owner" ? "app_user" : [], cacheStatus: "remote" }));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      schema: "public",
+      tableName: "users",
+      draft: {
+        ...draft(),
+        activeTab: "ddl",
+        tableComment,
+        originalTableComment,
+        loadedMetadataFacets: [],
+      },
+    });
+    mountedApps.push(app);
+    app.mount(root);
+
+    const commentInput = () => root.querySelector<HTMLInputElement>('input[placeholder="structureEditor.tableCommentPlaceholder"]');
+    await vi.waitFor(() => expect(commentInput()?.value).toBe(expectedComment));
+  });
+
+  it("refreshes the SQL preview when a delayed table comment updates the restored draft baseline", async () => {
+    const commentSql = "COMMENT ON TABLE users IS 'Local edit';";
+    let resolveComment!: (result: { value: string; cacheStatus: "remote" }) => void;
+    const commentResult = new Promise<{ value: string; cacheStatus: "remote" }>((resolve) => {
+      resolveComment = resolve;
+    });
+    mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => {
+      if (facet === "comment") return commentResult;
+      return { value: facet === "owner" ? "app_user" : [], cacheStatus: "remote" };
+    });
+    mocks.buildTableStructureChangeSql.mockImplementation(async (options) => ({
+      statements: options.tableComment === options.originalTableComment ? [] : [commentSql],
+      warnings: [],
+    }));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      schema: "public",
+      tableName: "users",
+      draft: {
+        ...draft(),
+        activeTab: "ddl",
+        tableComment: "Local edit",
+        originalTableComment: "Old comment",
+        loadedMetadataFacets: [],
+      },
+    });
+    mountedApps.push(app);
+    app.mount(root);
+
+    await vi.waitFor(() => expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(expect.objectContaining({ tableComment: "Local edit", originalTableComment: "Old comment" })));
+    await vi.waitFor(() => expect(root.textContent).toContain(commentSql));
+    resolveComment({ value: "Local edit", cacheStatus: "remote" });
+    await vi.waitFor(() => expect(root.textContent).not.toContain(commentSql));
+    expect(root.textContent).toContain("structureEditor.noChanges");
   });
 
   it.each([
