@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2, Lock, Pencil, Plus, ShieldCheck, X } from "@lucide/vue";
+import { Loader2, Lock, Pencil, Plus, ShieldCheck, SquareArrowOutUpRight, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
 import { dateTimeLocalToGeneralizedTime, generalizedTimeToDateTimeLocal, getLdapEditor, isPasswordAttribute } from "@/lib/ldap/ldapEditors";
-import { getLdapAttributeType, getOptionalAttributes, getRequiredAttributes } from "@/lib/ldap/ldapSchema";
+import { getLdapAttributeType, getOptionalAttributes, getRequiredAttributes, isLdapDnAttribute, looksLikeLdapDn } from "@/lib/ldap/ldapSchema";
 import type { LdapSchemaConfig } from "@/lib/backend/http";
 import LdapObjectClassEditorDialog from "@/components/ldap/LdapObjectClassEditorDialog.vue";
 
@@ -26,6 +26,8 @@ const emit = defineEmits<{
   updated: [dn: string];
   /** Structural change (e.g. objectClass set) — parent should refetch the entry. */
   entryChanged: [dn: string];
+  /** A DN-valued cell (member/memberOf/…) requests navigation to that entry. */
+  openDn: [dn: string];
 }>();
 
 const objectClassEditorOpen = ref(false);
@@ -78,6 +80,11 @@ function attributeKind(name: string): string {
 function isSystemAttribute(name: string): boolean {
   const attr = props.schema ? getLdapAttributeType(props.schema, name) : undefined;
   return Boolean(attr && (attr.noUserModification || attr.operational));
+}
+
+/** Committed DN values (member/memberOf/…) offer a jump to the referenced entry. */
+function isDnJumpCell(row: AttributeRow, cell: ValueCell): boolean {
+  return !cell.isNew && looksLikeLdapDn(cell.committedText) && isLdapDnAttribute(row.name, props.schema);
 }
 
 function serializeValue(name: string, text: string): string {
@@ -349,6 +356,9 @@ function onObjectClassesSaved(newValues: string[]) {
         />
         <Button v-if="attributeKind(row.name) === 'password' && rowEditable(row) && !cell.isNew && !row.missing" variant="ghost" size="icon-xs" class="text-muted-foreground" :title="t('ldap.verifyPasswordTooltip')" @click="row.verifyOpen = !row.verifyOpen">
           <ShieldCheck class="size-3" />
+        </Button>
+        <Button v-if="isDnJumpCell(row, cell)" variant="ghost" size="icon-xs" class="text-muted-foreground" :title="t('ldap.openDnTooltip')" @click="emit('openDn', cell.committedText)">
+          <SquareArrowOutUpRight class="size-3" />
         </Button>
         <Button v-if="rowEditable(row) && !cell.isNew" variant="ghost" size="icon-xs" class="text-muted-foreground" :title="t('ldap.removeValue')" @click="removeCell(row, cell)">
           <X class="size-3" />

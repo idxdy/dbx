@@ -5813,6 +5813,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "所选 objectClass 不允许以下属性:{attribute}",
     writeSuccess: "LDAP 目录已更新",
     readOnly: "当前连接为只读,无法执行写操作。",
+    openDnTooltip: "跳转到该条目",
     save: "保存",
     create: "创建",
     rename: "重命名",

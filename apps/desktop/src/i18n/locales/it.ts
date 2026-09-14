@@ -5540,6 +5540,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "Attributi non consentiti dall'objectClass selezionato: {attribute}",
     writeSuccess: "Directory LDAP aggiornata",
     readOnly: "Questa connessione è di sola lettura e non può eseguire operazioni di scrittura.",
+    openDnTooltip: "Vai a questa voce",
     save: "Salva",
     create: "Crea",
     rename: "Rinomina",

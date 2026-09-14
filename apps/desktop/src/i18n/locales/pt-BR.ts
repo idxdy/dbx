@@ -5542,6 +5542,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "Atributos não permitidos pelo objectClass selecionado: {attribute}",
     writeSuccess: "Diretório LDAP atualizado",
     readOnly: "Esta conexão é somente leitura e não pode executar operações de gravação.",
+    openDnTooltip: "Ir para esta entrada",
     save: "Salvar",
     create: "Criar",
     rename: "Renomear",

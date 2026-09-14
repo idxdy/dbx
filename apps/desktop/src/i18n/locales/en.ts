@@ -5838,6 +5838,7 @@ export default {
     attributeNotAllowed: "Attributes not allowed by the selected objectClass: {attribute}",
     writeSuccess: "LDAP directory updated",
     readOnly: "This connection is read-only and cannot perform write operations.",
+    openDnTooltip: "Jump to this entry",
     save: "Save",
     create: "Create",
     rename: "Rename",

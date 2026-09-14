@@ -5680,6 +5680,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "Seçilmiş objectClass tərəfindən icazə verilməyən atributlar: {attribute}",
     writeSuccess: "LDAP kataloqu yeniləndi",
     readOnly: "Bu bağlantı salt oxunur və yazma əməliyyatları yerinə yetirə bilməz.",
+    openDnTooltip: "Bu qeydə keç",
     save: "Saxla",
     create: "Yarat",
     rename: "Yenidən adlandır",

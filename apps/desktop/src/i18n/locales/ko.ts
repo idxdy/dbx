@@ -5149,6 +5149,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "선택한 objectClass에서 허용되지 않는 속성: {attribute}",
     writeSuccess: "LDAP 디렉터리가 업데이트되었습니다",
     readOnly: "이 연결은 읽기 전용이므로 쓰기 작업을 수행할 수 없습니다.",
+    openDnTooltip: "이 항목으로 이동",
     save: "저장",
     create: "만들기",
     rename: "이름 바꾸기",

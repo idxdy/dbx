@@ -29,6 +29,27 @@ export function getLdapAttributeType(config: LdapSchemaConfig, attributeName: st
   return config.attributeTypes?.find((attr) => attr.name.toLowerCase() === key || attr.aliases.some((alias) => alias.toLowerCase() === key));
 }
 
+/**
+ * Attributes whose values hold entry DNs even when the server schema does not
+ * declare them (AD's memberOf, operational attributes, …). Memberships,
+ * references, and the DN-bearing operational/Root DSE attributes.
+ */
+const DN_ATTRIBUTE_NAME_HINTS = new Set(["member", "memberof", "uniquemember", "owner", "manager", "managedby", "seealso", "secretary", "memberurl", "distinguishedname", "aliasedobjectname", "entrydn", "creatorsname", "modifiersname", "subschemasubentry", "namingcontexts", "dynamicsubtrees"]);
+
+/** Whether values of this attribute are entry DNs (schema syntax first, known names as fallback). */
+export function isLdapDnAttribute(attributeName: string, schema?: LdapSchemaConfig | null): boolean {
+  if (schema) {
+    const attr = getLdapAttributeType(schema, attributeName);
+    if (attr) return attr.syntax === "dn";
+  }
+  return DN_ATTRIBUTE_NAME_HINTS.has(attributeName.toLowerCase());
+}
+
+/** Loose shape check for a DN value (at least one `attr=value` RDN). */
+export function looksLikeLdapDn(value: string): boolean {
+  return /[^=]+=[^=]/.test(value);
+}
+
 /** Resolve an attribute name to its schema name (alias-aware), lowercased for comparisons. */
 export function resolveAttributeName(config: LdapSchemaConfig, attributeName: string): string | undefined {
   const attr = getLdapAttributeType(config, attributeName);

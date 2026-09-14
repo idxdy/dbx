@@ -5574,6 +5574,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "Seçilen objectClass tarafından izin verilmeyen öznitelikler: {attribute}",
     writeSuccess: "LDAP dizini güncellendi",
     readOnly: "Bu bağlantı salt okunurdur ve yazma işlemleri gerçekleştiremez.",
+    openDnTooltip: "Bu girdiye git",
     save: "Kaydet",
     create: "Oluştur",
     rename: "Yeniden Adlandır",

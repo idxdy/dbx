@@ -86,7 +86,12 @@
                   <tr v-for="(value, name) in selectedResult.attributes" :key="name" class="hover:bg-muted/30">
                     <td class="px-3 py-1 font-mono text-xs whitespace-nowrap align-top">{{ name }}</td>
                     <td class="px-3 py-1 font-mono text-xs max-w-md">
-                      <span :class="{ 'cursor-pointer hover:text-primary hover:underline': isLongValue(value) }" @click="isLongValue(value) && openValuePopup(name, value)">{{ formatCellValue(value) }}</span>
+                      <template v-if="isDnAttribute(name) && dnValues(value).length > 0">
+                        <div v-for="(v, i) in dnValues(value)" :key="i">
+                          <span class="cursor-pointer text-primary hover:underline" :title="t('ldap.openDnTooltip')" @click="openDnInBrowser(v)">{{ v }}</span>
+                        </div>
+                      </template>
+                      <span v-else :class="{ 'cursor-pointer hover:text-primary hover:underline': isLongValue(value) }" @click="isLongValue(value) && openValuePopup(name, value)">{{ formatCellValue(value) }}</span>
                     </td>
                   </tr>
                 </tbody>
@@ -138,6 +143,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildGetAdObjectCommand, buildGetAdObjectIdentityCommand, buildLdapSearchByDnCommand, buildLdapSearchCommand, parseScope } from "@/lib/ldap/ldapSearchSyntax";
+import { isLdapDnAttribute, looksLikeLdapDn } from "@/lib/ldap/ldapSchema";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 
 const { t } = useI18n();
@@ -155,9 +161,8 @@ const readOnly = computed(() => Boolean((config.value as any)?.read_only));
 const showDeleteDialog = ref(false);
 const deleting = ref(false);
 
-/** Open the selected entry in the LDAP browser tab, where the inline editor lives. */
-function openSelectedInBrowser() {
-  const dn = selectedResult.value?.dn;
+/** Open the given entry in the LDAP browser tab, where the inline editor lives. */
+function openDnInBrowser(dn: string) {
   if (!dn) return;
   const existingTab = queryStore.tabs.find((tab) => tab.connectionId === props.connectionId && tab.mode === "ldap" && tab.database === dn);
   if (existingTab) {
@@ -165,6 +170,11 @@ function openSelectedInBrowser() {
   } else {
     queryStore.createTab(props.connectionId, dn, `${dn.split(",")[0] ?? dn} - ${config.value?.name || "LDAP"}`, "ldap");
   }
+}
+
+function openSelectedInBrowser() {
+  const dn = selectedResult.value?.dn;
+  if (dn) openDnInBrowser(dn);
 }
 
 async function deleteSelected() {
@@ -212,6 +222,16 @@ const popupValues = ref<string | string[]>("");
 function isLongValue(value: unknown): boolean {
   if (Array.isArray(value)) return value.length > 1 || (value.length === 1 && String(value[0]).length > 120);
   return String(value).length > 120;
+}
+
+/** DN-valued attributes (member/memberOf/…) render each value as a link. */
+function isDnAttribute(name: string): boolean {
+  return isLdapDnAttribute(name);
+}
+
+function dnValues(value: unknown): string[] {
+  const list = Array.isArray(value) ? value.map(String) : [String(value)];
+  return list.filter((v) => looksLikeLdapDn(v));
 }
 
 function formatCellValue(value: unknown): string {

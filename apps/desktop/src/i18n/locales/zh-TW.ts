@@ -4862,6 +4862,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "所選 objectClass 不允許以下屬性:{attribute}",
     writeSuccess: "LDAP 目錄已更新",
     readOnly: "目前連線為唯讀,無法執行寫入操作。",
+    openDnTooltip: "跳至該條目",
     save: "儲存",
     create: "建立",
     rename: "重新命名",

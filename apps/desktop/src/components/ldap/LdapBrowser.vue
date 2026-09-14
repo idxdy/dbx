@@ -38,7 +38,7 @@
         </div>
         <div>
           <h3 class="text-sm font-semibold mb-2">Attributes</h3>
-          <LdapEntryEditorTable :connection-id="connectionId" :entry="entryDetail" :read-only="readOnly || !entryDetail.dn" :schema="ldapConfig" @entry-changed="reloadEntryDetail" />
+          <LdapEntryEditorTable :connection-id="connectionId" :entry="entryDetail" :read-only="readOnly || !entryDetail.dn" :schema="ldapConfig" @entry-changed="reloadEntryDetail" @open-dn="navigateToDn" />
         </div>
       </div>
     </div>
@@ -147,9 +147,9 @@ function toggleOperational() {
   reloadEntryDetail();
 }
 
-function followTabDn(newDn: string) {
-  // The tab's base DN must follow the renamed entry, otherwise the panel
-  // would reload a DN that no longer exists.
+function retargetTabToDn(newDn: string) {
+  // The tab's base DN must follow the entry being shown, otherwise the panel
+  // would reload a DN that no longer matches the tab.
   const oldDn = props.baseDn;
   const tab = queryStore.tabs.find((tab) => tab.connectionId === props.connectionId && tab.mode === "ldap" && tab.database === oldDn);
   if (tab) {
@@ -160,7 +160,13 @@ function followTabDn(newDn: string) {
 }
 
 function onEntryRenamed(newDn: string) {
-  followTabDn(newDn);
+  retargetTabToDn(newDn);
+}
+
+/** Jump target of a DN-valued cell (memberOf, member, …). */
+function navigateToDn(dn: string) {
+  if (!dn) return;
+  retargetTabToDn(dn);
 }
 
 async function deleteEntry() {

@@ -5569,6 +5569,7 @@ export default withEnglishFallback({
     attributeNotAllowed: "選択した objectClass では許可されていない属性: {attribute}",
     writeSuccess: "LDAP ディレクトリを更新しました",
     readOnly: "この接続は読み取り専用のため、書き込み操作を実行できません。",
+    openDnTooltip: "このエントリへ移動",
     save: "保存",
     create: "作成",
     rename: "変更",
