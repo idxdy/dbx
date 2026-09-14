@@ -207,7 +207,7 @@ watch(
 const scope = ref("sub");
 const filter = ref("(objectClass=*)");
 const attributes = ref("");
-const sizeLimit = ref(100);
+const sizeLimit = ref(1000);
 const loading = ref(false);
 const selectedDn = ref<string>("");
 
