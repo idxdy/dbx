@@ -1306,6 +1306,7 @@ export type TreeNodeType =
   | "consul-overview"
   | "ldap-root"
   | "ldap-entry"
+  | "ldap-chunk"
   | "mongo-db"
   | "mongo-gridfs"
   | "mongo-buckets"
@@ -1392,6 +1393,8 @@ export interface TreeNode {
   };
   /** Icon filename from ldap.json objectClass definition (e.g. "ldap-person.png"). */
   ldapIcon?: string;
+  /** Real LDAP child-entry count when children are folded into ldap-chunk nodes. */
+  ldapChildCount?: number;
 }
 
 export interface CustomTypeTreeMemberMeta {

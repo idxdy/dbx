@@ -444,6 +444,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Server, colorClass: "text-blue-500" };
     case "ldap-entry":
       return resolveLdapIcon(node.ldapIcon);
+    case "ldap-chunk":
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-slate-400" };
     default:
       return { icon: Database, colorClass: "text-muted-foreground" };
   }
@@ -1645,7 +1647,7 @@ function onKeydown(event: KeyboardEvent) {
               >{{ visibleLabel(node) }}</span
             >
             <!-- LDAP entry: after expansion, show the direct-children count on the row -->
-            <span v-if="node.type === 'ldap-entry' && node.isExpanded && (node.children?.length ?? 0) > 0" class="shrink-0 text-[10px] tabular-nums text-muted-foreground">({{ node.children?.length }})</span>
+            <span v-if="node.type === 'ldap-entry' && node.isExpanded && (node.children?.length ?? 0) > 0" class="shrink-0 text-[10px] tabular-nums text-muted-foreground">({{ node.ldapChildCount ?? node.children?.length }})</span>
             <button v-if="node.type === 'oracle-db-links'" class="ml-auto rounded p-0.5 text-muted-foreground hover:bg-muted" :aria-label="t('databaseLinks.manage')" :title="t('databaseLinks.manage')" @click.stop="showDatabaseLinks = true" @dblclick.stop>
               <TableProperties class="h-3.5 w-3.5" />
             </button>

@@ -48,10 +48,20 @@
         </div>
         <div v-else-if="entries.length === 0" class="flex-1" />
         <div v-else class="flex-1 overflow-auto">
-          <div v-for="entry in entries" :key="entry.dn" class="flex items-center h-7 px-3 cursor-pointer hover:bg-accent text-sm select-none gap-1.5" :class="{ 'bg-accent': selectedDn === entry.dn }" @click="selectedDn = entry.dn">
-            <FileText class="size-3.5 text-blue-500 shrink-0" />
-            <span class="truncate text-xs">{{ entry.dn ? entry.dn.split(",")[0] : "Root DSE" }}</span>
-          </div>
+          <template v-for="(chunk, chunkIndex) in entryChunks" :key="`chunk-${chunkIndex}`">
+            <!-- Chunk fold header: every 100 results fold into one collapsible section -->
+            <div class="flex items-center h-6 px-3 cursor-pointer hover:bg-accent text-xs font-medium text-muted-foreground select-none gap-1 bg-muted/40" @click="toggleChunk(chunkIndex)">
+              <ChevronDown v-if="expandedChunks.has(chunkIndex)" class="size-3.5 shrink-0" />
+              <ChevronRight v-else class="size-3.5 shrink-0" />
+              <span class="truncate tabular-nums">{{ chunk.start + 1 }}–{{ chunk.end }} · {{ chunk.items.length }}</span>
+            </div>
+            <template v-if="expandedChunks.has(chunkIndex)">
+              <div v-for="entry in chunk.items" :key="entry.dn" class="flex items-center h-7 px-3 cursor-pointer hover:bg-accent text-sm select-none gap-1.5" :class="{ 'bg-accent': selectedDn === entry.dn }" @click="selectedDn = entry.dn">
+                <FileText class="size-3.5 text-blue-500 shrink-0" />
+                <span class="truncate text-xs">{{ entry.dn ? entry.dn.split(",")[0] : "Root DSE" }}</span>
+              </div>
+            </template>
+          </template>
         </div>
       </div>
 
@@ -133,7 +143,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
-import { Search, Loader2, FileText, FileSearch, X, Copy, ExternalLink, Trash2, RefreshCw } from "@lucide/vue";
+import { Search, Loader2, FileText, FileSearch, X, Copy, ExternalLink, Trash2, RefreshCw, ChevronDown, ChevronRight } from "@lucide/vue";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "vue-i18n";
@@ -218,6 +228,24 @@ interface SearchEntry {
 const entries = ref<SearchEntry[]>([]);
 const resultCount = computed(() => entries.value.length);
 
+/** Results fold into collapsible sections of this many rows. */
+const CHUNK_SIZE = 100;
+const entryChunks = computed(() => {
+  const chunks: { start: number; end: number; items: SearchEntry[] }[] = [];
+  for (let i = 0; i < entries.value.length; i += CHUNK_SIZE) {
+    const items = entries.value.slice(i, i + CHUNK_SIZE);
+    chunks.push({ start: i, end: i + items.length, items });
+  }
+  return chunks;
+});
+/** First chunk starts expanded; the rest fold until clicked. */
+const expandedChunks = ref<Set<number>>(new Set([0]));
+function toggleChunk(index: number) {
+  const next = new Set(expandedChunks.value);
+  if (!next.delete(index)) next.add(index);
+  expandedChunks.value = next;
+}
+
 const selectedResult = computed(() => {
   if (!selectedDn.value) return null;
   return entries.value.find((e) => e.dn === selectedDn.value) ?? null;
@@ -277,6 +305,8 @@ async function executeSearch() {
       dn: e.dn,
       attributes: e.attributes,
     }));
+    // A fresh search collapses everything after the first 100 rows.
+    expandedChunks.value = new Set([0]);
     selectedDn.value = "";
   } catch (_e: unknown) {
     entries.value = [];

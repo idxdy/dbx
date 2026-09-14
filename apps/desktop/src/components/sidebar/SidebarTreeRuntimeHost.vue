@@ -802,6 +802,15 @@ async function toggle(requestId = beginNavigationRequest()) {
     return;
   }
 
+  // LDAP chunk nodes hold prefetched entries — expansion is a pure client-side
+  // toggle. Must not fall through to the collapse path below, which may release
+  // children and leave the chunk permanently empty.
+  if (node.type === "ldap-chunk") {
+    node.isExpanded = !node.isExpanded;
+    emitNodeToggled(node, wasExpanded);
+    return;
+  }
+
   if (node.type === "type" && customTypeCapabilities(currentDatabaseType()).details && node.children !== undefined) {
     node.isExpanded = node.children.length > 0 ? !node.isExpanded : false;
     emitNodeToggled(node, wasExpanded);

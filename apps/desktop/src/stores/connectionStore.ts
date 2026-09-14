@@ -4821,6 +4821,46 @@ export const useConnectionStore = defineStore("connection", () => {
     return contexts.map((dn) => ({ dn, attributes: { namingContexts: dn } }));
   }
 
+  /** LDAP child entries fold into collapsible chunks of this many rows. */
+  const LDAP_ENTRY_CHUNK_SIZE = 100;
+
+  function ldapEntryNode(connectionId: string, entry: { dn: string; attributes: Record<string, unknown> }, ldapConfig: { objectClasses: { name: string; icon?: string }[] }): TreeNode {
+    return {
+      id: `${connectionId}:ldap:${entry.dn}`,
+      label: entry.dn.split(",")[0],
+      type: "ldap-entry" as const,
+      connectionId,
+      database: entry.dn,
+      isExpanded: false,
+      children: [],
+      ldapIcon: resolveLdapIcon(entry.attributes, ldapConfig),
+    };
+  }
+
+  /**
+   * Fold LDAP child entries: up to the chunk size they render as plain
+   * children; beyond that they are grouped into local `ldap-chunk` nodes
+   * (children prefetched — expanding a chunk is a pure client-side toggle).
+   */
+  function ldapChildNodes(connectionId: string, parentDn: string, entries: { dn: string; attributes: Record<string, unknown> }[], ldapConfig: { objectClasses: { name: string; icon?: string }[] }): TreeNode[] {
+    if (entries.length <= LDAP_ENTRY_CHUNK_SIZE) {
+      return entries.map((entry) => ldapEntryNode(connectionId, entry, ldapConfig));
+    }
+    const nodes: TreeNode[] = [];
+    for (let offset = 0; offset < entries.length; offset += LDAP_ENTRY_CHUNK_SIZE) {
+      const slice = entries.slice(offset, offset + LDAP_ENTRY_CHUNK_SIZE);
+      nodes.push({
+        id: `${connectionId}:ldap-chunk:${parentDn}:${offset}`,
+        label: `${offset + 1}–${offset + slice.length} · ${slice.length}`,
+        type: "ldap-chunk" as const,
+        connectionId,
+        isExpanded: offset === 0,
+        children: slice.map((entry) => ldapEntryNode(connectionId, entry, ldapConfig)),
+      });
+    }
+    return nodes;
+  }
+
   async function loadLdapRoot(connectionId: string) {
     const node = findConnectionNode(connectionId);
     if (!node) return;
@@ -4840,23 +4880,8 @@ export const useConnectionStore = defineStore("connection", () => {
         entries = result.entries;
       }
       const ldapConfig = await api.getLdapConfig();
-      setChildren(
-        node,
-        withSavedSqlRoot(
-          connectionId,
-          entries.map((entry) => ({
-            id: `${connectionId}:ldap:${entry.dn}`,
-            label: entry.dn.split(",")[0],
-            type: "ldap-entry" as const,
-            connectionId,
-            database: entry.dn,
-            isExpanded: false,
-            children: [],
-            ldapIcon: resolveLdapIcon(entry.attributes, ldapConfig),
-          })),
-          node,
-        ),
-      );
+      node.ldapChildCount = entries.length;
+      setChildren(node, withSavedSqlRoot(connectionId, ldapChildNodes(connectionId, baseDn, entries, ldapConfig), node));
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
@@ -4875,19 +4900,8 @@ export const useConnectionStore = defineStore("connection", () => {
     try {
       const result = await api.ldapSearch(connectionId, baseDn, "(objectClass=*)", "one", ["objectClass"]);
       const ldapConfig = await api.getLdapConfig();
-      setChildren(
-        node,
-        result.entries.map((entry) => ({
-          id: `${connectionId}:ldap:${entry.dn}`,
-          label: entry.dn.split(",")[0],
-          type: "ldap-entry" as const,
-          connectionId,
-          database: entry.dn,
-          isExpanded: false,
-          children: [],
-          ldapIcon: resolveLdapIcon(entry.attributes, ldapConfig),
-        })),
-      );
+      node.ldapChildCount = result.entries.length;
+      setChildren(node, ldapChildNodes(connectionId, baseDn, result.entries, ldapConfig));
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
