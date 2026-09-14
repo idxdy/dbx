@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const appSource = readFileSync(new URL("../../../App.vue", import.meta.url), "utf8");
 const toolbarSource = readFileSync(new URL("../../../components/layout/AppToolbar.vue", import.meta.url), "utf8");
-const tabBarSource = readFileSync(new URL("../../../components/layout/AppTabBar.vue", import.meta.url), "utf8");
+const editorGroupTabBarSource = readFileSync(new URL("../../../components/layout/EditorGroupTabBar.vue", import.meta.url), "utf8");
 const driverStoreSource = readFileSync(new URL("../../../components/config/DriverStoreDialog.vue", import.meta.url), "utf8");
 const appDialogsSource = readFileSync(new URL("../../../components/layout/AppDialogs.vue", import.meta.url), "utf8");
 const connectionDialogSource = readFileSync(new URL("../../../components/connection/ConnectionDialog.vue", import.meta.url), "utf8");
@@ -19,6 +19,7 @@ describe("plugin center integration", () => {
     // special-page surfaces; the tab bar still hosts the plugin center there.
     expect(tabBarSource).toContain('type SpecialRegularSurface = "driverStore" | "pluginCenter" | "settings";');
     expect(tabBarSource).toContain('if (keep !== "pluginCenter" && props.pluginCenterOpen)');
+    expect(editorGroupTabBarSource).toContain("data-plugin-center-tab");
   });
 
   it("keeps plugin management out of Driver Manager", () => {

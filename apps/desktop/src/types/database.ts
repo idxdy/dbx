@@ -347,6 +347,7 @@ export interface PluginFilesystemProviderContribution {
   label: string;
   schemes: string[];
   description?: string;
+  icon?: string;
   root_uri?: string;
   capabilities?: Array<"read" | "write" | "delete" | "rename" | "mkdir">;
 }
