@@ -29,7 +29,7 @@ const DEFAULT_LDAPS_PORT: u16 = 636;
 /// Hard upper bound for entries returned by a single search. Web / MCP layers
 /// clamp to the same value, so a misbehaving caller can never pull an
 /// unbounded result set from the driver.
-const MAX_LDAP_SEARCH_SIZE: i32 = 100;
+const MAX_LDAP_SEARCH_SIZE: i32 = 1000;
 
 /// Public entry point for native LDAP connections.
 pub struct LdapClient {
@@ -400,7 +400,7 @@ pub async fn search(
         scope = LdapScope::Base;
     }
     let filter = if filter.trim().is_empty() { "(objectClass=*)" } else { filter };
-    let limit = size_limit.unwrap_or(100).clamp(1, MAX_LDAP_SEARCH_SIZE);
+    let limit = size_limit.unwrap_or(1000).clamp(1, MAX_LDAP_SEARCH_SIZE);
     let timeout = timeout.unwrap_or(Duration::from_secs(DEFAULT_SEARCH_TIMEOUT_SECS));
     client.search(scope, base_dn, filter, attributes, limit, timeout).await
 }

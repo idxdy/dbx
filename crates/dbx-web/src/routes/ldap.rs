@@ -43,7 +43,7 @@ fn default_filter() -> String {
 /// request can never pull an unbounded result set. Mirrors the hard cap in
 /// the driver (`MAX_LDAP_SEARCH_SIZE`).
 fn clamp_size_limit(limit: Option<i32>) -> Option<i32> {
-    limit.map(|n| n.clamp(1, 100))
+    limit.map(|n| n.clamp(1, 1000))
 }
 
 pub async fn search(
