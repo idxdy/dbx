@@ -44,7 +44,7 @@
     </div>
 
     <!-- Write dialogs -->
-    <LdapEntryCreateDialog v-model:open="showCreateDialog" :connection-id="connectionId" :parent-dn="baseDn || ''" @created="reloadEntryDetail" />
+    <LdapEntryCreateDialog v-model:open="showCreateDialog" :connection-id="connectionId" :parent-dn="baseDn || ''" @created="onEntryCreated" />
     <LdapEntryRenameDialog v-model:open="showRenameDialog" :connection-id="connectionId" :dn="baseDn || ''" @renamed="onEntryRenamed" />
     <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="baseDn" :confirm-label="t('ldap.deleteEntry')" :loading="deleting" @confirm="deleteEntry" />
   </div>
@@ -145,6 +145,26 @@ function toggleOperational() {
   showOperational.value = !showOperational.value;
   localStorage.setItem(OPERATIONAL_TOGGLE_KEY, showOperational.value ? "1" : "0");
   reloadEntryDetail();
+}
+
+/** Refresh the sidebar tree node for this tab's DN so a newly created child shows up. */
+async function refreshSidebarLdapChildren() {
+  try {
+    const config = connectionStore.getConfig(props.connectionId) as any;
+    if ((config?.ldap_base_dn || "") === props.baseDn) {
+      await connectionStore.loadLdapRoot(props.connectionId);
+    } else if (props.baseDn) {
+      await connectionStore.loadLdapEntryChildren(props.connectionId, props.baseDn);
+    }
+  } catch (e: unknown) {
+    // Tree refresh is best-effort; the create dialog already reported success.
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  }
+}
+
+async function onEntryCreated() {
+  reloadEntryDetail();
+  await refreshSidebarLdapChildren();
 }
 
 function retargetTabToDn(newDn: string) {
