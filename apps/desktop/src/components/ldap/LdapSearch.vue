@@ -132,7 +132,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { Search, Loader2, FileText, FileSearch, X, Copy, ExternalLink, Trash2, RefreshCw } from "@lucide/vue";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -151,6 +151,8 @@ const { toast } = useToast();
 
 const props = defineProps<{
   connectionId: string;
+  /** Optional preselected base DN (e.g. opened from an entry's context menu). */
+  baseDn?: string;
 }>();
 
 const connectionStore = useConnectionStore();
@@ -194,7 +196,14 @@ async function deleteSelected() {
   }
 }
 
-const searchBaseDn = ref((config.value as any)?.ldap_base_dn ?? "");
+const searchBaseDn = ref(props.baseDn ?? (config.value as any)?.ldap_base_dn ?? "");
+// Follow the tab's base DN when it is retargeted (e.g. after a rename/jump).
+watch(
+  () => props.baseDn,
+  (dn) => {
+    if (dn != null) searchBaseDn.value = dn;
+  },
+);
 const scope = ref("sub");
 const filter = ref("(objectClass=*)");
 const attributes = ref("");

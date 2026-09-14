@@ -1899,12 +1899,20 @@ function openLdapBrowser() {
   queryStore.createTab(node.connectionId, "", tabTitle, "ldap");
 }
 
-function openLdapSearch() {
+function openLdapSearch(baseDn?: string) {
   const node = activeNode.value;
   if (!node.connectionId) return;
   const config = connectionStore.getConfig(node.connectionId);
-  const tabTitle = `${config?.name || "LDAP"} - Search`;
-  queryStore.createTab(node.connectionId, "", tabTitle, "ldap-search");
+  const tabTitle = baseDn ? `${baseDn.split(",")[0] ?? baseDn} - ${config?.name || "LDAP"} - Search` : `${config?.name || "LDAP"} - Search`;
+  queryStore.createTab(node.connectionId, baseDn ?? "", tabTitle, "ldap-search");
+}
+
+/** Open the LDAP Search tab scoped to the entry's DN (context-menu entry). */
+function openLdapSearchAtNode(node: TreeNode) {
+  if (!node.connectionId || !node.database) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const tabTitle = `${node.label} - ${config?.name || "LDAP"} - Search`;
+  queryStore.createTab(node.connectionId, node.database, tabTitle, "ldap-search");
 }
 
 async function openLdapEntryDetail() {
@@ -5989,6 +5997,11 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
         },
         icon: Pencil,
         disabled: ldapReadOnly,
+      });
+      items.push({
+        label: t("contextMenu.openLdapSearch"),
+        action: () => openLdapSearchAtNode(node),
+        icon: Search,
       });
       items.push({
         label: t("ldap.renameEntry"),

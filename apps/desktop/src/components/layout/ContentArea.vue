@@ -2470,7 +2470,7 @@ defineExpose({
     <!-- LDAP Search mode -->
     <template v-else-if="activeTab.mode === 'ldap-search'">
       <div class="flex-1 min-h-0">
-        <LdapSearch :key="activeTab.id" :connection-id="activeTab.connectionId" />
+        <LdapSearch :key="activeTab.id" :connection-id="activeTab.connectionId" :base-dn="activeTab.database" />
       </div>
     </template>
 
