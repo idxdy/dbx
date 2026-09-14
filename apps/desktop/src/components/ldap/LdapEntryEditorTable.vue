@@ -153,20 +153,9 @@ function buildRows() {
     const rank = (row: AttributeRow) => (row.locked ? 0 : row.kind === "must" ? 1 : 2);
     return rank(a) - rank(b) || a.name.localeCompare(b.name);
   });
-  // Synthesized rows for MUST attributes the entry is missing.
-  for (const name of missingMustAttributes.value) {
-    if (built.some((row) => row.name.toLowerCase() === name.toLowerCase())) continue;
-    const attr = props.schema ? getLdapAttributeType(props.schema, name) : undefined;
-    built.push({
-      name,
-      kind: "must",
-      description: attr?.description ?? "",
-      locked: false,
-      pending: false,
-      missing: true,
-      cells: [{ text: "", committedText: "", original: "", isNew: true }],
-    });
-  }
+  // Only attributes the entry actually carries are shown; schema-required
+  // (MUST) attributes that are absent are NOT synthesized as red rows —
+  // they remain available in the "Add attribute" dropdown.
   rows.value = built;
 }
 
