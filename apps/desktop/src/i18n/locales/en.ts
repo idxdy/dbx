@@ -5817,7 +5817,6 @@ export default {
     addAuxiliaryClass: "Add auxiliary class",
     removeClass: "Remove auxiliary class",
     objectClassEditorHint: "Only auxiliary classes can be added or removed; structural classes define the entry type.",
-    editEntry: "Edit",
     renameEntry: "Rename",
     deleteEntry: "Delete",
     addChildEntry: "Add Child Entry",

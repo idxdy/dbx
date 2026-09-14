@@ -4841,7 +4841,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "新增輔助類別",
     removeClass: "移除輔助類別",
     objectClassEditorHint: "僅輔助類別可增刪;結構類別決定條目類型,不可修改。",
-    editEntry: "編輯",
     renameEntry: "重新命名",
     deleteEntry: "刪除",
     addChildEntry: "新增子條目",

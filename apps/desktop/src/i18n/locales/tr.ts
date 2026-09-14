@@ -5549,7 +5549,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "Yardımcı sınıf ekle",
     removeClass: "Yardımcı sınıfı kaldır",
     objectClassEditorHint: "Yalnızca yardımcı sınıflar eklenebilir veya kaldırılabilir; yapısal sınıflar girdi türünü tanımlar.",
-    editEntry: "Düzenle",
     renameEntry: "Yeniden Adlandır",
     deleteEntry: "Sil",
     addChildEntry: "Alt Girdi Ekle",

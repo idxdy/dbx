@@ -5548,7 +5548,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "補助クラスを追加",
     removeClass: "補助クラスを削除",
     objectClassEditorHint: "追加・削除できるのは補助クラスのみです。構造クラスがエントリの種類を決めます。",
-    editEntry: "編集",
     renameEntry: "名前を変更",
     deleteEntry: "削除",
     addChildEntry: "子エントリを追加",

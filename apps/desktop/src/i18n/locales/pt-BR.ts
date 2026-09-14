@@ -5521,7 +5521,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "Adicionar classe auxiliar",
     removeClass: "Remover classe auxiliar",
     objectClassEditorHint: "Somente classes auxiliares podem ser adicionadas ou removidas; classes estruturais definem o tipo da entrada.",
-    editEntry: "Editar",
     renameEntry: "Renomear",
     deleteEntry: "Excluir",
     addChildEntry: "Adicionar entrada filha",

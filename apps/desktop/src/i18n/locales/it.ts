@@ -5519,7 +5519,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "Aggiungi classe ausiliaria",
     removeClass: "Rimuovi classe ausiliaria",
     objectClassEditorHint: "Solo le classi ausiliarie possono essere aggiunte o rimosse; le classi strutturali definiscono il tipo di voce.",
-    editEntry: "Modifica",
     renameEntry: "Rinomina",
     deleteEntry: "Elimina",
     addChildEntry: "Aggiungi voce figlia",

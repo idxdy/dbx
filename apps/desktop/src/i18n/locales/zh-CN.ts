@@ -5792,7 +5792,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "添加辅助类",
     removeClass: "移除辅助类",
     objectClassEditorHint: "仅辅助类可增删;结构类决定条目类型,不可修改。",
-    editEntry: "编辑",
     renameEntry: "重命名",
     deleteEntry: "删除",
     addChildEntry: "新增子条目",

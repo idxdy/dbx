@@ -5991,14 +5991,6 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
         disabled: ldapReadOnly,
       });
       items.push({
-        label: t("ldap.editEntry"),
-        action: () => {
-          void openLdapEntryDetail();
-        },
-        icon: Pencil,
-        disabled: ldapReadOnly,
-      });
-      items.push({
         label: t("contextMenu.openLdapSearch"),
         action: () => openLdapSearchAtNode(node),
         icon: Search,

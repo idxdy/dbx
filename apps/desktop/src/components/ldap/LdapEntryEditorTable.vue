@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2, Lock, Pencil, Plus, ShieldCheck, SquareArrowOutUpRight, X } from "@lucide/vue";
+import { Loader2, Lock, Pencil, Plus, ShieldCheck, SquareArrowOutUpRight, X, Check } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -63,6 +63,11 @@ let rowsDn = "";
 /** Authoritative attribute map for the entry under edit; updated on every commit. */
 const currentAttributes = ref<Record<string, string | string[]>>({});
 const showAddAttribute = ref(false);
+/**
+ * Attributes are view-only until the user explicitly enters edit mode
+ * (click "Edit"); "Done" leaves edit mode again.
+ */
+const editing = ref(false);
 
 function entryObjectClasses(): string[] {
   const raw = props.entry?.attributes["objectClass"];
@@ -117,6 +122,8 @@ const addableAttributes = computed<{ name: string; missing: boolean }[]>(() => {
 
 function buildRows() {
   const entry = props.entry;
+  // Navigating to a different entry starts back in view-only mode.
+  if ((entry?.dn ?? "") !== rowsDn) editing.value = false;
   rowsDn = entry?.dn ?? "";
   showAddAttribute.value = false;
   currentAttributes.value = entry ? { ...entry.attributes } : {};
@@ -166,7 +173,7 @@ function buildRows() {
 watch([() => props.entry, () => props.schema], buildRows, { immediate: true });
 
 function rowEditable(row: AttributeRow): boolean {
-  return !props.readOnly && !row.locked && !!props.entry?.dn;
+  return editing.value && !props.readOnly && !row.locked && !!props.entry?.dn;
 }
 
 async function commitAttribute(row: AttributeRow, mutateCell?: ValueCell) {
@@ -318,13 +325,18 @@ function onObjectClassesSaved(newValues: string[]) {
 
 <template>
   <div class="space-y-1.5">
+    <!-- Edit-mode toggle: attributes are view-only until "Edit" is clicked -->
+    <div v-if="entry?.dn && !readOnly" class="flex items-center justify-end gap-2 pb-1">
+      <Button v-if="!editing" variant="outline" size="sm" class="h-6 px-2 text-xs" @click="editing = true"> <Pencil class="size-3 mr-1" />{{ t("common.edit") }} </Button>
+      <Button v-else variant="default" size="sm" class="h-6 px-2 text-xs" @click="editing = false"> <Check class="size-3 mr-1" />{{ t("common.done") }} </Button>
+    </div>
     <div v-for="row in rows" :key="row.name" class="rounded border border-border/60 px-2 py-1.5 space-y-1" :class="{ 'border-destructive/50': row.kind === 'must' && row.missing }">
       <div class="flex items-center gap-2">
         <span class="w-44 shrink-0 text-xs font-mono" :class="{ 'text-muted-foreground': row.kind !== 'must' }" :title="row.description || row.name"> <span v-if="row.kind === 'must'" class="text-destructive mr-0.5">*</span>{{ row.name }} </span>
         <Badge v-if="row.kind === 'must'" variant="secondary" class="text-[10px] px-1 py-0">MUST</Badge>
         <Loader2 v-if="row.pending" class="size-3 animate-spin text-muted-foreground" />
         <template v-else-if="row.locked">
-          <Button v-if="row.name.toLowerCase() === 'objectclass' && !props.readOnly" variant="ghost" size="icon-sm" class="text-muted-foreground" :title="t('ldap.objectClassEditorTitle')" @click="objectClassEditorOpen = true">
+          <Button v-if="row.name.toLowerCase() === 'objectclass' && !props.readOnly && editing" variant="ghost" size="icon-sm" class="text-muted-foreground" :title="t('ldap.objectClassEditorTitle')" @click="objectClassEditorOpen = true">
             <Pencil class="size-3.5" />
           </Button>
           <Lock v-else class="size-3 text-muted-foreground" :title="t('ldap.objectClassLocked')" />
@@ -374,7 +386,7 @@ function onObjectClassesSaved(newValues: string[]) {
       <Button v-if="rowEditable(row)" variant="ghost" size="sm" class="h-5 px-1.5 text-xs text-muted-foreground" @click="addValueCell(row)"> <Plus class="size-3 mr-1" />{{ t("ldap.addValue") }} </Button>
     </div>
 
-    <div v-if="addableAttributes.length > 0 && !readOnly && entry?.dn" class="flex items-center gap-2 pt-1">
+    <div v-if="editing && addableAttributes.length > 0 && !readOnly && entry?.dn" class="flex items-center gap-2 pt-1">
       <Button v-if="!showAddAttribute" variant="outline" size="sm" class="h-7 px-2 text-xs" @click="showAddAttribute = true"> <Plus class="size-3 mr-1" />{{ t("ldap.addAttribute") }} </Button>
       <template v-else>
         <select class="h-7 flex-1 min-w-0 text-xs font-mono rounded-md border border-input bg-background px-2" @change="addAttributeRow(($event.target as HTMLSelectElement).value)">

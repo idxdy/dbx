@@ -5128,7 +5128,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "보조 클래스 추가",
     removeClass: "보조 클래스 제거",
     objectClassEditorHint: "보조 클래스만 추가/제거할 수 있습니다. 구조 클래스가 항목 유형을 결정합니다.",
-    editEntry: "편집",
     renameEntry: "이름 바꾸기",
     deleteEntry: "삭제",
     addChildEntry: "하위 항목 추가",

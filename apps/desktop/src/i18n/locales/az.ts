@@ -5655,7 +5655,6 @@ export default withEnglishFallback({
     addAuxiliaryClass: "Köməkçi sinif əlavə et",
     removeClass: "Köməkçi sinifi sil",
     objectClassEditorHint: "Yalnız köməkçi siniflər əlavə edilə və silinə bilər; struktural siniflər qeydin növünü müəyyən edir.",
-    editEntry: "Redaktə et",
     renameEntry: "Yenidən adlandır",
     deleteEntry: "Sil",
     addChildEntry: "Alt qeyd əlavə et",
