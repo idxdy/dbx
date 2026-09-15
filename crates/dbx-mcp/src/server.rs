@@ -9,7 +9,9 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::backend::{format_query_result, new_connection_config, parse_database_type, ConnectionSummary, DbxBackend};
+use crate::backend::{
+    format_query_result, new_connection_config_with_ldap, parse_database_type, ConnectionSummary, DbxBackend,
+};
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
 use crate::session::{McpSession, McpSessionStore};
 use dbx_core::{
@@ -167,6 +169,21 @@ pub struct AddConnectionRequest {
     pub ssl: bool,
     #[schemars(extend("type" = "string"))]
     pub driver_profile: Option<String>,
+    /// LDAP security protocol (`simple` or `gssapi`). Only used for `ldap` connections.
+    #[serde(default)]
+    pub ldap_security_protocol: String,
+    /// Kerberos principal for `gssapi` LDAP connections (e.g. `svc@REALM.COM`).
+    #[serde(default)]
+    pub ldap_principal: String,
+    /// Path to the Kerberos keytab for `gssapi` LDAP connections.
+    #[serde(default)]
+    pub ldap_keytab_path: String,
+    /// krb5.conf contents for `gssapi` LDAP connections.
+    #[serde(default)]
+    pub ldap_krb5_conf: String,
+    /// Base DN used to scope LDAP searches (e.g. `DC=corp,DC=com`).
+    #[serde(default)]
+    pub ldap_base_dn: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -258,6 +275,28 @@ pub struct SendMessageRequest {
     #[schemars(description = "RabbitMQ virtual-host namespace")]
     #[schemars(extend("type" = "string"))]
     pub namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LdapSearchRequest {
+    #[serde(flatten)]
+    pub selector: ConnectionSelector,
+    #[schemars(description = "Distinguished Name to start the search from. Empty string searches from the root DSE.")]
+    pub base_dn: String,
+    #[schemars(
+        description = "LDAP search filter (RFC 4515), e.g. `(sAMAccountName=alice)` or `(&(objectClass=user)(memberOf=CN=admins,DC=corp,DC=com))`."
+    )]
+    pub filter: String,
+    #[schemars(
+        description = "Search scope. One of `base` (single object), `one` (immediate children), or `sub` (whole subtree). Defaults to `sub`."
+    )]
+    pub scope: Option<String>,
+    #[schemars(
+        description = "Attribute names to return (e.g. `[\"cn\", \"mail\", \"memberOf\"]`). Empty/missing returns all attributes the server is willing to expose."
+    )]
+    pub attributes: Option<Vec<String>>,
+    #[schemars(description = "Maximum number of entries to return. Defaults to 100. Server-side limits still apply.")]
+    pub size_limit: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -605,7 +644,7 @@ impl DbxMcpServer {
 
     #[tool(
         name = "dbx_execute_query",
-        description = "Execute a SQL query on a database connection (max 100 rows returned)"
+        description = "Execute a SQL query on a database connection (max 100 rows returned). For backwards compatibility, multi-statement scripts and stored-procedure scripts are routed through the dialect-aware batch executor."
     )]
     async fn execute_query(&self, Parameters(request): Parameters<ExecuteQueryRequest>) -> CallToolResult {
         if let Err(error) = self.ensure_tool_allowed("dbx_execute_query").await {
@@ -623,6 +662,18 @@ impl DbxMcpServer {
                 "REDIS_COMMAND_REQUIRED",
                 "Redis connections do not accept SQL through dbx_execute_query. Use dbx_execute_redis_command.",
             );
+        }
+        if sql_requires_batch_execution(&request.sql, connection.db_type) {
+            return self
+                .execute_batch_request(ExecuteBatchQueryRequest {
+                    selector: ConnectionSelector { connection_id: Some(connection.id.clone()), connection_name: None },
+                    database: request.database.clone(),
+                    sql: request.sql.clone(),
+                    session_id: request.session_id.clone(),
+                    continue_on_error: None,
+                    use_transaction: None,
+                })
+                .await;
         }
         // Database discovery does not require a default database. In a
         // narrowed MCP scope it must never reveal names outside the allowlist,
@@ -751,6 +802,10 @@ impl DbxMcpServer {
         if let Err(error) = self.ensure_tool_allowed("dbx_execute_batch").await {
             return error;
         }
+        self.execute_batch_request(request).await
+    }
+
+    async fn execute_batch_request(&self, request: ExecuteBatchQueryRequest) -> CallToolResult {
         let resolved = match self.resolve_connection(&request.selector).await {
             Ok(resolved) => resolved,
             Err(error) => return error,
@@ -926,15 +981,11 @@ impl DbxMcpServer {
                     results[0].statement_index = None;
                 }
                 let markdown = format_batch_results(&results);
-                // Issue #7548 requires a structured array so callers do not
-                // parse concatenated text. The Markdown block stays as a human-
-                // readable summary; structuredContent carries one object per
-                // statement (or the single merged outcome in transaction mode).
+                // Issue #7548 requires structured per-statement results so callers do not
+                // parse concatenated text. MCP requires structuredContent to be an object,
+                // so the array lives under `results`.
                 let mut tool_result = CallToolResult::success(vec![ContentBlock::text(markdown)]);
-                tool_result.structured_content = Some(
-                    serde_json::to_value(&results)
-                        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
-                );
+                tool_result.structured_content = Some(serde_json::json!({ "results": results }));
                 tool_result
             }
             Err(error) => backend_tool_error("DBX_BATCH_EXECUTION_ERROR", error),
@@ -1223,6 +1274,49 @@ impl DbxMcpServer {
         }
     }
 
+    #[tool(
+        name = "dbx_execute_ldap_search",
+        description = "Run an LDAP search on an LDAP connection. Returns matching entries (DN + attributes). Use this whenever the user asks about directory contents, group membership, user attributes, or any other LDAP lookup. LDAP search is read-only."
+    )]
+    async fn execute_ldap_search(&self, Parameters(request): Parameters<LdapSearchRequest>) -> CallToolResult {
+        let resolved = match self.resolve_connection(&request.selector).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+        let connection = &resolved.connection;
+        if connection.db_type != DatabaseType::Ldap {
+            return tool_error(
+                "INVALID_CONNECTION_TYPE",
+                format!(
+                    "dbx_execute_ldap_search is only available on LDAP connections (current: {:?}).",
+                    connection.db_type
+                ),
+            );
+        }
+        let scope = request.scope.as_deref().unwrap_or("sub").trim().to_string();
+        if !matches!(scope.as_str(), "base" | "one" | "sub") {
+            return tool_error("INVALID_SCOPE", format!("`scope` must be one of base/one/sub, got {scope}"));
+        }
+        let mut arguments = json!({
+            "base_dn": request.base_dn,
+            "scope": scope,
+            "filter": request.filter,
+        });
+        if let Some(attributes) = &request.attributes {
+            let attributes = attributes.iter().filter(|value| !value.trim().is_empty()).cloned().collect::<Vec<_>>();
+            if !attributes.is_empty() {
+                arguments["attributes"] = json!(attributes);
+            }
+        }
+        if let Some(size_limit) = request.size_limit {
+            arguments["size_limit"] = json!(size_limit.clamp(1, 100));
+        }
+        let permissions = dbx_core::agent_tools::AgentSqlPermissions::default();
+        let result =
+            self.backend.execute_agent_tool(connection, "", "dbx_execute_ldap_search", arguments, permissions).await;
+        agent_result(result)
+    }
+
     #[tool(name = "dbx_get_schema_context", description = "Get compact table and column context for writing SQL")]
     async fn get_schema_context(&self, Parameters(request): Parameters<SchemaContextRequest>) -> CallToolResult {
         if let Err(error) = self.ensure_tool_allowed("dbx_get_schema_context").await {
@@ -1304,7 +1398,7 @@ impl DbxMcpServer {
             Some(port) => port,
             None => return text("Port is required for this database type."),
         };
-        let config = match new_connection_config(
+        let config = match new_connection_config_with_ldap(
             Uuid::new_v4().to_string(),
             request.name,
             db_type,
@@ -1315,6 +1409,13 @@ impl DbxMcpServer {
             request.database,
             request.ssl,
             request.driver_profile,
+            crate::backend::LdapConnectionOptions {
+                security_protocol: request.ldap_security_protocol,
+                principal: request.ldap_principal,
+                keytab_path: request.ldap_keytab_path,
+                krb5_conf: request.ldap_krb5_conf,
+                base_dn: request.ldap_base_dn,
+            },
         ) {
             Ok(config) => config,
             Err(error) => return tool_error("INVALID_CONNECTION", error),
@@ -1836,6 +1937,17 @@ fn backend_tool_error(default_code: &str, error: impl Into<String>) -> CallToolR
         }
     }
     tool_error(default_code, error)
+}
+
+/// Keep older MCP clients compatible with the original single-query tool when
+/// they send a complete SQL script. The batch executor removes client-side
+/// commands such as MySQL `DELIMITER` and preserves semicolons inside routine
+/// bodies before dispatching statements to the database.
+fn sql_requires_batch_execution(sql: &str, database_type: DatabaseType) -> bool {
+    if sql.lines().any(|line| line.trim_start().to_ascii_lowercase().starts_with("delimiter ")) {
+        return true;
+    }
+    dbx_core::sql::sql_execution_plan_for_database(sql, database_type).statements.len() > 1
 }
 
 /// Maximum rows returned per statement in a `dbx_execute_batch` call, matching
@@ -2781,9 +2893,9 @@ mod tests {
         let tools = server.tool_router.list_all();
         let names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         #[cfg(feature = "mq-admin")]
         assert!(names.contains(&"dbx_peek_messages"));
         #[cfg(not(feature = "mq-admin"))]
@@ -2800,6 +2912,7 @@ mod tests {
         assert!(names.contains(&"dbx_duplicate_connection"));
         assert!(names.contains(&"dbx_remove_connection"));
         assert!(names.contains(&"dbx_execute_redis_command"));
+        assert!(names.contains(&"dbx_execute_ldap_search"));
         assert!(names.contains(&"dbx_get_schema_context"));
         assert!(names.contains(&"dbx_open_table"));
         assert!(names.contains(&"dbx_execute_and_show"));
@@ -3033,9 +3146,9 @@ mod tests {
         );
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_duplicate_connection"));
         assert!(!names.iter().any(|name| name == "dbx_remove_connection"));
@@ -3044,6 +3157,7 @@ mod tests {
         assert!(names.iter().any(|name| name == "dbx_execute_batch"));
         assert!(names.iter().any(|name| name == "dbx_list_routines"));
         assert!(names.iter().any(|name| name == "dbx_get_routine_source"));
+        assert!(names.iter().any(|name| name == "dbx_execute_ldap_search"));
         assert!(names.iter().any(|name| name == "dbx_open_session"));
         assert!(names.iter().any(|name| name == "dbx_close_session"));
         #[cfg(feature = "mq-admin")]
@@ -4020,11 +4134,12 @@ mod tests {
             .await;
         // The human-readable block stays in content…
         assert!(result_text(&result).contains("Statement 1"));
-        // …and structuredContent carries one object per statement.
+        // …and structuredContent is a protocol-valid object carrying one result per statement.
         let structured = result.structured_content.as_ref().expect("structured content must be populated");
-        let statements = structured.as_array().expect("structured content must be an array");
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0]["statement_index"], 0);
+        assert!(structured.is_object(), "MCP structuredContent must be a JSON object");
+        let results = structured["results"].as_array().expect("results must be an array");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["statement_index"], 0);
     }
 
     #[tokio::test]
@@ -4051,6 +4166,17 @@ mod tests {
         assert!(confirmed_batch_sql_block_reason("INSERT INTO t VALUES (1)", postgres_db_type, None).is_none());
         // Unparseable SQL fails closed (treated as a write).
         assert!(confirmed_batch_sql_block_reason("NOT VALID SQL ;;;", postgres_db_type, confirmed).is_some());
+    }
+
+    #[test]
+    fn execute_query_routes_scripts_to_the_dialect_aware_batch_path() {
+        assert!(sql_requires_batch_execution("SELECT 1; SELECT 2", DatabaseType::Postgres));
+        assert!(sql_requires_batch_execution(
+            "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;",
+            DatabaseType::Mysql
+        ));
+        assert!(!sql_requires_batch_execution("SELECT 1;", DatabaseType::Mysql));
+        assert!(!sql_requires_batch_execution("SELECT 1", DatabaseType::Mysql));
     }
 
     #[test]
@@ -4132,8 +4258,8 @@ mod tests {
         assert!(result_text(&result).contains("Transaction outcome"));
         assert!(!result_text(&result).contains("Statement 1"));
         let structured = result.structured_content.as_ref().expect("structured content must be populated");
-        assert_eq!(structured[0]["merged"], true);
-        assert!(structured[0]["statement_index"].is_null());
+        assert_eq!(structured["results"][0]["merged"], true);
+        assert!(structured["results"][0]["statement_index"].is_null());
     }
 
     #[tokio::test]
@@ -4161,7 +4287,7 @@ mod tests {
         let structured = result.structured_content.as_ref().expect("structured content must be populated");
         // merged=false is skipped by serde, so the single statement must not
         // carry a merged marker (null/absent), unlike the transaction outcome.
-        assert!(structured[0]["merged"].is_null());
+        assert!(structured["results"][0]["merged"].is_null());
     }
 
     #[tokio::test]
@@ -4185,6 +4311,6 @@ mod tests {
         assert!(result_text(&result).contains("Transaction outcome"));
         assert!(!result_text(&result).contains("Statement 1"));
         let structured = result.structured_content.as_ref().expect("structured content must be populated");
-        assert_eq!(structured[0]["merged"], true);
+        assert_eq!(structured["results"][0]["merged"], true);
     }
 }

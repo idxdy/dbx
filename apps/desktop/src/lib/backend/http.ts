@@ -46,6 +46,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  LocalSshKey,
   TunnelProfile,
 } from "@/types/database";
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
@@ -531,6 +532,11 @@ export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return get("/api/ssh/config-hosts");
 }
 
+export async function listLocalSshKeys(): Promise<LocalSshKey[]> {
+  console.warn("listLocalSshKeys: local SSH key discovery is not available in the web backend");
+  return [];
+}
+
 export async function listPlugins(): Promise<InstalledPlugin[]> {
   return get("/api/plugins");
 }
@@ -580,6 +586,22 @@ export async function installPluginPackage(pathOrFile: string | File, allowUnsig
   const formData = new FormData();
   formData.append("file", blob, fileName);
   const response = await fetch(apiUrl(`/api/plugins/install?allow_unsigned=${allowUnsigned}`), { method: "POST", body: formData });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function installPluginPackageFromUrl(url: string, allowUnsigned = false): Promise<PluginInstallResult> {
+  let blob: Blob;
+  let fileName: string;
+  try {
+    fileName = new URL(url).pathname.split("/").pop() || "plugin.dbxp";
+  } catch {
+    fileName = "plugin.dbxp";
+  }
+  blob = await (await fetch(url)).blob();
+  const formData = new FormData();
+  formData.append("file", blob, fileName);
+  const response = await fetch(apiUrl(`/api/plugins/install?allow_unsigned=${allowUnsigned}&from_url=true`), { method: "POST", body: formData });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -1873,6 +1895,7 @@ export async function aiAgentStream(
   confirmedDatabase?: string,
   confirmedSchema?: string,
   signal?: AbortSignal,
+  selectedDatabases?: string[],
 ): Promise<string> {
   const res = await fetch(apiUrl("/api/ai/agent-stream"), {
     method: "POST",
@@ -1890,6 +1913,7 @@ export async function aiAgentStream(
       confirmedConnectionId,
       confirmedDatabase,
       confirmedSchema,
+      selectedDatabases,
     }),
     signal,
   });
@@ -3048,6 +3072,172 @@ export async function exportQueryResultMarkdown(filePath: string, columns: strin
 
 export async function redisListDatabases(connectionId: string): Promise<RedisDatabaseInfo[]> {
   return post("/api/redis/list-databases", { connectionId });
+}
+
+// ---------------------------------------------------------------------------
+// LDAP
+// ---------------------------------------------------------------------------
+
+export interface LdapEntry {
+  dn: string;
+  attributes: Record<string, string | string[]>;
+}
+
+export interface LdapSearchResult {
+  entries: LdapEntry[];
+  count: number;
+  truncated: boolean;
+}
+
+export async function ldapSearch(connectionId: string, baseDn: string, filter?: string, scope?: string, attributes?: string[], sizeLimit?: number): Promise<LdapSearchResult> {
+  return post("/api/ldap/search", {
+    connection_id: connectionId,
+    base_dn: baseDn,
+    scope: scope ?? "sub",
+    filter: filter ?? "(objectClass=*)",
+    attributes: attributes ?? null,
+    size_limit: sizeLimit ?? null,
+  });
+}
+
+export interface LdapModification {
+  op: "add" | "replace" | "delete";
+  attribute: string;
+  values: string[];
+}
+export interface LdapWriteResult {
+  success: boolean;
+  dn: string;
+}
+
+export async function ldapAdd(connectionId: string, dn: string, attributes: Record<string, string | string[]>): Promise<LdapWriteResult> {
+  return post("/api/ldap/add", {
+    connection_id: connectionId,
+    dn,
+    attributes,
+  });
+}
+
+export async function ldapModify(connectionId: string, dn: string, modifications: LdapModification[]): Promise<LdapWriteResult> {
+  return post("/api/ldap/modify", {
+    connection_id: connectionId,
+    dn,
+    modifications,
+  });
+}
+
+export async function ldapDelete(connectionId: string, dn: string): Promise<LdapWriteResult> {
+  return post("/api/ldap/delete", {
+    connection_id: connectionId,
+    dn,
+  });
+}
+
+export async function ldapRename(connectionId: string, dn: string, newRdn: string, deleteOldRdn?: boolean, newParentDn?: string): Promise<LdapWriteResult> {
+  return post("/api/ldap/rename", {
+    connection_id: connectionId,
+    dn,
+    new_rdn: newRdn,
+    delete_old_rdn: deleteOldRdn ?? true,
+    new_parent_dn: newParentDn ?? null,
+  });
+}
+
+export interface LdapVerifyPasswordResult {
+  verified: boolean;
+  dn: string;
+}
+
+export async function ldapVerifyPassword(connectionId: string, dn: string, password: string): Promise<LdapVerifyPasswordResult> {
+  return post("/api/ldap/verify-password", {
+    connection_id: connectionId,
+    dn,
+    password,
+  });
+}
+
+export interface LdapObjectClass {
+  name: string;
+  system: string[];
+  description: string;
+  superior: string[];
+  inheritanceChain: string[];
+  must: string[];
+  may: string[];
+  type: "STRUCTURAL" | "ABSTRACT" | "AUXILIARY";
+  icon?: string;
+  note?: string;
+}
+
+export interface LdapAttributeType {
+  name: string;
+  aliases: string[];
+  description: string;
+  syntaxOid: string;
+  syntax: "string" | "integer" | "boolean" | "generalizedTime" | "dn" | "binary" | "jpeg";
+  singleValue: boolean;
+  noUserModification: boolean;
+  operational: boolean;
+  equality: string;
+}
+
+export interface LdapSchemaConfig {
+  objectClasses: LdapObjectClass[];
+  attributeTypes?: LdapAttributeType[];
+  attributesEditor: Record<string, string>;
+  source?: "server" | "static";
+}
+
+export async function getLdapConfig(): Promise<LdapSchemaConfig> {
+  return get("/api/ldap/config");
+}
+
+export async function getLdapConfigForConnection(connectionId: string): Promise<LdapSchemaConfig> {
+  return get(`/api/ldap/config?connection_id=${encodeURIComponent(connectionId)}`);
+}
+
+export interface LdapLoginSettings {
+  enabled: boolean;
+  name: string;
+  host: string;
+  port: number;
+  useTls: boolean;
+  baseDn: string;
+  requireServiceAccount: boolean;
+  serviceAccountDn: string;
+  serviceAccountPassword: string;
+  searchFilter: string;
+  allowedGroups: string;
+  connectTimeoutSecs: number;
+}
+
+export interface LdapLoginConfigResponse extends LdapLoginSettings {
+  serviceAccountPasswordSet: boolean;
+}
+
+export async function ldapAuthLogin(username: string, password: string): Promise<void> {
+  await post("/api/auth/ldap-login", {
+    username,
+    password,
+  });
+}
+
+export async function loadLdapLoginConfig(): Promise<LdapLoginConfigResponse> {
+  return get("/api/app-settings/ldap-login");
+}
+
+export async function saveLdapLoginConfig(settings: LdapLoginSettings): Promise<void> {
+  await post("/api/app-settings/ldap-login", settings);
+}
+
+export async function testLdapLoginConfig(settings: LdapLoginSettings): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const res = await fetch(apiUrl("/api/app-settings/ldap-login/test"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  const data = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string; error?: string };
+  return { ok: res.ok && data.ok !== false, message: data.message, error: data.error };
 }
 
 export async function redisScanKeys(connectionId: string, db: number, cursor: number, pattern: string, count: number): Promise<RedisScanResult> {

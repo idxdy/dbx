@@ -3,15 +3,18 @@ use std::sync::Arc;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use dbx_core::ldap_login::LdapLoginSettings;
 use dbx_core::storage::{McpGlobalPolicy, McpGlobalPolicyState};
 use pbkdf2::pbkdf2_hmac;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::error::AppError;
-use crate::state::WebState;
+use crate::state::{LdapLoginBackend, WebState};
 
 const CONFIG_PBKDF2_ITERATIONS: u32 = 100_000;
 
@@ -184,13 +187,130 @@ fn decrypt_config_payload(payload: &EncryptedConfigPayload, passphrase: &str) ->
     String::from_utf8(plaintext).map_err(|_| "wrong_passphrase".to_string())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LdapLoginConfigResponse {
+    #[serde(flatten)]
+    pub settings: LdapLoginSettings,
+    /// Whether a service-account password is currently stored. The password
+    /// itself is never returned to the client.
+    pub service_account_password_set: bool,
+}
+
+/// Return the current LDAP login configuration (service-account password
+/// masked) so the settings page can render the form.
+pub async fn get_ldap_login_config(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<LdapLoginConfigResponse>, StatusCode> {
+    let settings = state
+        .app
+        .storage
+        .load_ldap_login_settings()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .unwrap_or_default();
+    let service_account_password_set = settings.has_service_account_password();
+    Ok(Json(LdapLoginConfigResponse { settings: settings.redacted(), service_account_password_set }))
+}
+
+/// When the client leaves the service-account password blank and one is
+/// already stored, reuse the stored password so an empty field does not wipe
+/// the configured credential.
+async fn merge_stored_service_account_password(state: &WebState, body: &mut LdapLoginSettings) {
+    if body.service_account_password.is_empty() {
+        if let Ok(Some(current)) = state.app.storage.load_ldap_login_settings().await {
+            if current.has_service_account_password() {
+                body.service_account_password = current.service_account_password;
+            }
+        }
+    }
+}
+
+/// Persist the LDAP login configuration from the settings page and reload
+/// the runtime backend. Validation happens BEFORE anything is written: an
+/// enabled-but-invalid config is rejected with 400 and must never reach the
+/// database, otherwise a restart would load a broken fail-open login config.
+/// When the client leaves the service-account password blank and one is
+/// already stored, the existing password is preserved.
+pub async fn save_ldap_login_config(
+    State(state): State<Arc<WebState>>,
+    Json(mut body): Json<LdapLoginSettings>,
+) -> Result<Response, StatusCode> {
+    merge_stored_service_account_password(&state, &mut body).await;
+    // Keep the name trimmed so the login page never renders a blank label.
+    body.name = body.name.trim().to_string();
+
+    let backend = if body.enabled {
+        match body.build_login() {
+            Ok((mode, login)) => {
+                let name = if body.name.is_empty() { "LDAP".to_string() } else { body.name.clone() };
+                Some(LdapLoginBackend { name, mode, config: Arc::new(login) })
+            }
+            Err(err) => {
+                return Ok(
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": err}))).into_response()
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    state.app.storage.save_ldap_login_settings(&body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    *state.ldap_login.write().await = backend;
+
+    Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
+}
+
+/// Validate + test the supplied LDAP login config without saving it. When the
+/// client leaves the service-account password blank and one is already stored,
+/// the stored password is used (mirroring [`save_ldap_login_config`]).
+pub async fn test_ldap_login_config(
+    State(state): State<Arc<WebState>>,
+    Json(mut body): Json<LdapLoginSettings>,
+) -> Response {
+    merge_stored_service_account_password(&state, &mut body).await;
+    match dbx_core::ldap_login::test_connection(&body).await {
+        Ok(message) => Json(serde_json::json!({"ok": true, "message": message})).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": err}))).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_config_payload, sql_file_upload_max_bytes_from_mb, EncryptedConfigPayload};
+    use super::{
+        decrypt_config_payload, save_ldap_login_config, sql_file_upload_max_bytes_from_mb, EncryptedConfigPayload,
+    };
 
     #[test]
     fn preserves_four_gib_sql_file_upload_limit() {
         assert_eq!(sql_file_upload_max_bytes_from_mb(4096), 4096_u64 * 1024 * 1024);
+    }
+    use crate::state::WebState;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::Json;
+    use dbx_core::ldap_login::LdapLoginSettings;
+    use dbx_core::storage::Storage;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn save_ldap_login_config_rejects_invalid_enabled_config_without_persisting() {
+        let dir = std::env::temp_dir().join(format!("dbx-app-settings-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let app = Arc::new(dbx_core::connection::AppState::new_with_plugin_dir(storage, dir.join("plugins")));
+        let state = Arc::new(WebState::for_tests(app, dir.clone()));
+
+        // Enabled but invalid (no host): must be rejected with 400 and never
+        // reach the database or the runtime backend.
+        let body = LdapLoginSettings { enabled: true, ..Default::default() };
+        let response = save_ldap_login_config(State(state.clone()), Json(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.app.storage.load_ldap_login_settings().await.unwrap().is_none());
+        assert!(state.ldap_login.read().await.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn exported_browser_payload() -> EncryptedConfigPayload {
