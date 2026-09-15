@@ -167,6 +167,14 @@
   ],
   "attributesEditor": {
     "objectGUID": "GuidEditor",
+    "objectSid": "SidEditor",
+    "accountExpires": "FileTimeEditor",
+    "lastLogonTimestamp": "FileTimeEditor",
+    "lastLogon": "FileTimeEditor",
+    "pwdLastSet": "FileTimeEditor",
+    "badPasswordTime": "FileTimeEditor",
+    "userAccountControl": "FlagEditor",
+    "userCertificate": "HexEditor",
     "*": "StringEditor"
   }
 }
