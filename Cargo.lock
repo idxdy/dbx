@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -2089,6 +2089,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
+ "tempfile",
  "tiberius",
  "tokio",
  "tokio-postgres",
@@ -2101,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-cli"
-version = "0.4.86"
+version = "0.4.87"
 dependencies = [
  "async-trait",
  "dbx-core",
@@ -2200,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-mcp"
-version = "0.4.86"
+version = "0.4.87"
 dependencies = [
  "async-trait",
  "axum",
@@ -2235,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",

@@ -44,3 +44,6 @@ pub mod tunnel_profiles;
 pub mod update;
 pub mod vector;
 pub mod zookeeper;
+
+#[cfg(test)]
+mod object_cache_tests;
