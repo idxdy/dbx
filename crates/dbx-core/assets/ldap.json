@@ -1,0 +1,180 @@
+{
+  "objectClasses": [
+    {
+      "name": "top",
+      "system": ["LDAP", "AD"],
+      "description": "ABSTRACT SUP",
+      "superior": [],
+      "inheritanceChain": ["top"],
+      "must": ["objectClass"],
+      "may": [],
+      "type": "ABSTRACT"
+    },
+    {
+      "name": "dcObject",
+      "system": ["LDAP"],
+      "description": "域名组件对象",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "dcObject"],
+      "must": ["dc"],
+      "may": [],
+      "type": "STRUCTURAL"
+    },
+    {
+      "name": "organization",
+      "system": ["LDAP"],
+      "description": "organization",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "organization"],
+      "must": ["o"],
+      "may": ["description", "telephoneNumber", "postalAddress"],
+      "type": "STRUCTURAL",
+      "icon": "FolderOpen"
+    },
+    {
+      "name": "organizationalUnit",
+      "system": ["LDAP"],
+      "description": "organizational unit",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "organizationalUnit"],
+      "must": ["ou"],
+      "may": ["description", "telephoneNumber", "postalAddress"],
+      "type": "STRUCTURAL",
+      "icon": "FolderOpen"
+    },
+    {
+      "name": "person",
+      "system": ["LDAP", "AD"],
+      "description": "通用人员",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "person"],
+      "must": ["cn", "sn"],
+      "may": ["description", "seeAlso", "telephoneNumber", "userPassword"],
+      "type": "STRUCTURAL",
+      "icon": "User"
+    },
+    {
+      "name": "organizationalPerson",
+      "system": ["LDAP", "AD"],
+      "description": "organizational person",
+      "superior": ["person"],
+      "inheritanceChain": ["top", "person", "organizationalPerson"],
+      "must": ["cn", "sn"],
+      "may": ["title", "departmentNumber", "description", "telephoneNumber", "userPassword"],
+      "type": "STRUCTURAL",
+      "icon": "User"
+    },
+    {
+      "name": "inetOrgPerson",
+      "system": ["LDAP"],
+      "description": "user - OpenLDAP",
+      "superior": ["organizationalPerson"],
+      "inheritanceChain": ["top", "person", "organizationalPerson", "inetOrgPerson"],
+      "must": ["cn", "sn"],
+      "may": [
+        "uid", "mail", "mobile", "title", "departmentNumber",
+        "description", "telephoneNumber", "userPassword", "employeeNumber"
+      ],
+      "type": "STRUCTURAL",
+      "icon": "User"
+    },
+    {
+      "name": "user",
+      "system": ["AD"],
+      "description": "user - Active Directory",
+      "superior": ["organizationalPerson"],
+      "inheritanceChain": ["top", "person", "organizationalPerson", "user"],
+      "must": ["cn", "sn", "sAMAccountName"],
+      "may": ["objectCategory", "userPrincipalName", "displayName", "mail", "employeeID"],
+      "type": "STRUCTURAL",
+      "note": "objectCategory 由 AD 自动填充，无需手动指定",
+      "icon": "User"
+    },
+    {
+      "name": "group",
+      "system": ["AD"],
+      "description": "group",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "group"],
+      "must": ["cn", "sAMAccountName"],
+      "may": ["member", "groupType", "objectCategory", "description"],
+      "type": "STRUCTURAL",
+      "note": "member 在创建时非必须",
+      "icon": "UsersRound"
+    },
+    {
+      "name": "computer",
+      "system": ["AD"],
+      "description": "domain computer",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "computer"],
+      "must": ["cn", "sAMAccountName"],
+      "may": ["dNSHostName", "operatingSystem", "objectCategory"],
+      "type": "STRUCTURAL"
+    },
+    {
+      "name": "groupOfNames",
+      "system": ["LDAP"],
+      "description": "通过成员 DN 标识的组",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "groupOfNames"],
+      "must": ["cn", "member"],
+      "may": ["description", "owner"],
+      "type": "STRUCTURAL",
+      "icon": "UsersRound"
+    },
+    {
+      "name": "groupOfUniqueNames",
+      "system": ["LDAP"],
+      "description": "通过唯一成员 DN 标识的组",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "groupOfUniqueNames"],
+      "must": ["cn", "uniqueMember"],
+      "may": ["description", "owner"],
+      "type": "STRUCTURAL"
+    },
+    {
+      "name": "posixAccount",
+      "system": ["LDAP"],
+      "description": "POSIX 标准用户账户，用于 Linux/Unix 集成",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "posixAccount"],
+      "must": ["cn", "uid", "uidNumber", "gidNumber", "homeDirectory"],
+      "may": ["userPassword", "loginShell"],
+      "type": "STRUCTURAL"
+    },
+    {
+      "name": "posixGroup",
+      "system": ["LDAP"],
+      "description": "POSIX 标准用户组",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "posixGroup"],
+      "must": ["cn", "gidNumber"],
+      "may": ["userPassword"],
+      "type": "STRUCTURAL",
+      "icon": "UsersRound"
+    },
+    {
+      "name": "device",
+      "system": ["LDAP"],
+      "description": "device(server, printer...)",
+      "superior": ["top"],
+      "inheritanceChain": ["top", "device"],
+      "must": ["cn"],
+      "may": ["serialNumber", "owner", "description"],
+      "type": "STRUCTURAL"
+    }
+  ],
+  "attributesEditor": {
+    "objectGUID": "GuidEditor",
+    "objectSid": "SidEditor",
+    "accountExpires": "FileTimeEditor",
+    "lastLogonTimestamp": "FileTimeEditor",
+    "lastLogon": "FileTimeEditor",
+    "pwdLastSet": "FileTimeEditor",
+    "badPasswordTime": "FileTimeEditor",
+    "userAccountControl": "FlagEditor",
+    "userCertificate": "HexEditor",
+    "*": "StringEditor"
+  }
+}

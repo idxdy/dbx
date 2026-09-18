@@ -273,6 +273,11 @@ mod tests {
             redis_key_templates: Vec::new(),
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
@@ -1409,7 +1414,10 @@ async fn test_connection_with_info_inner(
                     config.url_params.as_deref(),
                     config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
@@ -1423,7 +1431,10 @@ async fn test_connection_with_info_inner(
                     config.url_params.as_deref(),
                     config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
                 db::easysearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
@@ -1854,7 +1865,10 @@ pub async fn connect_db(
                 db_config.url_params.as_deref(),
                 db_config.external_config.as_ref(),
                 connect_timeout,
-            );
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
@@ -1867,7 +1881,10 @@ pub async fn connect_db(
                 db_config.url_params.as_deref(),
                 db_config.external_config.as_ref(),
                 connect_timeout,
-            );
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
             db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Easysearch(client)
         }
