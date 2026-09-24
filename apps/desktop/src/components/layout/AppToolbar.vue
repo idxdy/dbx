@@ -51,6 +51,7 @@ const props = defineProps<{
   hasMcpUpdateAvailable: boolean;
   hasConnections: boolean;
   hasSqlFileConnections: boolean;
+  activeConnectionDbType?: string;
 }>();
 
 const emit = defineEmits<{
@@ -77,6 +78,8 @@ const { t } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
+
+const isLdapConnection = computed(() => props.activeConnectionDbType === "ldap");
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
 const updateTooltip = computed(() => {
   if (props.hasUpdateAvailable && props.updateReady) return t("updates.restartRequiredTooltip");
@@ -562,7 +565,7 @@ const toolbarStyle = computed(() => {
       </span>
     </Button>
 
-    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')" :disabled="!hasConnections">
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')" :disabled="!hasConnections || isLdapConnection">
       <FilePlus2 class="h-3.5 w-3.5" />
       <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
     </Button>
@@ -684,7 +687,7 @@ const toolbarStyle = computed(() => {
 
       <Tooltip v-if="toolbarItems.history">
         <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('history')" variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showHistory }" @click="emit('toggle-history')">
+          <Button v-show="isRightItemVisible('history')" variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showHistory }" @click="emit('toggle-history')" :disabled="isLdapConnection">
             <History class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showHistory }" />
             <span v-if="showHistory" class="toolbar-panel-status" aria-hidden="true" />
           </Button>
