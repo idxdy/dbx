@@ -10,10 +10,16 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::state::WebState;
+use crate::state::{LdapLoginBackend, WebState};
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct LdapLoginRequest {
+    pub username: String,
     pub password: String,
 }
 
@@ -28,6 +34,12 @@ pub struct AuthCheckResponse {
     pub authenticated: bool,
     pub required: bool,
     pub setup_required: bool,
+    /// `true` when password login is disabled via the `DBX_DISABLE_PASSWORD` env var.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password_disabled: bool,
+    /// `true` when LDAP login is enabled in the app settings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ldap_enabled: bool,
 }
 
 const MAX_ATTEMPTS: u32 = 5;
@@ -146,19 +158,112 @@ pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
     Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
 }
 
+/// Whether LDAP login is enabled (a runtime backend is configured).
+async fn ldap_login_enabled(state: &Arc<WebState>) -> bool {
+    state.ldap_login.read().await.is_some()
+}
+
+/// Login with LDAP simple bind. The request authenticates against the single
+/// app-level LDAP login provider configured in the app settings.
+pub async fn ldap_login(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<LdapLoginRequest>,
+) -> Result<Response, StatusCode> {
+    if body.username.trim().is_empty() || body.password.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Rate limit (shared with the password login).
+    {
+        let rl = state.login_rate_limit.lock().await;
+        if let Some(locked_until) = rl.locked_until {
+            if locked_until > std::time::Instant::now() {
+                let remaining = (locked_until - std::time::Instant::now()).as_secs();
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": format!("Please try again in {remaining}s")})),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    let backend: LdapLoginBackend = {
+        let ldap = state.ldap_login.read().await;
+        ldap.clone().ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    match dbx_core::ldap_login::authenticate(backend.mode, &backend.config, &body.username, &body.password).await {
+        Ok(bind_dn) => {
+            let mut rl = state.login_rate_limit.lock().await;
+            rl.fail_count = 0;
+            rl.locked_until = None;
+            drop(rl);
+
+            let token = uuid::Uuid::new_v4().to_string();
+            state.sessions.write().await.insert(token.clone());
+            log::info!("LDAP login succeeded for user `{}` via `{}` (bind DN: {bind_dn})", body.username, backend.name);
+
+            let cookie = format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax", session_cookie_path(&state));
+            Ok((
+                StatusCode::OK,
+                [("set-cookie", cookie.as_str())],
+                Json(serde_json::json!({
+                    "ok": true,
+                    "mode": "ldap",
+                    "provider": backend.name,
+                    "dn": bind_dn
+                })),
+            )
+                .into_response())
+        }
+        Err(err) => {
+            log::warn!("LDAP login failed for user `{}` via `{}`: {err}", body.username, backend.name);
+            let mut rl = state.login_rate_limit.lock().await;
+            rl.fail_count += 1;
+            if rl.fail_count >= MAX_ATTEMPTS {
+                rl.locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECS));
+                rl.fail_count = 0;
+            }
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
 pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Json<AuthCheckResponse> {
-    if state.password_disabled {
-        return Json(AuthCheckResponse { authenticated: true, required: false, setup_required: false });
+    let ldap_enabled = ldap_login_enabled(&state).await;
+    let password_disabled = state.password_disabled;
+    if state.password_disabled && !ldap_enabled && !state.ldap_login_broken {
+        return Json(AuthCheckResponse {
+            authenticated: true,
+            required: false,
+            setup_required: false,
+            password_disabled,
+            ldap_enabled,
+        });
     }
     let has_password = state.password_hash.read().await.is_some();
-    if !has_password {
-        return Json(AuthCheckResponse { authenticated: false, required: false, setup_required: true });
+    if !has_password && !ldap_enabled {
+        return Json(AuthCheckResponse {
+            authenticated: false,
+            required: false,
+            setup_required: true,
+            password_disabled,
+            ldap_enabled,
+        });
     }
     let authenticated = match extract_session_token(&req) {
         Some(token) => state.sessions.read().await.contains(&token),
         None => false,
     };
-    Json(AuthCheckResponse { authenticated, required: true, setup_required: false })
+    let required = !state.password_disabled || ldap_enabled;
+    Json(AuthCheckResponse {
+        authenticated,
+        required,
+        setup_required: !has_password && !ldap_enabled,
+        password_disabled,
+        ldap_enabled,
+    })
 }
 
 pub async fn change_password(
@@ -236,11 +341,18 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    if state.password_disabled {
+    // Auth is only fully open when the password is disabled AND no LDAP login
+    // is configured (or the stored config is healthy). When LDAP is enabled
+    // it becomes the required auth method, and a *broken* enabled config
+    // must fail closed instead of silently opening anonymous access.
+    let ldap_enabled = ldap_login_enabled(&state).await;
+    if state.password_disabled && !ldap_enabled && !state.ldap_login_broken {
         return next.run(req).await;
     }
 
-    if state.password_hash.read().await.is_none() {
+    // Not set up yet: no local password AND no LDAP backend means there is no
+    // way to authenticate, so reject every API request.
+    if state.password_hash.read().await.is_none() && !ldap_enabled {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -264,7 +376,14 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{api_path_suffix, middleware_api_path_suffix};
+    use super::{api_path_suffix, auth_middleware, middleware_api_path_suffix};
+    use crate::state::WebState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::response::Response;
+    use dbx_core::connection::AppState;
+    use dbx_core::storage::Storage;
+    use std::sync::Arc;
 
     #[test]
     fn api_path_suffix_handles_root_api_paths() {
@@ -287,5 +406,39 @@ mod tests {
         assert_eq!(middleware_api_path_suffix("/api/connection/list", "/"), Some("connection/list"));
         assert_eq!(middleware_api_path_suffix("/dbx/api/connection/list", "/dbx"), Some("connection/list"));
         assert_eq!(middleware_api_path_suffix("/dbx/login", "/dbx"), None);
+    }
+
+    async fn test_web_state(ldap_login_broken: bool) -> (Arc<WebState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dbx-auth-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let app = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
+        let state =
+            Arc::new(WebState { password_disabled: true, ldap_login_broken, ..WebState::for_tests(app, dir.clone()) });
+        (state, dir)
+    }
+
+    async fn middleware_response(state: Arc<WebState>) -> Response {
+        let app = axum::Router::new()
+            .route("/api/connections", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let request = Request::builder().uri("/api/connections").body(Body::empty()).unwrap();
+        use tower::ServiceExt as _;
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn middleware_fails_closed_when_ldap_login_is_broken() {
+        // DBX_DISABLE_PASSWORD=1 with a healthy/absent LDAP config opens anonymous access...
+        let (healthy_state, healthy_dir) = test_web_state(false).await;
+        let response = middleware_response(healthy_state.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(healthy_dir);
+
+        // ...but a broken enabled LDAP config must fail closed instead.
+        let (broken_state, broken_dir) = test_web_state(true).await;
+        let response = middleware_response(broken_state.clone()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(broken_dir);
     }
 }

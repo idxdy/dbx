@@ -38,6 +38,11 @@ import {
   X,
   CircleX,
   RefreshCw,
+  User,
+  Monitor,
+  Smartphone,
+  Globe,
+  Lock,
 } from "@lucide/vue";
 import OracleDatabaseLinksDialog from "@/components/objects/OracleDatabaseLinksDialog.vue";
 const showDatabaseLinks = ref(false);
@@ -46,6 +51,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import ConnectionErrorIndicator from "@/components/connection/ConnectionErrorIndicator.vue";
 import ReadOnlySessionControl from "@/components/connection/ReadOnlySessionControl.vue";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
@@ -236,6 +242,27 @@ function currentDriverProfile(): string | undefined {
   return activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId)?.driver_profile : undefined;
 }
 
+const ldapIconMap: Record<string, any> = {
+  User,
+  FolderOpen,
+  UsersRound,
+  ShieldCheck,
+  Server,
+  Database,
+  Monitor,
+  Smartphone,
+  Globe,
+  Key,
+  Lock,
+};
+
+function resolveLdapIcon(iconName: string | undefined): { icon: any; colorClass: string } {
+  if (iconName && ldapIconMap[iconName]) {
+    return { icon: ldapIconMap[iconName], colorClass: "text-sky-400" };
+  }
+  return { icon: Database, colorClass: "text-sky-400" };
+}
+
 function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   switch (node.type) {
     case "connection":
@@ -413,6 +440,12 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Package, colorClass: "text-violet-400" };
     case "load-more":
       return { icon: Plus, colorClass: "text-primary" };
+    case "ldap-root":
+      return { icon: Server, colorClass: "text-blue-500" };
+    case "ldap-entry":
+      return resolveLdapIcon(node.ldapIcon);
+    case "ldap-chunk":
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-slate-400" };
     default:
       return { icon: Database, colorClass: "text-muted-foreground" };
   }
@@ -822,6 +855,10 @@ const canExpand = computed(() => {
   if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
     return activeNode.value.hasMembers === true;
   }
+  // LDAP entry nodes: hide expander after first expand when no children found
+  if (activeNode.value.type === "ldap-entry" && activeNode.value.isExpanded && (activeNode.value.children?.length ?? 0) === 0) {
+    return false;
+  }
   return canTreeNodeShowExpander({
     type: activeNode.value.type,
     childCount: activeNode.value.children?.length ?? 0,
@@ -964,6 +1001,13 @@ function connectionIconType(connectionId?: string) {
   const config = connectionId ? connectionStore.getConfig(connectionId) : undefined;
   return config?.driver_profile || config?.db_type || "postgres";
 }
+
+const pluginConnectionIcon = computed(() => {
+  if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return undefined;
+  const config = connectionStore.getConfig(activeNode.value.connectionId);
+  if (config?.db_type !== "plugin" || !config.plugin_id) return undefined;
+  return { pluginId: config.plugin_id, contributionId: config.plugin_connection_provider };
+});
 
 const connectionColor = computed(() => {
   const connectionId = activeNode.value.connectionId;
@@ -1570,7 +1614,8 @@ function onKeydown(event: KeyboardEvent) {
         </template>
         <span v-else class="w-3.5 h-3.5 shrink-0" />
         <span class="relative flex h-3.5 w-3.5 shrink-0" :class="{ 'overflow-visible': node.valid === false }">
-          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
+          <PluginIcon v-if="node.type === 'connection' && pluginConnectionIcon" :plugin-id="pluginConnectionIcon.pluginId" :contribution-id="pluginConnectionIcon.contributionId" class="h-3.5 w-3.5 shrink-0" />
+          <DatabaseIcon v-else-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
           <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
           <component v-else :is="getIconInfo(node)?.icon || Database" class="h-3.5 w-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
           <CircleX v-if="node.valid === false" data-invalid-object-indicator="true" class="pointer-events-none absolute -right-1 -bottom-1 h-2.5 w-2.5 rounded-full bg-background text-destructive stroke-[3]" aria-hidden="true" />
@@ -1601,6 +1646,8 @@ function onKeydown(event: KeyboardEvent) {
               ]"
               >{{ visibleLabel(node) }}</span
             >
+            <!-- LDAP entry: after expansion, show the direct-children count on the row -->
+            <span v-if="node.type === 'ldap-entry' && node.isExpanded && (node.children?.length ?? 0) > 0" class="shrink-0 text-[10px] tabular-nums text-muted-foreground">({{ node.ldapChildCount ?? node.children?.length }})</span>
             <button v-if="node.type === 'oracle-db-links'" class="ml-auto rounded p-0.5 text-muted-foreground hover:bg-muted" :aria-label="t('databaseLinks.manage')" :title="t('databaseLinks.manage')" @click.stop="showDatabaseLinks = true" @dblclick.stop>
               <TableProperties class="h-3.5 w-3.5" />
             </button>

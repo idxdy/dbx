@@ -1071,11 +1071,10 @@ async fn try_export_native_table_stream(
                 &cancelled,
                 cancel_token.clone(),
                 |row| {
-                    let formatted = crate::temporal_format::format_temporal_export_row_for_csv_cow(
+                    let formatted = crate::temporal_format::format_temporal_export_row_cow(
                         row,
                         column_types,
                         request.date_time_format.as_deref(),
-                        request.format.eq_ignore_ascii_case("csv"),
                     );
                     write_table_text_row(&mut file, true, formatted.as_ref(), &mut row_buffer, request.csv_quote_mode)?;
                     rows_exported += 1;
@@ -1681,11 +1680,10 @@ async fn export_table_data_core_inner(
                 if row_count == 0 {
                     break;
                 }
-                let formatted_rows = crate::temporal_format::format_temporal_export_rows_for_csv_cow(
+                let formatted_rows = crate::temporal_format::format_temporal_export_rows_cow(
                     &result.rows,
                     &column_types,
                     request.date_time_format.as_deref(),
-                    request.format.eq_ignore_ascii_case("csv"),
                 );
 
                 if is_first_batch {
@@ -3254,7 +3252,8 @@ mod tests {
         )
         .await;
 
-        let progress = run_external_driver_export(&fixture).await.expect("multi-page JDBC export should succeed");
+        let progress =
+            Box::pin(run_external_driver_export(&fixture)).await.expect("multi-page JDBC export should succeed");
         let csv = std::fs::read_to_string(&fixture.output).unwrap();
         assert!(csv.contains("\"1\",\"Ada\""));
         assert!(csv.contains("\"2\",\"Grace\""));
@@ -3472,7 +3471,7 @@ esac"#,
         )
         .await;
 
-        run_external_driver_export(&fixture).await.expect("legacy JDBC export should succeed");
+        Box::pin(run_external_driver_export(&fixture)).await.expect("legacy JDBC export should succeed");
         let csv = std::fs::read_to_string(&fixture.output).unwrap();
         assert_eq!(csv.matches("\"Ada\"").count(), 1);
         assert_eq!(csv.matches("\"Grace\"").count(), 1);
@@ -3502,7 +3501,7 @@ esac"#,
         )
         .await;
 
-        run_external_driver_export(&fixture).await.expect("row-limited JDBC export should succeed");
+        Box::pin(run_external_driver_export(&fixture)).await.expect("row-limited JDBC export should succeed");
         assert_eq!(std::fs::read_to_string(&fixture.calls).unwrap(), "executeQueryPage\ncloseQuerySession\n");
         assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
 
@@ -3551,7 +3550,8 @@ esac"#,
         )
         .await;
 
-        let error = run_external_driver_export(&fixture).await.expect_err("fetch errors must fail the export");
+        let error =
+            Box::pin(run_external_driver_export(&fixture)).await.expect_err("fetch errors must fail the export");
         assert!(error.starts_with("simulated fetch failure"));
         assert_eq!(
             std::fs::read_to_string(&fixture.calls).unwrap(),

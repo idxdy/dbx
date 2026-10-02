@@ -15,10 +15,11 @@ use crate::ai::{
     AiRunStatus,
 };
 use crate::connection_secrets::{
-    CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX, CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
-    MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX,
-    MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX, NACOS_AUTH_PASSWORD_KEY,
-    NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY, PLUGIN_CONNECTION_SECRET_PREFIX,
+    plugin_connection_secret_key, CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX,
+    CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY,
+    MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX,
+    NACOS_AUTH_PASSWORD_KEY, NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
+    PLUGIN_CONNECTION_SECRET_PREFIX,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{
@@ -40,6 +41,12 @@ const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
 const MCP_HTTP_SERVER_SETTINGS_KEY: &str = "mcp_http_server_settings";
 const MAX_RETRIES_KEY: &str = "max_retries";
 const SQL_FILE_UPLOAD_MAX_MB_KEY: &str = "sql_file_upload_max_mb";
+const LDAP_LOGIN_SETTINGS_KEY: &str = "ldap_login_settings";
+/// Sentinel id under which the LDAP login service-account password lives in
+/// `connection_secrets` — it is not tied to any connection and must survive
+/// the connection-secret GC.
+const LDAP_LOGIN_SECRET_ID: &str = "__ldap_login__";
+const LDAP_LOGIN_SERVICE_PASSWORD_KEY: &str = "service_account_password";
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
 const SNIPPET_SYNC_IDS_KEY: &str = "snippet_sync_ids";
@@ -1363,6 +1370,12 @@ fn scrub_nacos_auth_secrets(config: &mut ConnectionConfig) {
     }
 }
 
+fn scrub_plugin_connection_secrets(config: &mut ConnectionConfig) {
+    for secret in config.connection_secrets.values_mut() {
+        secret.clear();
+    }
+}
+
 fn scrub_cassandra_tls_secrets(config: &mut ConnectionConfig) {
     if config.db_type != DatabaseType::Cassandra {
         return;
@@ -2063,7 +2076,8 @@ impl Storage {
                 .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let dedicated_keys = [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY, SQL_FILE_UPLOAD_MAX_MB_KEY];
+            let dedicated_keys =
+                [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY, SQL_FILE_UPLOAD_MAX_MB_KEY, LDAP_LOGIN_SETTINGS_KEY];
             for key in dedicated_keys {
                 settings.remove(key);
             }
@@ -2093,6 +2107,59 @@ impl Storage {
     pub async fn load_password_hash(&self) -> Result<Option<String>, String> {
         let settings = self.load_app_settings_json().await?;
         Ok(settings.get("password_hash").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    }
+
+    pub async fn save_ldap_login_settings(
+        &self,
+        settings: &crate::ldap_login::LdapLoginSettings,
+    ) -> Result<(), String> {
+        let mut value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+        // The service-account password lives in connection_secrets, never in
+        // the app_settings JSON blob (both written in the same transaction).
+        let password = settings.service_account_password.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("serviceAccountPassword".to_string(), serde_json::Value::String(String::new()));
+        }
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let current: Option<String> = tx
+                .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let mut map = match current {
+                Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+                    .map_err(|e| format!("invalid app settings JSON: {e}"))?,
+                None => serde_json::Map::new(),
+            };
+            map.insert(LDAP_LOGIN_SETTINGS_KEY.to_string(), value);
+            let json = serde_json::Value::Object(map).to_string();
+            tx.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [json])
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
+            persist_secret_in_tx(&tx, LDAP_LOGIN_SECRET_ID, LDAP_LOGIN_SERVICE_PASSWORD_KEY, &password)?;
+            tx.commit().map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_ldap_login_settings(&self) -> Result<Option<crate::ldap_login::LdapLoginSettings>, String> {
+        let settings = self.load_app_settings_json().await?;
+        let Some(value) = settings.get(LDAP_LOGIN_SETTINGS_KEY) else {
+            return Ok(None);
+        };
+        let Ok(mut parsed) = serde_json::from_value::<crate::ldap_login::LdapLoginSettings>(value.clone()) else {
+            return Ok(None);
+        };
+        // One-time migration: versions before the secret store kept the
+        // service-account password inside the app_settings JSON. Move it over
+        // and scrub the blob.
+        if !parsed.service_account_password.is_empty() {
+            self.save_ldap_login_settings(&parsed).await?;
+            return Ok(Some(parsed));
+        }
+        parsed.service_account_password =
+            self.get_secret(LDAP_LOGIN_SECRET_ID, LDAP_LOGIN_SERVICE_PASSWORD_KEY).await?.unwrap_or_default();
+        Ok(Some(parsed))
     }
 
     pub async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicyState, String> {
@@ -3407,14 +3474,16 @@ fn delete_unreferenced_connection_secrets_in_tx(
     tx: &rusqlite::Transaction<'_>,
     retained_ids: &[String],
 ) -> Result<(), String> {
-    if retained_ids.is_empty() {
-        tx.execute("DELETE FROM connection_secrets", []).map_err(|e| e.to_string())?;
-    } else {
-        let placeholders = vec!["?"; retained_ids.len()].join(",");
-        let sql = format!("DELETE FROM connection_secrets WHERE connection_id NOT IN ({placeholders})");
-        let ids = retained_ids.iter().map(|id| id as &dyn ToSql);
-        tx.execute(&sql, params_from_iter(ids)).map_err(|e| e.to_string())?;
+    // The LDAP login service-account password is stored under a sentinel id
+    // that belongs to no connection; it must survive connection GC.
+    let mut retained_ids: Vec<String> = retained_ids.to_vec();
+    if !retained_ids.iter().any(|id| id == LDAP_LOGIN_SECRET_ID) {
+        retained_ids.push(LDAP_LOGIN_SECRET_ID.to_string());
     }
+    let placeholders = vec!["?"; retained_ids.len()].join(",");
+    let sql = format!("DELETE FROM connection_secrets WHERE connection_id NOT IN ({placeholders})");
+    let ids = retained_ids.iter().map(|id| id as &dyn ToSql);
+    tx.execute(&sql, params_from_iter(ids)).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3776,16 +3845,32 @@ impl Storage {
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
             let needs_nacos_auth_rewrite = self.hydrate_nacos_auth_secret(&id, &mut config).await?;
             let needs_cassandra_tls_rewrite = self.hydrate_cassandra_tls_secrets(&id, &mut config).await?;
+            let mut needs_plugin_secret_rewrite = false;
+            let plugin_secret_keys = config.connection_secrets.keys().cloned().collect::<Vec<_>>();
+            for key in plugin_secret_keys {
+                let storage_key = plugin_connection_secret_key(&key)?;
+                let current = config.connection_secrets.get(&key).cloned().unwrap_or_default();
+                if current.is_empty() {
+                    if let Some(secret) = self.get_secret(&id, &storage_key).await? {
+                        config.connection_secrets.insert(key, secret);
+                    }
+                } else {
+                    self.set_secret(&id, &storage_key, &current).await?;
+                    needs_plugin_secret_rewrite = true;
+                }
+            }
             let needs_external_secret_rewrite = needs_mq_auth_rewrite
                 || needs_mq_token_signing_rewrite
                 || needs_nacos_auth_rewrite
-                || needs_cassandra_tls_rewrite;
+                || needs_cassandra_tls_rewrite
+                || needs_plugin_secret_rewrite;
             if needs_external_secret_rewrite {
                 let mut sanitized = config.clone().canonicalized();
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
                 scrub_nacos_auth_secrets(&mut sanitized);
                 scrub_cassandra_tls_secrets(&mut sanitized);
+                scrub_plugin_connection_secrets(&mut sanitized);
                 let sanitized_json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
                 let update_id = id.clone();
                 self.with_conn(move |conn| {
@@ -5345,7 +5430,8 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 mod tests {
     use super::{
         maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
-        McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,
+        McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, LDAP_LOGIN_SECRET_ID,
+        LDAP_LOGIN_SERVICE_PASSWORD_KEY, LDAP_LOGIN_SETTINGS_KEY, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::ai::{
         AiActiveModelSelection, AiAssistantMode, AiChatMessage, AiChatSelectionState, AiConversation,
@@ -5353,8 +5439,9 @@ mod tests {
     };
     use crate::connection_secrets::NACOS_RNACOS_CONSOLE_PASSWORD_KEY;
     use crate::connection_secrets::{
-        CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
-        MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY, PLUGIN_CONNECTION_SECRET_PREFIX,
+        plugin_connection_secret_key, CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+        MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
+        PLUGIN_CONNECTION_SECRET_PREFIX,
     };
     use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
     use crate::models::connection::{
@@ -6084,7 +6171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_connections_moves_plugin_secrets_to_secret_table_and_restores_them() {
+    async fn save_connections_moves_plugin_secrets_to_secret_table_and_clears_removed_values() {
         let path = temp_db_path("plugin-secrets");
         let storage = Storage::open(&path).await.unwrap();
         let mut config = plain_connection("plugin", "");
@@ -6186,6 +6273,11 @@ mod tests {
             redis_key_templates: Vec::new(),
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: Some(serde_json::json!({
@@ -6260,6 +6352,11 @@ mod tests {
             redis_key_templates: Vec::new(),
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
+            ldap_security_protocol: String::new(),
+            ldap_principal: String::new(),
+            ldap_keytab_path: String::new(),
+            ldap_krb5_conf: String::new(),
+            ldap_base_dn: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: Some(serde_json::json!({
@@ -6671,6 +6768,39 @@ mod tests {
         assert_eq!(storage.get_secret("future", "password").await.unwrap().as_deref(), Some("future-secret"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn save_connections_moves_plugin_secrets_to_secret_table_and_restores_them() {
+        let path = temp_db_path("plugin-connection-secret");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = mq_connection("plugin-connection", "");
+        config.name = "Hello plugin".to_string();
+        config.db_type = DatabaseType::Plugin;
+        config.driver_profile = Some("plugin".to_string());
+        config.external_config = Some(serde_json::json!({ "greeting": "Hello" }));
+        config.plugin_id = Some("dbx.example.hello".to_string());
+        config.plugin_connection_provider = Some("hello.connection".to_string());
+        config.plugin_connection_type = Some("hello".to_string());
+        config.connection_secrets.insert("access_token".to_string(), "plugin-secret".to_string());
+
+        storage.save_connections(&[config]).await.unwrap();
+
+        let raw_json = raw_connection_json(&storage, "plugin-connection").await;
+        assert!(!raw_json.contains("plugin-secret"));
+        let persisted: ConnectionConfig = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(persisted.connection_secrets.get("access_token"), None);
+        assert_eq!(
+            storage
+                .get_secret("plugin-connection", &plugin_connection_secret_key("access_token").unwrap())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plugin-secret")
+        );
+
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(loaded[0].connection_secrets.get("access_token").map(String::as_str), Some("plugin-secret"));
     }
 
     #[tokio::test]
@@ -7537,6 +7667,121 @@ mod tests {
             vec!["conn-1".to_string(), "conn-1:db:main".to_string()]
         );
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ldap_login_settings_roundtrip_and_preserve_password_hash() {
+        let path = temp_db_path("ldap-login-settings-roundtrip");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_password_hash("hash-ldap").await.unwrap();
+        let settings = crate::ldap_login::LdapLoginSettings {
+            enabled: true,
+            name: "Corp AD".into(),
+            host: "ldap.example.com".into(),
+            port: 636,
+            use_tls: true,
+            base_dn: "DC=corp,DC=example,DC=com".into(),
+            require_service_account: true,
+            service_account_dn: "CN=svc,OU=Service,DC=corp,DC=example,DC=com".into(),
+            service_account_password: "s3cret".into(),
+            search_base: "OU=Users,DC=corp,DC=example,DC=com".into(),
+            allowed_groups: String::new(),
+            search_filter: "(sAMAccountName={user})".into(),
+            connect_timeout_secs: 12,
+        };
+        storage.save_ldap_login_settings(&settings).await.unwrap();
+
+        let loaded = storage.load_ldap_login_settings().await.unwrap().unwrap();
+        assert_eq!(loaded, settings);
+        assert!(loaded.has_service_account_password());
+        assert_eq!(loaded.redacted().service_account_password, "");
+        assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-ldap".to_string()));
+    }
+
+    fn ldap_login_test_settings() -> crate::ldap_login::LdapLoginSettings {
+        crate::ldap_login::LdapLoginSettings {
+            enabled: true,
+            name: "Corp AD".into(),
+            host: "ldap.example.com".into(),
+            port: 636,
+            use_tls: true,
+            base_dn: "DC=corp,DC=example,DC=com".into(),
+            require_service_account: true,
+            service_account_dn: "CN=svc,OU=Service,DC=corp,DC=example,DC=com".into(),
+            service_account_password: "s3cret".into(),
+            search_base: "OU=Users,DC=corp,DC=example,DC=com".into(),
+            allowed_groups: String::new(),
+            search_filter: "(sAMAccountName={user})".into(),
+            connect_timeout_secs: 12,
+        }
+    }
+
+    #[tokio::test]
+    async fn ldap_login_service_password_lives_in_secret_store_not_app_settings() {
+        let path = temp_db_path("ldap-login-secret-store");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_ldap_login_settings(&ldap_login_test_settings()).await.unwrap();
+
+        // The app_settings JSON must not contain the plaintext password.
+        let blob = storage.load_app_settings_json().await.unwrap();
+        let ldap_json = blob.get(LDAP_LOGIN_SETTINGS_KEY).cloned().unwrap_or(serde_json::Value::Null).to_string();
+        assert!(!ldap_json.contains("s3cret"), "password leaked into app_settings: {ldap_json}");
+
+        // The secret store holds it, and load hydrates it back.
+        assert_eq!(
+            storage.get_secret(LDAP_LOGIN_SECRET_ID, LDAP_LOGIN_SERVICE_PASSWORD_KEY).await.unwrap(),
+            Some("s3cret".to_string())
+        );
+        let loaded = storage.load_ldap_login_settings().await.unwrap().unwrap();
+        assert_eq!(loaded.service_account_password, "s3cret");
+        assert!(loaded.has_service_account_password());
+    }
+
+    #[tokio::test]
+    async fn ldap_login_service_password_migrates_from_legacy_plaintext_json() {
+        let path = temp_db_path("ldap-login-secret-migration");
+        let storage = Storage::open(&path).await.unwrap();
+
+        // Simulate the pre-secret-store layout: plaintext password in app_settings.
+        let legacy = serde_json::json!({
+            LDAP_LOGIN_SETTINGS_KEY: serde_json::to_value(ldap_login_test_settings()).unwrap(),
+        });
+        let legacy_json = legacy.to_string();
+        storage
+            .with_conn(move |conn| {
+                conn.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [legacy_json])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+
+        let loaded = storage.load_ldap_login_settings().await.unwrap().unwrap();
+        assert_eq!(loaded.service_account_password, "s3cret");
+
+        // Migration must have scrubbed the JSON and populated the secret store.
+        let blob = storage.load_app_settings_json().await.unwrap();
+        let ldap_json = blob.get(LDAP_LOGIN_SETTINGS_KEY).cloned().unwrap_or(serde_json::Value::Null).to_string();
+        assert!(!ldap_json.contains("s3cret"), "legacy password not scrubbed: {ldap_json}");
+        assert_eq!(
+            storage.get_secret(LDAP_LOGIN_SECRET_ID, LDAP_LOGIN_SERVICE_PASSWORD_KEY).await.unwrap(),
+            Some("s3cret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ldap_login_secret_survives_connection_gc() {
+        let path = temp_db_path("ldap-login-secret-gc");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_ldap_login_settings(&ldap_login_test_settings()).await.unwrap();
+        // Wipe every connection (and its secrets) — the sentinel must survive.
+        storage.save_connection_metadata_preserving_secrets(&[]).await.unwrap();
+
+        let loaded = storage.load_ldap_login_settings().await.unwrap().unwrap();
+        assert_eq!(loaded.service_account_password, "s3cret");
     }
 
     #[tokio::test]

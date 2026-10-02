@@ -10,6 +10,7 @@ import { useToast } from "@/composables/useToast";
 import type { ObjectSourceKind, QueryTab, TableInfo, TableNameFilter, TreeNode, TreeNodeType } from "@/types/database";
 import type { ElasticsearchIndexMetadataKind } from "@/lib/backend/tauri";
 import {
+  filterLocallySearchedTables,
   createSidebarSearchSubtreePreserver,
   filterSidebarSearchRootsByConnectionState,
   filterSidebarTree,
@@ -18,15 +19,14 @@ import {
   mergeSidebarRegexIndexScopes,
   resolveSidebarFilterGuards,
   resolveSidebarObjectSearchFilter,
-  reuseLiveSidebarTreeNodes,
   type SidebarRegexIndexScope,
   type SidebarRegexScopeIdentity,
+  localTableSearchParentTypes,
 } from "@/lib/sidebar/sidebarSearchTree";
-import { createSidebarLabelMatcher, matchSidebarLabel } from "@/lib/sidebar/sidebarSearch";
+import { createSidebarLabelMatcher } from "@/lib/sidebar/sidebarSearch";
 import { collectSidebarRegexIndexScopes, resolveSidebarRemoteSearchQuery, resolveSidebarSearchDispatchMode } from "@/lib/sidebar/sidebarRegexSearchIndex";
 import { createSidebarSearchExpansionState } from "@/lib/sidebar/sidebarSearchExpansionState";
 import { createSidebarSearchLoadingTracker } from "@/lib/sidebar/sidebarSearchLoadingTracker";
-import { buildTableTreeNodes } from "@/lib/table/tableTree";
 import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut, isViewTableDdlShortcut } from "@/lib/editor/keyboardShortcuts";
 import { sidebarNodeSupportsDdlView } from "@/lib/sidebar/sidebarTreeDdlShortcut";
 import { objectSourceTargetForTreeNode } from "@/lib/sidebar/treeNodeClick";
@@ -64,6 +64,11 @@ import SidebarLocateButton from "./SidebarLocateButton.vue";
 import SidebarRegexToggleButton from "./SidebarRegexToggleButton.vue";
 import SidebarTreeRuntimeHost from "./SidebarTreeRuntimeHost.vue";
 import SidebarTreeItemDialogs from "./SidebarTreeItemDialogs.vue";
+import LdapEntryCreateDialog from "@/components/ldap/LdapEntryCreateDialog.vue";
+import LdapEntryRenameDialog from "@/components/ldap/LdapEntryRenameDialog.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
+import { ldapEntryDialogState } from "@/lib/ldap/ldapEntryDialogState";
+import * as api from "@/lib/backend/api";
 import InstallExtensionDialog from "@/components/objects/InstallExtensionDialog.vue";
 import ExtensionDetailsDialog from "@/components/objects/ExtensionDetailsDialog.vue";
 import { RecycleScroller } from "vue-virtual-scroller";
@@ -94,6 +99,72 @@ import { compileSearchRegex } from "@/lib/common/searchPattern";
 
 const { t } = useI18n();
 const store = useConnectionStore();
+
+/** Parent DN of an LDAP entry DN, or the DN itself when it has no RDN part. */
+function ldapParentDn(dn: string): string {
+  const comma = dn.indexOf(",");
+  return comma >= 0 ? dn.substring(comma + 1) : dn;
+}
+
+async function refreshLdapChildren(connectionId: string, dn: string) {
+  const config = store.getConfig(connectionId) as any;
+  if ((config?.ldap_base_dn || "") === dn) {
+    await store.loadLdapRoot(connectionId);
+  } else {
+    await store.loadLdapEntryChildren(connectionId, dn);
+  }
+}
+
+async function onLdapEntryCreated() {
+  try {
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.createParentDn);
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  }
+}
+
+async function onLdapEntryRenamed(newDn: string) {
+  try {
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapEntryDialogState.renameDn);
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  }
+  // When the entry was moved to a new parent, refresh that parent too.
+  const newParent = ldapParentDn(newDn);
+  if (newParent !== ldapParentDn(ldapEntryDialogState.renameDn)) {
+    try {
+      await refreshLdapChildren(ldapEntryDialogState.connectionId, newParent);
+    } catch (e: unknown) {
+      toast(e instanceof Error ? e.message : String(e), 5000);
+    }
+  }
+}
+
+const ldapDeleting = ref(false);
+
+async function confirmLdapDelete() {
+  if (ldapDeleting.value) return;
+  // Defense-in-depth: the sidebar menu item is disabled for read-only
+  // connections; refuse here too in case the flag changed after the
+  // dialog was opened.
+  if (Boolean((store.getConfig(ldapEntryDialogState.connectionId) as any)?.read_only)) {
+    toast(t("ldap.readOnly"), 4000);
+    ldapEntryDialogState.deleteOpen = false;
+    return;
+  }
+  ldapDeleting.value = true;
+  try {
+    const dn = ldapEntryDialogState.deleteDn;
+    await api.ldapDelete(ldapEntryDialogState.connectionId, dn);
+    toast(t("ldap.writeSuccess"), 2500);
+    ldapEntryDialogState.deleteOpen = false;
+    await refreshLdapChildren(ldapEntryDialogState.connectionId, ldapParentDn(dn));
+  } catch (e: unknown) {
+    toast(e instanceof Error ? e.message : String(e), 5000);
+  } finally {
+    ldapDeleting.value = false;
+  }
+}
 const queryStore = useQueryStore();
 const savedSqlStore = useSavedSqlStore();
 const settingsStore = useSettingsStore();
@@ -658,28 +729,6 @@ type InvalidatedTableSearchScope = SidebarRegexScopeIdentity & { parentNodeId: s
 const pendingInvalidatedTableSearchScopes = new Map<string, InvalidatedTableSearchScope>();
 const regexTableSearchScopes = shallowRef<SidebarRegexIndexScope[]>([]);
 
-const localTableSearchParentTypes = new Set<TreeNodeType>(["database", "schema", "linked-server-schema", "group-tables"]);
-const localTableSearchChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view"]);
-
-function filterLocallySearchedTables(nodes: TreeNode[]): TreeNode[] {
-  return nodes.map((node) => {
-    const children = node.children ? filterLocallySearchedTables(node.children) : undefined;
-    const query = settingsStore.editorSettings.sidebarTableSearchLocal && localTableSearchParentTypes.has(node.type) ? store.sidebarTableSearchQueries[node.id]?.trim() : "";
-    if (!query || !children) return children === node.children ? node : { ...node, children };
-
-    const indexed = localTableSearchResults.value[node.id];
-    // matchSidebarLabel compares case-insensitively internally and needs the
-    // ORIGINAL label (and entry name) so camelCase boundaries stay detectable.
-    const matchingChildren =
-      indexed === null
-        ? children.filter((child) => localTableSearchChildTypes.has(child.type) && !!matchSidebarLabel(child.label, query))
-        : indexed
-          ? reuseLiveSidebarTreeNodes(buildTableTreeNodes({ nodeId: node.id, connectionId: node.connectionId || "", database: node.database || "", schema: node.schema, catalog: node.catalog, tables: indexed.filter((entry) => !!matchSidebarLabel(entry.name, query)) }), children)
-          : children.filter((child) => localTableSearchChildTypes.has(child.type) && !!matchSidebarLabel(child.label, query));
-    return { ...node, children: matchingChildren };
-  });
-}
-
 async function loadRegexTableSearchIndexes() {
   if (!regexMode.value || !deferredSearchQuery.value) return;
   const loadedScopes = await collectSidebarRegexIndexScopes(
@@ -781,7 +830,7 @@ const filteredNodes = computed(() => {
     nodes = filterSidebarTreeToConnectedConnections(nodes, store.connectedIds);
   }
 
-  nodes = filterLocallySearchedTables(nodes);
+  nodes = filterLocallySearchedTables(nodes, { enabled: settingsStore.editorSettings.sidebarTableSearchLocal, queries: store.sidebarTableSearchQueries, indexedResults: localTableSearchResults.value });
   nodes = filterGloballyIndexedRegexTables(nodes);
 
   const q = deferredSearchQuery.value;
@@ -1433,7 +1482,38 @@ provide(sidebarTreeContextKey, {
       scheduleLocalSidebarTableSearchRefresh(parentNodeId, focusRestore);
     } else scheduleSidebarTableSearchRefresh(parentNodeId, { focusRestore });
   },
-  refreshTableSearchIndex: (parentNodeId) => void loadLocalTableSearchResults(parentNodeId, true),
+  refreshTableSearchIndex: (parentNodeId) => {
+    // Re-fetch the live object list before rebuilding the local index. The
+    // index refresh used to scan the database correctly, but the tree itself
+    // still contained the old first page, so newly-created tables could not
+    // be rendered even though they were present in the refreshed index.
+    const findNode = (nodes: TreeNode[]): TreeNode | undefined => {
+      for (const node of nodes) {
+        if (node.id === parentNodeId) return node;
+        const found = node.children ? findNode(node.children) : undefined;
+        if (found) return found;
+      }
+      return undefined;
+    };
+    void (async () => {
+      const parent = findNode(store.treeNodes);
+      if (parent?.connectionId && parent.database && (parent.type === "database" || parent.type === "schema" || parent.type === "linked-server-schema" || parent.type === "group-tables")) {
+        // Refresh only the tables group. Refreshing the database/schema node
+        // also reloads views, routines, triggers, etc., causing a visible
+        // redraw of the whole sidebar for a table-only operation.
+        if (parent.type === "group-tables") {
+          await store.loadObjectGroupChildren(parent, { force: true });
+        } else if (localTableSearchParentTypes.has(parent.type)) {
+          await store.loadTables(parent.connectionId, parent.database, parent.schema, { force: true });
+        }
+      }
+      await loadLocalTableSearchResults(parentNodeId, true);
+    })().catch((error) => {
+      // Keep refresh failures inside the UI action boundary instead of
+      // leaving an unhandled Promise rejection when metadata loading fails.
+      toast(error instanceof Error ? error.message : String(error), 5000);
+    });
+  },
   registerPasteHandler: pasteHandlerRegistry.register,
 });
 provide(sidebarTreeRuntimeKey, sidebarTreeRuntime);
@@ -2058,18 +2138,11 @@ function openSidebarObjectSource(node: TreeNode, initialEditing: boolean) {
   // connections list user-defined types without a CREATE TYPE getter this cycle.
   if ((node.type === "type" || node.type === "type-body") && !supportsTypeObjectSource(store.getConfig(node.connectionId)?.db_type)) return;
   const target = createSidebarActionTarget(node);
-  const requestGeneration = beginSidebarAction();
-  void store
-    .ensureConnected(target.connectionId!)
-    .then(() => {
-      if (requestGeneration !== sidebarActionGeneration) return;
-      store.activeConnectionId = target.connectionId!;
-      sidebarObjectSourceTarget.value = { node: target, initialEditing };
-      sidebarObjectSourceOpen.value = true;
-    })
-    .catch((error: any) => {
-      if (requestGeneration === sidebarActionGeneration) toast(error?.message || String(error), 5000);
-    });
+  beginSidebarAction();
+  // issue #9035：弹窗立即挂载。此前先 await ensureConnected 再开弹窗，这段时间
+  // 界面上没有任何反馈；现在连接与取源都在弹窗自身的加载态之内完成。
+  sidebarObjectSourceTarget.value = { node: target, initialEditing };
+  sidebarObjectSourceOpen.value = true;
 }
 
 function openSidebarSettings(initialTab: string) {
@@ -2844,6 +2917,9 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
       </template>
     </SidebarDangerConfirmDialog>
     <SidebarTreeItemDialogs v-if="sidebarTreeItemDialogController" :key="sidebarTreeItemDialogController.node?.id" :controller="sidebarTreeItemDialogController" @closed="sidebarTreeItemDialogController = null" />
+    <LdapEntryCreateDialog v-model:open="ldapEntryDialogState.createOpen" :connection-id="ldapEntryDialogState.connectionId" :parent-dn="ldapEntryDialogState.createParentDn" @created="onLdapEntryCreated" />
+    <LdapEntryRenameDialog v-model:open="ldapEntryDialogState.renameOpen" :connection-id="ldapEntryDialogState.connectionId" :dn="ldapEntryDialogState.renameDn" @renamed="onLdapEntryRenamed" />
+    <DangerConfirmDialog v-model:open="ldapEntryDialogState.deleteOpen" :title="t('ldap.deleteTitle')" :message="t('ldap.deleteConfirmMessage')" :details="ldapEntryDialogState.deleteDn" :confirm-label="t('ldap.deleteEntry')" :loading="ldapDeleting" @confirm="confirmLdapDelete" />
     <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" @changed="refreshSidebarActionTarget" />
     <ExtensionDetailsDialog v-if="sidebarExtensionDetailsTarget" ref="sidebarExtensionDetailsDialogRef" :node="sidebarExtensionDetailsTarget" />
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">
