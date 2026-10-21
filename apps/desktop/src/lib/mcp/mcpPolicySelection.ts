@@ -41,6 +41,7 @@ export const MCP_TOOL_OPTIONS = [
   { name: "dbx_remove_connection", labelKey: "settings.mcpToolRemoveConnection" },
   { name: "dbx_open_table", labelKey: "settings.mcpToolOpenTable" },
   { name: "dbx_execute_and_show", labelKey: "settings.mcpToolExecuteAndShow" },
+  { name: "dbx_execute_ldap_search", labelKey: "settings.mcpToolExecuteLdapSearch" },
 ] as const;
 
 export interface McpExecutionPolicyFields {

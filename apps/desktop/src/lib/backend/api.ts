@@ -88,6 +88,7 @@ export const removePluginRepository = forward("removePluginRepository");
 export const fetchPluginMarketplaceCatalogs = forward("fetchPluginMarketplaceCatalogs");
 export const installMarketplacePlugin = forward("installMarketplacePlugin");
 export const installPluginPackage = forward("installPluginPackage");
+export const installPluginPackageFromUrl = forward("installPluginPackageFromUrl");
 export const rollbackPlugin = forward("rollbackPlugin");
 export const uninstallPlugin = forward("uninstallPlugin");
 export const activatePlugin = forward("activatePlugin");
@@ -406,6 +407,7 @@ export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructi
 // System
 export const listSystemFonts = forward("listSystemFonts");
 export const listSshConfigHosts = forward("listSshConfigHosts");
+export const listLocalSshKeys = forward("listLocalSshKeys");
 
 // SQL File Execution
 export const previewSqlFile = forward("previewSqlFile");
@@ -513,6 +515,20 @@ export const cancelQueryResultExport = forward("cancelQueryResultExport");
 
 // Redis
 export const redisListDatabases = forward("redisListDatabases");
+
+// LDAP
+export const ldapSearch = forward("ldapSearch");
+export const ldapAdd = forward("ldapAdd");
+export const ldapModify = forward("ldapModify");
+export const ldapDelete = forward("ldapDelete");
+export const ldapRename = forward("ldapRename");
+export const ldapVerifyPassword = forward("ldapVerifyPassword");
+export const getLdapConfig = forward("getLdapConfig");
+export const getLdapConfigForConnection = forward("getLdapConfigForConnection");
+export const ldapAuthLogin = forward("ldapAuthLogin");
+export const loadLdapLoginConfig = forward("loadLdapLoginConfig");
+export const saveLdapLoginConfig = forward("saveLdapLoginConfig");
+export const testLdapLoginConfig = forward("testLdapLoginConfig");
 export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
 export const redisScanValues = forward("redisScanValues");

@@ -15,6 +15,7 @@ pub mod hbase;
 pub mod history;
 pub mod jdbc;
 pub mod layout;
+pub mod ldap;
 pub mod mcp_policy;
 pub mod mongo;
 pub mod mongodb_import_export;
@@ -43,3 +44,6 @@ pub mod tunnel_profiles;
 pub mod update;
 pub mod vector;
 pub mod zookeeper;
+
+#[cfg(test)]
+mod object_cache_tests;

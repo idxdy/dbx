@@ -1571,6 +1571,8 @@ mod tests {
             login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
             export_files: RwLock::new(HashMap::new()),
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
+            ldap_login: RwLock::new(None),
+            ldap_login_broken: false,
         });
         (state, dir)
     }

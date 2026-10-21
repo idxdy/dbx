@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 const appSource = readFileSync(new URL("../../../App.vue", import.meta.url), "utf8");
 const toolbarSource = readFileSync(new URL("../../../components/layout/AppToolbar.vue", import.meta.url), "utf8");
 const tabBarSource = readFileSync(new URL("../../../components/layout/AppTabBar.vue", import.meta.url), "utf8");
+const groupTabBarSource = readFileSync(new URL("../../../components/layout/EditorGroupTabBar.vue", import.meta.url), "utf8");
 const driverStoreSource = readFileSync(new URL("../../../components/config/DriverStoreDialog.vue", import.meta.url), "utf8");
 const appDialogsSource = readFileSync(new URL("../../../components/layout/AppDialogs.vue", import.meta.url), "utf8");
 const connectionDialogSource = readFileSync(new URL("../../../components/connection/ConnectionDialog.vue", import.meta.url), "utf8");
@@ -15,7 +16,14 @@ describe("plugin center integration", () => {
     expect(toolbarSource).toContain("emit('open-plugin-center')");
     expect(appSource).toContain('@open-plugin-center="openPluginCenterPage()"');
     expect(appSource).toContain("<PluginCenterPage");
-    expect(tabBarSource).toContain("data-plugin-center-tab");
+    // The dedicated data-plugin-center-tab button was folded into the unified
+    // special-page surfaces; the tab bar still hosts the plugin center there.
+    expect(tabBarSource).toContain('type SpecialRegularSurface = "driverStore" | "pluginCenter" | "settings";');
+    expect(tabBarSource).toContain('if (keep !== "pluginCenter" && props.pluginCenterOpen)');
+    // The plugin center pill lives in the focused group's tab strip, like the
+    // settings and driver-store special pages.
+    expect(groupTabBarSource).toContain("data-plugin-center-tab");
+    expect(appSource).toContain(':plugin-center-open="pluginCenterTabOpen"');
   });
 
   it("keeps plugin management out of Driver Manager", () => {
@@ -53,6 +61,8 @@ describe("plugin center integration", () => {
     expect(template).toContain("<SelectTrigger");
     expect(template).not.toContain("max-w-md grid-cols-3");
     expect(template).not.toContain("marketplaceCategory");
-    expect(template).toContain("repeat(auto-fit");
+    // 84e8bab62 restored the card grid as a fixed responsive grid
+    // (grid-cols-1 / md:grid-cols-3) instead of the auto-fit template column.
+    expect(template).toContain("md:grid-cols-3");
   });
 });

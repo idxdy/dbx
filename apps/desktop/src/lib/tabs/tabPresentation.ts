@@ -4,7 +4,8 @@ import { hexToRgba } from "@/lib/common/color";
 import type { CSSProperties } from "vue";
 import { findConnectionGroupPath } from "@/lib/sidebar/sidebarLayout";
 import { splitMongoCommandRanges } from "@/lib/mongo/mongoShellCommand";
-import { executableStatementRanges, splitSqlStatementRanges, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
+import { executableStatementRanges, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
+import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import type { BatchSqlExecution, ConnectionConfig, DatabaseType, QueryResult, QueryTab } from "@/types/database";
@@ -159,6 +160,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return t("tabs.databases");
     return `${t("tabs.databases")}@${connectionDisplayName(tab.connectionId)}`;
   }
+  if (tab.mode === "ldap") {
+    if (compact) return connectionDisplayName(tab.connectionId);
+    return `${connectionDisplayName(tab.connectionId)}@ldap`;
+  }
   if (tab.mode === "objects") {
     if (isEventObjectBrowserTab(tab)) {
       const eventTitle = tab.objectBrowser?.eventName || t("tree.events");
@@ -240,14 +245,14 @@ export function resultSqlForGrid(tab: Pick<QueryTab, "result" | "resultBaseSql" 
  * A stale or ambiguous source is ignored instead of highlighting a different
  * statement that happens to have the same text.
  */
-export function resultSourceRange(editorSql: string, result: Pick<QueryResult, "sourceStatement" | "sourceFrom" | "sourceTo"> | undefined, resultIndex: number | undefined, databaseType?: DatabaseType): SqlTextRange | undefined {
+export function resultSourceRange(editorSql: string, result: Pick<QueryResult, "sourceStatement" | "sourceFrom" | "sourceTo"> | undefined, resultIndex: number | undefined, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): SqlTextRange | undefined {
   const sourceStatement = result?.sourceStatement;
   if (!sourceStatement) return undefined;
   if (typeof result.sourceFrom === "number" && typeof result.sourceTo === "number" && editorSql.slice(result.sourceFrom, result.sourceTo) === sourceStatement) {
     return { from: result.sourceFrom, to: result.sourceTo, sql: sourceStatement };
   }
 
-  const statements = statementRanges(editorSql, databaseType);
+  const statements = statementRanges(editorSql, databaseType, parameterOptions);
   const indexed = typeof resultIndex === "number" ? statements[resultIndex] : undefined;
   if (indexed?.sql === sourceStatement) {
     return { from: indexed.from, to: indexed.to, sql: indexed.sql };
@@ -273,10 +278,10 @@ function lineStartOffset(sql: string, from: number): number {
   return sql.lastIndexOf("\n", Math.max(0, from - 1)) + 1;
 }
 
-function statementRanges(sql: string, databaseType?: DatabaseType): SqlTextRange[] {
+function statementRanges(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): SqlTextRange[] {
   if (databaseType === "redis") return executableStatementRanges(sql, databaseType);
   if (databaseType === "mongodb") return splitMongoCommandRanges(sql).map(({ from, to, text }) => ({ from, to, sql: text }));
-  return splitSqlStatementRanges(sql, databaseType);
+  return splitSqlStatementRanges(sql, databaseType, parameterOptions ?? sqlStatementParameterOptionsForCompatibility(databaseType));
 }
 
 function liveStatementExecutionMarkers(editorSql: string, batch: BatchSqlExecution): StatementExecutionMarker[] {
@@ -301,12 +306,20 @@ function liveStatementExecutionMarkers(editorSql: string, batch: BatchSqlExecuti
     }));
 }
 
-export function statementExecutionMarkers(editorSql: string, results: QueryResult[] | undefined, databaseType?: DatabaseType, submittedSql = editorSql, executionEditorFingerprint = sqlTextFingerprint(editorSql), batch?: BatchSqlExecution): StatementExecutionMarker[] {
+export function statementExecutionMarkers(
+  editorSql: string,
+  results: QueryResult[] | undefined,
+  databaseType?: DatabaseType,
+  submittedSql = editorSql,
+  executionEditorFingerprint = sqlTextFingerprint(editorSql),
+  batch?: BatchSqlExecution,
+  parameterOptions?: SqlParameterOptions,
+): StatementExecutionMarker[] {
   if (batch?.items.length) return liveStatementExecutionMarkers(editorSql, batch);
   if (!results?.length || sqlTextFingerprint(editorSql) !== executionEditorFingerprint) return [];
-  const submittedStatements = statementRanges(submittedSql, databaseType);
+  const submittedStatements = statementRanges(submittedSql, databaseType, parameterOptions);
   if (submittedStatements.length <= 1) return [];
-  const editorStatements = submittedSql === editorSql ? submittedStatements : statementRanges(editorSql, databaseType);
+  const editorStatements = submittedSql === editorSql ? submittedStatements : statementRanges(editorSql, databaseType, parameterOptions);
 
   const byLine = new Map<number, { success: number; error: number }>();
   for (const result of results) {
@@ -484,6 +497,7 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "zookeeper") return t("tabs.zookeeper");
   if (tab.mode === "consul") return t("tabs.consul");
   if (tab.mode === "consul-overview") return t("consul.ui.overview");
+  if (tab.mode === "ldap") return "LDAP";
   if (tab.mode === "nacos") return "Nacos";
   if (tab.mode === "databases") return t("tabs.databases");
   if (isEventObjectBrowserTab(tab)) return t("tree.events");

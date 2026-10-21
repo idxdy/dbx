@@ -93,9 +93,6 @@ arc-swap = "1"
 insta = { version = "1", features = ["json", "glob"] }
 tempfile = "3"
 
-[target.'cfg(not(all(windows, target_vendor = "win7")))'.dependencies]
-iana-time-zone = "0.1"
-
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }
 
@@ -106,6 +103,11 @@ nix = { version = "0.31.3", features = ["user"] }
 mysql_common = { git = "https://github.com/t8y2/rust_mysql_common.git", rev = "47740d85a8277167a5717afac785d37b46a36296", default-features = false }
 tokio = { version = "1", features = ["test-util"] }
 tokio-openssl = "0.6"
+
+[dependencies.ldap3]
+version = "0.11"
+default-features = false
+features = ["tls-rustls"]
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }

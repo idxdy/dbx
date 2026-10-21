@@ -11,7 +11,7 @@ import { useExportTracker } from "@/composables/useExportTracker";
 import { clipboardCellValue, type CellValue } from "@/lib/dataGrid/cellValue";
 import { binaryCellClipboardText } from "@/lib/dataGrid/binaryCellDownload";
 import { tryStartExclusiveActivation, type ActionActivationGuard } from "@/lib/connection/actionActivation";
-import { copyToClipboard } from "@/lib/common/clipboard";
+import { clipboardLineEndings, copyToClipboard } from "@/lib/common/clipboard";
 import { clearDataGridClipboardCopy, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
 import { buildDataGridCopyInsertStatement, type DataGridCopyInsertMode, type DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import { formatSqlInsert, formatTsv } from "@/lib/export/exportFormats";
@@ -116,7 +116,7 @@ export interface UseDataGridExportOptions {
   queryResultExportRequest?: (options: {
     exportId: string;
     filePath: string;
-    format: "csv" | "xlsx" | "txt" | "sql";
+    format: "csv" | "xlsx" | "json" | "txt" | "sql";
     includeSqlSheet?: boolean;
     exportTableName?: string;
     exportColumnTypes?: Array<string | null | undefined>;
@@ -236,7 +236,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     clearDataGridClipboardCopy();
     try {
       await copyToClipboard(text);
-      if (copiedRows) rememberDataGridClipboardCopy(text, copiedRows, copiedHeader);
+      // Remember the text as it now sits on the clipboard, so a paste back into
+      // the grid still matches and keeps its null-cell metadata.
+      if (copiedRows) rememberDataGridClipboardCopy(clipboardLineEndings(text), copiedRows, copiedHeader);
       toast(t("grid.copied"));
       return true;
     } catch (e: any) {
@@ -876,6 +878,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     await runExclusiveExport(async () => {
       try {
         if (await exportFullTableDataViaBackend("json", rowIds)) return;
+        if (await exportQueryResultViaBackend("json", rowIds)) return;
 
         let outputPath = exportFileName("export", "json");
         if (isTauriRuntime()) {
@@ -1265,7 +1268,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return true;
   }
 
-  async function exportQueryResultViaBackend(format: "csv" | "xlsx" | "txt" | "sql", rowIds?: number[], includeSqlSheet = false, headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode?: SqlInsertMode): Promise<boolean> {
+  async function exportQueryResultViaBackend(format: "csv" | "xlsx" | "json" | "txt" | "sql", rowIds?: number[], includeSqlSheet = false, headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode?: SqlInsertMode): Promise<boolean> {
     if (rowIds !== undefined || context.value !== "results" || !queryResultExportRequest) {
       return false;
     }

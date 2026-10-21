@@ -71,6 +71,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  LocalSshKey,
   TunnelProfile,
   TransactionLog,
   ExternalSqlFileVersion,
@@ -587,6 +588,7 @@ export async function aiAgentStream(
   confirmedDatabase?: string,
   confirmedSchema?: string,
   _signal?: AbortSignal,
+  selectedDatabases?: string[],
 ): Promise<string> {
   const unlisten: UnlistenFn = await listen<TauriAgentEvent>("ai-agent-event", (event) => {
     const payload = event.payload;
@@ -610,6 +612,7 @@ export async function aiAgentStream(
       confirmedConnectionId,
       confirmedDatabase,
       confirmedSchema,
+      selectedDatabases,
     });
   } catch (e) {
     unlisten();
@@ -978,6 +981,10 @@ export async function listSystemFonts(): Promise<string[]> {
 
 export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return invoke("list_ssh_config_hosts");
+}
+
+export async function listLocalSshKeys(): Promise<LocalSshKey[]> {
+  return invoke("list_local_ssh_keys");
 }
 
 export async function pendingOpenSqlFiles(): Promise<string[]> {
@@ -2287,6 +2294,10 @@ export async function installPluginPackage(pathOrFile: string | File, allowUnsig
   return invoke("install_plugin_package", { path: pathOrFile, allowUnsigned });
 }
 
+export async function installPluginPackageFromUrl(url: string, allowUnsigned = false): Promise<PluginInstallResult> {
+  return invoke("install_plugin_package_from_url", { url, allowUnsigned });
+}
+
 export async function rollbackPlugin(pluginId: string): Promise<PluginRollbackResult> {
   return invoke("rollback_plugin", { pluginId });
 }
@@ -2860,6 +2871,143 @@ export interface RedisNodeEndpoint {
 
 export async function redisListDatabases(connectionId: string): Promise<RedisDatabaseInfo[]> {
   return invoke("redis_list_databases", { connectionId });
+}
+
+// LDAP (Tauri stub — falls back to HTTP in dev mode)
+export interface LdapSearchEntry {
+  dn: string;
+  attributes: Record<string, string | string[]>;
+}
+export interface LdapSearchResult {
+  entries: LdapSearchEntry[];
+  count: number;
+  truncated: boolean;
+}
+
+export async function ldapSearch(connectionId: string, baseDn: string, filter?: string, scope?: string, attributes?: string[], sizeLimit?: number): Promise<LdapSearchResult> {
+  return invokeBackend("ldap_search", {
+    connectionId,
+    baseDn,
+    scope: scope ?? "sub",
+    filter: filter ?? "(objectClass=*)",
+    attributes: attributes ?? null,
+    sizeLimit: sizeLimit ?? null,
+  });
+}
+
+export interface LdapModification {
+  op: "add" | "replace" | "delete";
+  attribute: string;
+  values: string[];
+}
+export interface LdapWriteResult {
+  success: boolean;
+  dn: string;
+}
+
+export async function ldapAdd(connectionId: string, dn: string, attributes: Record<string, string | string[]>): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_add", { connectionId, dn, attributes });
+}
+
+export async function ldapModify(connectionId: string, dn: string, modifications: LdapModification[]): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_modify", { connectionId, dn, modifications });
+}
+
+export async function ldapDelete(connectionId: string, dn: string): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_delete", { connectionId, dn });
+}
+
+export async function ldapRename(connectionId: string, dn: string, newRdn: string, deleteOldRdn?: boolean, newParentDn?: string): Promise<LdapWriteResult> {
+  return invokeBackend("ldap_rename", {
+    connectionId,
+    dn,
+    newRdn,
+    deleteOldRdn: deleteOldRdn ?? true,
+    newParentDn: newParentDn ?? null,
+  });
+}
+
+export interface LdapVerifyPasswordResult {
+  verified: boolean;
+  dn: string;
+}
+
+export async function ldapVerifyPassword(connectionId: string, dn: string, password: string): Promise<LdapVerifyPasswordResult> {
+  return invokeBackend("ldap_verify_password", { connectionId, dn, password });
+}
+
+export interface LdapObjectClass {
+  name: string;
+  system: string[];
+  description: string;
+  superior: string[];
+  inheritanceChain: string[];
+  must: string[];
+  may: string[];
+  type: "STRUCTURAL" | "ABSTRACT" | "AUXILIARY";
+  icon?: string;
+  note?: string;
+}
+
+export interface LdapSchemaConfig {
+  objectClasses: LdapObjectClass[];
+  attributeTypes?: LdapAttributeType[];
+  attributesEditor: Record<string, string>;
+  source?: "server" | "static";
+}
+
+export interface LdapAttributeType {
+  name: string;
+  aliases: string[];
+  description: string;
+  syntaxOid: string;
+  syntax: "string" | "integer" | "boolean" | "generalizedTime" | "dn" | "binary" | "jpeg";
+  singleValue: boolean;
+  noUserModification: boolean;
+  operational: boolean;
+  equality: string;
+}
+
+export async function getLdapConfig(): Promise<LdapSchemaConfig> {
+  return invokeBackend("ldap_get_config", {});
+}
+
+export async function getLdapConfigForConnection(connectionId: string): Promise<LdapSchemaConfig> {
+  return invokeBackend("ldap_get_config_for_connection", { connectionId });
+}
+
+// LDAP login is web-only (the desktop app does not gate itself behind a
+// password). These stubs satisfy the `api.ts` forward type so the desktop
+// build compiles; they are never reached in practice.
+export interface LdapLoginSettings {
+  enabled: boolean;
+  name: string;
+  host: string;
+  port: number;
+  useTls: boolean;
+  baseDn: string;
+  requireServiceAccount: boolean;
+  serviceAccountDn: string;
+  serviceAccountPassword: string;
+  searchFilter: string;
+  allowedGroups: string;
+  connectTimeoutSecs: number;
+}
+
+export async function ldapAuthLogin(_username: string, _password: string): Promise<any> {
+  throw new Error("LDAP login is not used in the Tauri desktop app. Use the HTTP backend.");
+}
+
+export async function loadLdapLoginConfig(): Promise<any> {
+  throw new Error("LDAP login settings are web-only. Use the HTTP backend.");
+}
+
+export async function saveLdapLoginConfig(_settings: any): Promise<any> {
+  throw new Error("LDAP login settings are web-only. Use the HTTP backend.");
+}
+
+export async function testLdapLoginConfig(_settings: any): Promise<any> {
+  throw new Error("LDAP login settings are web-only. Use the HTTP backend.");
 }
 
 export async function redisScanKeys(connectionId: string, db: number, cursor: number, pattern: string, count: number): Promise<RedisScanResult> {
@@ -5325,7 +5473,7 @@ export interface QueryResultExportRequest {
   databaseType: DatabaseType;
   useAgentCursor: boolean;
   filePath: string;
-  format: "csv" | "xlsx" | "txt" | "sql";
+  format: "csv" | "xlsx" | "json" | "txt" | "sql";
   insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
   includeSqlSheet?: boolean;

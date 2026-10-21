@@ -43,11 +43,13 @@ import {
   Scissors,
   CopyPlus,
   Plus,
+  Replace,
   ScrollText,
   Code2,
   Wrench,
   ListFilter,
   Clipboard,
+  LayoutGrid,
   UsersRound,
   ShieldCheck,
   Activity,
@@ -156,13 +158,12 @@ import {
   type TableChildObjectType,
 } from "@/lib/database/dbAdminSql";
 import { buildRenameObjectSql, buildRenameDatabaseSql, buildRenameDatabasePreflightSql, databaseRenameMaintenanceDatabase, supportsDatabaseRename, supportsObjectRename, type RenameableObjectType } from "@/lib/table/objectRenameSql";
-import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
-import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
+import { buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { buildViewDdl } from "@/lib/table/viewDdl";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
-import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionTableSqlSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import {
   defaultPasteTableMode,
@@ -197,6 +198,7 @@ import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseB
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildConnectionUrlCopy, CONNECTION_URL_COPY_WITH_PASSWORD_FORMATS, connectionUrlCopyFormats, type ConnectionUrlCopyFormat } from "@/lib/connection/connectionUrlBuilder";
+import { openLdapCreateEntryDialog, openLdapDeleteEntryDialog, openLdapRenameEntryDialog } from "@/lib/ldap/ldapEntryDialogState";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
@@ -799,6 +801,15 @@ async function toggle(requestId = beginNavigationRequest()) {
     return;
   }
 
+  // LDAP chunk nodes hold prefetched entries — expansion is a pure client-side
+  // toggle. Must not fall through to the collapse path below, which may release
+  // children and leave the chunk permanently empty.
+  if (node.type === "ldap-chunk") {
+    node.isExpanded = !node.isExpanded;
+    emitNodeToggled(node, wasExpanded);
+    return;
+  }
+
   if (node.type === "type" && customTypeCapabilities(currentDatabaseType()).details && node.children !== undefined) {
     node.isExpanded = node.children.length > 0 ? !node.isExpanded : false;
     emitNodeToggled(node, wasExpanded);
@@ -903,7 +914,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       return;
     }
 
-    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(currentDatabaseType())) {
+    const packageDatabaseType = currentDatabaseType();
+    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(packageDatabaseType, packageDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(node.connectionId, node.database) : undefined)) {
       await connectionStore.loadPackageMembers(node);
       emitNodeToggled(node, wasExpanded);
       return;
@@ -936,6 +948,8 @@ async function toggle(requestId = beginNavigationRequest()) {
         await connectionStore.loadNacosNamespaces(node.connectionId, treeLoadSearchOptions);
       } else if (config?.db_type === "mqtt") {
         await connectionStore.loadMqttTopics(node.connectionId);
+      } else if (config?.db_type === "ldap") {
+        await connectionStore.loadLdapRoot(node.connectionId);
       } else if (config?.db_type === "plugin") {
         await queryStore.openPluginConnection(node.connectionId);
         return;
@@ -960,6 +974,12 @@ async function toggle(requestId = beginNavigationRequest()) {
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "ZooKeeper"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "zookeeper");
       refreshActiveKvBrowserAfterOpen("zookeeper", node.connectionId);
+    } else if (node.type === "ldap-root" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name ?? "LDAP"}`;
+      queryStore.createTab(node.connectionId, "", tabTitle, "ldap");
+    } else if (node.type === "ldap-entry" && node.connectionId && node.database) {
+      await connectionStore.loadLdapEntryChildren(node.connectionId, node.database);
     } else if (node.type === "user-admin" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       queryStore.openUserAdmin(node.connectionId);
@@ -1077,6 +1097,11 @@ function runRowClickAction(clickDetail: number, requestId: number) {
   }
   if (node.type === "mongo-gridfs") {
     openMongoTreeData(node);
+    return;
+  }
+  if (node.type === "ldap-entry") {
+    if (clickDetail > 1) return;
+    void openLdapEntryDetail();
     return;
   }
   if (node.type === "event") {
@@ -1875,6 +1900,47 @@ function openRedisInstanceInfo() {
   queryStore.createTab(node.connectionId, "0", `${dbName} - ${t("contextMenu.instanceInfo")}`, "redis-dashboard");
 }
 
+function openLdapBrowser() {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const tabTitle = `${config?.name || "LDAP"}`;
+  queryStore.createTab(node.connectionId, "", tabTitle, "ldap");
+}
+
+function openLdapSearch(baseDn?: string) {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const tabTitle = baseDn ? `${baseDn.split(",")[0] ?? baseDn} - ${config?.name || "LDAP"} - Search` : `${config?.name || "LDAP"} - Search`;
+  queryStore.createTab(node.connectionId, baseDn ?? "", tabTitle, "ldap-search");
+}
+
+/** Open the LDAP Search tab scoped to the entry's DN (context-menu entry). */
+function openLdapSearchAtNode(node: TreeNode) {
+  if (!node.connectionId || !node.database) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const tabTitle = `${node.label} - ${config?.name || "LDAP"} - Search`;
+  queryStore.createTab(node.connectionId, node.database, tabTitle, "ldap-search");
+}
+
+async function openLdapEntryDetail() {
+  const node = activeNode.value;
+  if (!node.connectionId || !node.database) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const tabTitle = `${node.label} - ${config?.name || "LDAP"}`;
+
+  // Reuse existing LDAP tab for this connection if any
+  const existingTab = queryStore.tabs.find((t) => t.connectionId === node.connectionId && t.mode === "ldap");
+  if (existingTab) {
+    existingTab.database = node.database;
+    existingTab.title = tabTitle;
+    queryStore.switchTab(existingTab.id);
+  } else {
+    queryStore.createTab(node.connectionId, node.database, tabTitle, "ldap");
+  }
+}
+
 async function loadTemplateContext(allowView = false, node: TreeNode = activeNode.value) {
   if (!node.connectionId || !hasTreeNodeDatabaseContext(node)) return null;
   const isTableNode = node.type === "table";
@@ -2189,10 +2255,33 @@ function openElasticsearchIndexMetadata(kind: ElasticsearchIndexMetadataKind) {
   emit("open-elasticsearch-index-metadata", createSidebarActionTarget(activeNode.value), kind);
 }
 
+async function refreshLdapEntry(node: TreeNode) {
+  if (!node.connectionId || !node.database) return;
+  // Refresh this node's children if it is expanded
+  if (node.isExpanded) {
+    await connectionStore.loadLdapEntryChildren(node.connectionId, node.database);
+    // Recursively refresh expanded children
+    if (node.children) {
+      for (const child of node.children) {
+        if (child.isExpanded) {
+          await refreshLdapEntry(child);
+        }
+      }
+    }
+  }
+}
+
 async function refresh() {
   const node = activeNode.value;
   try {
-    await connectionStore.refreshTreeNode(node);
+    if (node.type === "ldap-entry") {
+      await refreshLdapEntry(node);
+      void nextTick(() => {
+        window.dispatchEvent(new CustomEvent("dbx-refresh-active-kv-browser", { detail: { mode: "ldap", connectionId: node.connectionId } }));
+      });
+    } else {
+      await connectionStore.refreshTreeNode(node);
+    }
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
     openDriverStoreForInstallError(e?.message || String(e), node);
@@ -2525,63 +2614,22 @@ function openObjectSourceDialog(initialEditing: boolean, viewPackageBody = false
   const database = node.database;
   const sourceTarget = objectSourceTargetForTreeNode(sourceNode);
   if (!sourceTarget) return;
-  const openMode = settingsStore.editorSettings.routineSourceOpenMode;
-  if (openMode === "query-tab") {
-    void connectionStore
-      .ensureConnected(connectionId)
-      .then(async () => {
-        connectionStore.activeConnectionId = connectionId;
-        const schema = sourceTarget.schema || database;
-        const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
-        if (!databaseType) throw new Error("Connection type is unavailable.");
-        const objectName = sourceTarget.name;
-        const {
-          raw,
-          editableSource,
-          objectType: resolvedType,
-        } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
-          connectionId,
-          database,
-          schema,
-          name: objectName,
-          objectType: sourceTarget.objectType as any,
-          databaseType,
-          signature: sourceNode.signature,
-        });
-        const sourceIsEditable = raw.editable !== false && !["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY", "JOB"].includes(resolvedType);
-        if (sourceIsEditable) {
-          queryStore.openObjectSourceTab({
-            connectionId,
-            database,
-            title: `Source - ${node.label}`,
-            schema,
-            catalog: node.catalog,
-            sql: editableSource,
-            objectSource: {
-              schema,
-              name: objectName,
-              objectType: resolvedType,
-              signature: node.signature,
-            },
-          });
-        } else {
-          queryStore.createTab(connectionId, database, `Source - ${node.label}`, "query", schema, editableSource, node.catalog, { forceNew: true, sourceView: true });
-        }
-      })
-      .catch((e: any) => {
-        toast(e?.message || String(e), 5000);
-      });
+  const schema = sourceTarget.schema || database;
+  // issue #9035：两个分支都不再 await 连接与取源。先把容器挂出来（源码 tab /
+  // 源码弹窗），ensureConnected 与 getObjectSource 都发生在已挂载的 UI 之内，
+  // 加载中有状态、失败就地重试，而不是点击后一段时间毫无反应。
+  if (settingsStore.editorSettings.routineSourceOpenMode === "query-tab") {
+    queryStore.openObjectSourceTabPending({
+      connectionId,
+      database,
+      title: `Source - ${node.label}`,
+      schema,
+      catalog: node.catalog,
+      request: { name: sourceTarget.name, objectType: sourceTarget.objectType, signature: sourceNode.signature },
+    });
     return;
   }
-  void connectionStore
-    .ensureConnected(connectionId)
-    .then(() => {
-      connectionStore.activeConnectionId = connectionId;
-      emit("open-object-source", sourceNode, initialEditing);
-    })
-    .catch((e: any) => {
-      toast(e?.message || String(e), 5000);
-    });
+  emit("open-object-source", sourceNode, initialEditing);
 }
 
 function openProcedureExecution() {
@@ -2798,11 +2846,13 @@ function batchTruncateConfirmMessage(): string {
 
 async function dropSqlForTreeNode(node: TreeNode, options?: { cascade?: boolean }): Promise<string | null> {
   if (node.type === "table" && node.connectionId && node.database) {
+    const config = connectionStore.getConfig(node.connectionId);
     return buildDropTableSql({
       databaseType: databaseTypeForNode(node),
-      schema: node.schema,
+      schema: connectionTableSqlSchema(config, node.schema),
       tableName: node.label,
       cascade: options?.cascade && supportsDropTableCascade(databaseTypeForNode(node)),
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
     });
   }
   const objectOptions = dropObjectSqlOptionsForNode(node);
@@ -4621,7 +4671,24 @@ const canOpenFieldLineage = computed(() => {
 
 const hasTypeMenu = computed(() => {
   const t = activeNode.value.type;
-  return t === "connection" || t === "database" || t === "schema" || t === "table" || t === "view" || t === "column" || t === "procedure" || t === "function" || t === "trigger" || t === "package" || t === "package-body" || t === "type" || t === "type-body" || isGroupLabel(activeNode.value);
+  return (
+    t === "connection" ||
+    t === "database" ||
+    t === "schema" ||
+    t === "table" ||
+    t === "view" ||
+    t === "column" ||
+    t === "procedure" ||
+    t === "function" ||
+    t === "trigger" ||
+    t === "package" ||
+    t === "package-body" ||
+    t === "type" ||
+    t === "type-body" ||
+    t === "ldap-root" ||
+    t === "ldap-entry" ||
+    isGroupLabel(activeNode.value)
+  );
 });
 
 const isSelected = computed(() => connectionStore.selectedTreeNodeId === activeNode.value.id);
@@ -5462,6 +5529,10 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     if (currentDatabaseType() === "redis") {
       items.push({ label: t("contextMenu.instanceInfo"), action: openRedisInstanceInfo, icon: Info });
     }
+    if (currentDatabaseType() === "ldap") {
+      items.push({ label: t("contextMenu.openConnection"), action: openLdapBrowser, icon: Database });
+      items.push({ label: "LDAP Search", action: openLdapSearch, icon: Search });
+    }
     if (supportsQueryActions) {
       const sqlHistoryMenu = savedSqlHistorySubmenu();
       if (sqlHistoryMenu) items.push(sqlHistoryMenu);
@@ -5854,6 +5925,72 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
 
   if (node.type === "nacos-access-control" || node.type === "etcd-root" || node.type === "etcd-dashboard" || node.type === "etcd-access-control" || node.type === "zookeeper-root" || node.type === "consul-root" || node.type === "consul-overview") {
     items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
+    return true;
+  }
+
+  if (node.type === "ldap-root") {
+    items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
+    items.push({
+      label: t("contextMenu.openLdapBrowser"),
+      action: openLdapBrowser,
+      icon: LayoutGrid,
+    });
+    items.push({
+      label: t("contextMenu.openLdapSearch"),
+      action: openLdapSearch,
+      icon: Search,
+    });
+    items.push({ label: "", separator: true });
+    items.push({
+      label: t("contextMenu.refreshChildren"),
+      action: refresh,
+      icon: RefreshCw,
+      shortcut: shortcutRefresh,
+    });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+    return true;
+  }
+
+  if (node.type === "ldap-entry") {
+    const ldapReadOnly = Boolean((node.connectionId ? connectionStore.getConfig(node.connectionId) : (undefined as any))?.read_only);
+    if (node.connectionId && node.database) {
+      items.push({
+        label: t("ldap.addChildEntry"),
+        action: () => openLdapCreateEntryDialog(node.connectionId!, node.database!),
+        icon: Plus,
+        disabled: ldapReadOnly,
+      });
+      items.push({
+        label: t("contextMenu.openLdapSearch"),
+        action: () => openLdapSearchAtNode(node),
+        icon: Search,
+      });
+      items.push({
+        label: t("ldap.renameEntry"),
+        action: () => openLdapRenameEntryDialog(node.connectionId!, node.database!),
+        icon: Replace,
+        disabled: ldapReadOnly,
+      });
+      items.push({ label: "", separator: true });
+      items.push({
+        label: t("contextMenu.refreshChildren"),
+        action: refresh,
+        icon: RefreshCw,
+        shortcut: shortcutRefresh,
+      });
+      items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+      items.push({ label: "", separator: true });
+      items.push({
+        label: t("ldap.deleteEntry"),
+        action: () => openLdapDeleteEntryDialog(node.connectionId!, node.database!),
+        icon: Trash2,
+        shortcut: shortcutDelete,
+        variant: "destructive" as const,
+        disabled: ldapReadOnly,
+      });
+    } else {
+      items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy });
+    }
     return true;
   }
 
@@ -6469,6 +6606,27 @@ function treeItemMenuItems(): ContextMenuItem[] {
   if (hasTypeMenu.value) {
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+  }
+
+  // Safety net: connection nodes should always have at least basic items
+  if (items.length === 0 && node.type === "connection") {
+    if (isConnecting.value) {
+      items.push({ label: t("connection.cancelConnecting"), action: cancelConnectionAttempt, icon: X });
+    } else if (!isConnected.value) {
+      items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Plug });
+    } else {
+      items.push({ label: t("contextMenu.closeConnection"), action: disconnectConnection, icon: Unplug });
+    }
+    items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil });
+    items.push({ label: "", separator: true });
+    items.push({ label: connectionDuplicateMenuLabel(), action: duplicateConnection, icon: CopyPlus });
+    items.push({ label: "", separator: true });
+    items.push({
+      label: connectionDeleteMenuLabel(),
+      action: deleteConnection,
+      icon: Trash2,
+      variant: "destructive" as const,
+    });
   }
 
   appendPluginConnectionMenuItems(items, node);

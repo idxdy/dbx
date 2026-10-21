@@ -53,6 +53,9 @@ pub mod external;
 pub mod hbase_ops;
 pub mod history;
 pub mod jdbc;
+pub mod ldap_login;
+pub mod ldap_ops;
+pub mod ldap_schema;
 pub mod mcp_policy;
 pub mod models;
 pub mod mongo_oidc;
@@ -68,6 +71,7 @@ pub mod mysql_event_sql;
 pub mod nacos;
 #[cfg(all(target_os = "windows", target_env = "gnu"))]
 mod nanosleep_stub;
+pub mod object_cache;
 pub mod object_source_sql;
 pub mod path_utils;
 pub mod plugins;
